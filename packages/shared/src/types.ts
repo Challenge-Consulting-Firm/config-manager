@@ -213,3 +213,72 @@ export interface AuthUser {
   tenantId?: string;
   objectId?: string;
 }
+
+// ===== Full-text search =====
+
+/** A single line-level match produced by the config full-text search.
+ *  `before` / `after` carry one line of context when available. */
+export interface ConfigSearchHit {
+  versionId: string;
+  generation: number;
+  customer: string;
+  hostname: string;
+  ipAddress: string;
+  role: Role;
+  /** 1-based line number in the normalized body. */
+  line: number;
+  /** Matched line text. */
+  text: string;
+  /** One line of context before the match, when available. */
+  before?: string;
+  /** One line of context after the match, when available. */
+  after?: string;
+}
+
+/** Aggregate result of a config full-text search. */
+export interface ConfigSearchResult {
+  query: string;
+  isRegex: boolean;
+  scope: "latest" | "all";
+  hits: ConfigSearchHit[];
+  /** Number of distinct devices scanned. */
+  scannedDevices: number;
+  /** Number of config versions scanned. */
+  scannedVersions: number;
+}
+
+// ===== Firewall rule diff =====
+
+/** A pair of rules that share the same logical signature but differ in
+ *  metadata (status, comments, NAT, ...). Ordering-independent: the diff is
+ *  computed by signature so re-ordered rules do not appear as changes. */
+export interface FirewallRuleChange {
+  before: FirewallRule;
+  after: FirewallRule;
+}
+
+/** Structural diff between two generations' firewall rule sets. */
+export interface FirewallRuleDiff {
+  added: FirewallRule[];
+  removed: FirewallRule[];
+  changed: FirewallRuleChange[];
+  /** Count of rules with identical signature and content in both sides. */
+  unchanged: number;
+}
+
+// ===== Routing route diff =====
+
+/** A pair of routes that share the same logical signature but differ in
+ *  metadata (next-hop, admin distance, metric, ...). */
+export interface RoutingRouteChange {
+  before: RoutingRoute;
+  after: RoutingRoute;
+}
+
+/** Structural diff between two generations' routing tables. */
+export interface RoutingRouteDiff {
+  added: RoutingRoute[];
+  removed: RoutingRoute[];
+  changed: RoutingRouteChange[];
+  unchanged: number;
+}

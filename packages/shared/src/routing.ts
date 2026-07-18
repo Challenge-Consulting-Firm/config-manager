@@ -13,7 +13,11 @@
  */
 
 import type { DeviceDetection } from "./detect.js";
-import type { RoutingRoute } from "./types.js";
+import type {
+  RoutingRoute,
+  RoutingRouteChange,
+  RoutingRouteDiff,
+} from "./types.js";
 
 // ----- cache (de)serialization -----
 
@@ -790,4 +794,70 @@ function runForVendor(lines: string[], vendor: string): RoutingRoute[] {
     default:
       return [];
   }
+}
+
+// ----- structural diff -----
+
+/** Build a stable signature for a route, ignoring position-dependent fields. */
+function routingRouteSignature(r: RoutingRoute): string {
+  return [
+    r.vendor,
+    r.protocol,
+    r.network,
+    r.nextHop,
+    r.interface ?? "",
+  ]
+    .map((s) => (s ?? "").replace(/\|/g, "||"))
+    .join("|");
+}
+
+/** Compare two routes for full equality, ignoring only source line / raw. */
+function routingRoutesEqual(a: RoutingRoute, b: RoutingRoute): boolean {
+  return (
+    routingRouteSignature(a) === routingRouteSignature(b) &&
+    (a.adminDistance ?? "") === (b.adminDistance ?? "") &&
+    (a.metric ?? "") === (b.metric ?? "") &&
+    (a.attributes ?? "") === (b.attributes ?? "")
+  );
+}
+
+/** Compute a structural diff between two routing tables. */
+export function diffRoutingRoutes(
+  before: RoutingRoute[],
+  after: RoutingRoute[],
+): RoutingRouteDiff {
+  const beforeBySig = new Map<string, RoutingRoute[]>();
+  for (const r of before) {
+    const sig = routingRouteSignature(r);
+    const arr = beforeBySig.get(sig);
+    if (arr) arr.push(r);
+    else beforeBySig.set(sig, [r]);
+  }
+  const afterBySig = new Map<string, RoutingRoute[]>();
+  for (const r of after) {
+    const sig = routingRouteSignature(r);
+    const arr = afterBySig.get(sig);
+    if (arr) arr.push(r);
+    else afterBySig.set(sig, [r]);
+  }
+
+  const added: RoutingRoute[] = [];
+  const removed: RoutingRoute[] = [];
+  const changed: RoutingRouteChange[] = [];
+  let unchanged = 0;
+
+  const allSigs = new Set<string>([...beforeBySig.keys(), ...afterBySig.keys()]);
+  for (const sig of allSigs) {
+    const bs = beforeBySig.get(sig) ?? [];
+    const asAfter = afterBySig.get(sig) ?? [];
+    const pairCount = Math.min(bs.length, asAfter.length);
+    for (let i = 0; i < pairCount; i++) {
+      if (routingRoutesEqual(bs[i], asAfter[i])) unchanged++;
+      else changed.push({ before: bs[i], after: asAfter[i] });
+    }
+    for (let i = pairCount; i < asAfter.length; i++) added.push(asAfter[i]);
+    for (let i = pairCount; i < bs.length; i++) removed.push(bs[i]);
+  }
+
+  return { added, removed, changed, unchanged };
 }

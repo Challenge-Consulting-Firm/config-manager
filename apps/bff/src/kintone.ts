@@ -103,7 +103,7 @@ async function kintoneFetch<T>(
   return text ? (JSON.parse(text) as T) : (undefined as unknown as T);
 }
 
-interface KintoneRecord {
+export interface KintoneRecord {
   $id: { value: string };
   $revision: { value: string };
   [fieldCode: string]: { value: string };
@@ -443,4 +443,27 @@ export async function listAudit(
       createdAt: new Date(val("作成日時") || Date.now()).getTime(),
     } satisfies AuditLogEntry;
   });
+}
+
+/** List config records without filter. Used by full-text search and other
+ *  batch-scanning endpoints. Returns raw Kintone records so callers can read
+ *  both identifiers and body in one pass. */
+export async function listConfigRecords(
+  cfg: AppConfig,
+  limit = 500,
+): Promise<KintoneRecord[]> {
+  const res = await kintoneFetch<{ records: KintoneRecord[] }>(
+    cfg,
+    cfg.kintone.configAppToken,
+    "/records.json",
+    {
+      method: "POST",
+      headers: { "X-HTTP-Method-Override": "GET" },
+      body: JSON.stringify({
+        app: cfg.kintone.configAppId,
+        query: `order by ${F.config.generation} desc limit ${limit}`,
+      }),
+    },
+  );
+  return res.records;
 }

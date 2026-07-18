@@ -15,6 +15,8 @@ import type {
   ExpandedFirewallCombination,
   FirewallRule,
   FirewallRuleCategory,
+  FirewallRuleChange,
+  FirewallRuleDiff,
 } from "./types.js";
 
 // ----- cache (de)serialization -----
@@ -1017,4 +1019,85 @@ export function expandFirewallRule(
     }
   }
   return out;
+}
+
+// ----- structural diff -----
+
+/** Build a stable signature for a rule, ignoring position-dependent fields
+ *  (line number, raw text) so that re-ordered or reformatted rules compare
+ *  as equal. Two rules with the same signature are "the same rule"; their
+ *  metadata may still differ and is compared by {@link firewallRulesEqual}. */
+function firewallRuleSignature(r: FirewallRule): string {
+  return [
+    r.vendor,
+    r.name,
+    r.category ?? "policy",
+    r.action,
+    r.protocol,
+    r.source,
+    r.destination,
+    r.port,
+  ]
+    .map((s) => (s ?? "").replace(/\|/g, "||"))
+    .join("|");
+}
+
+/** Compare two rules for full equality, ignoring only the source line number
+ *  and raw text (which are position-dependent, not semantic). */
+function firewallRulesEqual(a: FirewallRule, b: FirewallRule): boolean {
+  return (
+    firewallRuleSignature(a) === firewallRuleSignature(b) &&
+    (a.displayName ?? "") === (b.displayName ?? "") &&
+    (a.enabled ?? true) === (b.enabled ?? true) &&
+    (a.sourceItems?.join(",") ?? "") === (b.sourceItems?.join(",") ?? "") &&
+    (a.destinationItems?.join(",") ?? "") ===
+      (b.destinationItems?.join(",") ?? "") &&
+    (a.serviceItems?.join(",") ?? "") === (b.serviceItems?.join(",") ?? "") &&
+    JSON.stringify(a.nat ?? null) === JSON.stringify(b.nat ?? null) &&
+    (a.comments ?? "") === (b.comments ?? "") &&
+    (a.attributes ?? "") === (b.attributes ?? "")
+  );
+}
+
+/** Compute a structural diff between two firewall rule sets.
+ *  Rules are paired by signature; pairs with metadata differences become
+ *  `changed`, rules present only on one side become `added` / `removed`. */
+export function diffFirewallRules(
+  before: FirewallRule[],
+  after: FirewallRule[],
+): FirewallRuleDiff {
+  const beforeBySig = new Map<string, FirewallRule[]>();
+  for (const r of before) {
+    const sig = firewallRuleSignature(r);
+    const arr = beforeBySig.get(sig);
+    if (arr) arr.push(r);
+    else beforeBySig.set(sig, [r]);
+  }
+  const afterBySig = new Map<string, FirewallRule[]>();
+  for (const r of after) {
+    const sig = firewallRuleSignature(r);
+    const arr = afterBySig.get(sig);
+    if (arr) arr.push(r);
+    else afterBySig.set(sig, [r]);
+  }
+
+  const added: FirewallRule[] = [];
+  const removed: FirewallRule[] = [];
+  const changed: FirewallRuleChange[] = [];
+  let unchanged = 0;
+
+  const allSigs = new Set<string>([...beforeBySig.keys(), ...afterBySig.keys()]);
+  for (const sig of allSigs) {
+    const bs = beforeBySig.get(sig) ?? [];
+    const asAfter = afterBySig.get(sig) ?? [];
+    const pairCount = Math.min(bs.length, asAfter.length);
+    for (let i = 0; i < pairCount; i++) {
+      if (firewallRulesEqual(bs[i], asAfter[i])) unchanged++;
+      else changed.push({ before: bs[i], after: asAfter[i] });
+    }
+    for (let i = pairCount; i < asAfter.length; i++) added.push(asAfter[i]);
+    for (let i = pairCount; i < bs.length; i++) removed.push(bs[i]);
+  }
+
+  return { added, removed, changed, unchanged };
 }

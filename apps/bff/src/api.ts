@@ -5,6 +5,7 @@
 
 import { Hono } from "hono";
 import type { AppConfig } from "./config.js";
+import type { KintoneRecord } from "./kintone.js";
 import type { Session } from "./session.js";
 import {
   createVersion,
@@ -15,6 +16,7 @@ import {
   identifiersFromRecord,
   latestGenerationFor,
   listAudit,
+  listConfigRecords,
   listVersions,
   setFwCache,
   setRoutingCache,
@@ -22,6 +24,8 @@ import {
 } from "./kintone.js";
 import {
   diffConfigs,
+  diffFirewallRules,
+  diffRoutingRoutes,
   detectDeviceInfo,
   extractFirewallRules,
   extractRoutingRoutes,
@@ -33,9 +37,12 @@ import {
 } from "@config-manager/shared";
 import type {
   AuthUser,
+  ConfigSearchHit,
   ConfigVersion,
   Device,
+  FirewallRule,
   Role,
+  RoutingRoute,
 } from "@config-manager/shared";
 
 interface Env {
@@ -439,4 +446,211 @@ api.get("/audit", async (c) => {
   );
   const entries = await listAudit(c.var.cfg, limit);
   return c.json({ entries });
+});
+
+/** Escape regex metacharacters so a literal string is treated as a literal
+ *  match by RegExp. */
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** GET /api/search?q=...&scope=latest|all&regex=0|1 — full-text search across
+ *  config bodies. Scans all config records server-side (Kintone has no native
+ *  substring query for multi-line text) and returns line-level matches with
+ *  one line of context. `scope=latest` restricts to each device's latest
+ *  generation so typical impact surveys don't drown in historical noise. */
+api.get("/search", async (c) => {
+  const cfg = c.var.cfg;
+  const q = c.req.query("q")?.trim() ?? "";
+  const scopeParam = c.req.query("scope");
+  const scope: "latest" | "all" = scopeParam === "all" ? "all" : "latest";
+  const isRegex = c.req.query("regex") === "1";
+  const maxPerVersion = Math.min(
+    Number.parseInt(c.req.query("maxPerVersion") ?? "30", 10) || 30,
+    200,
+  );
+  const recordLimit = Math.min(
+    Number.parseInt(c.req.query("limit") ?? "500", 10) || 500,
+    500,
+  );
+
+  if (!q) {
+    return c.json({
+      query: q,
+      isRegex,
+      scope,
+      hits: [],
+      scannedDevices: 0,
+      scannedVersions: 0,
+    });
+  }
+
+  let pattern: RegExp;
+  try {
+    pattern = isRegex ? new RegExp(q, "i") : new RegExp(escapeRegExp(q), "i");
+  } catch {
+    return c.json({ error: "invalid regex pattern" }, 400);
+  }
+
+  const records = await listConfigRecords(cfg, recordLimit);
+
+  // Find the latest generation per device key so we can filter when
+  // scope=latest. The device key mirrors the grouping in /api/devices.
+  const latestGenByKey = new Map<string, number>();
+  for (const rec of records) {
+    const ids = identifiersFromRecord(rec);
+    const key = `${ids.customer}|${ids.hostname}|${ids.ipAddress}|${ids.role}`;
+    const gen =
+      Number.parseInt(rec["generation"]?.value ?? "0", 10) || 0;
+    const prev = latestGenByKey.get(key);
+    if (prev === undefined || gen > prev) latestGenByKey.set(key, gen);
+  }
+
+  const hits: ConfigSearchHit[] = [];
+  for (const rec of records) {
+    const ids = identifiersFromRecord(rec);
+    const gen =
+      Number.parseInt(rec["generation"]?.value ?? "0", 10) || 0;
+    if (scope === "latest") {
+      const key = `${ids.customer}|${ids.hostname}|${ids.ipAddress}|${ids.role}`;
+      const latest = latestGenByKey.get(key);
+      if (latest === undefined || gen !== latest) continue;
+    }
+    const body = rec["body"]?.value ?? "";
+    if (!body) continue;
+    const lines = body.split("\\n");
+    let matchCount = 0;
+    for (let i = 0; i < lines.length && matchCount < maxPerVersion; i++) {
+      if (pattern.test(lines[i])) {
+        hits.push({
+          versionId: rec.$id.value,
+          generation: gen,
+          customer: ids.customer,
+          hostname: ids.hostname,
+          ipAddress: ids.ipAddress,
+          role: ids.role,
+          line: i + 1,
+          text: lines[i],
+          before: i > 0 ? lines[i - 1] : undefined,
+          after: i < lines.length - 1 ? lines[i + 1] : undefined,
+        });
+        matchCount++;
+      }
+    }
+  }
+
+  // Audit the search so administrators can see what operators are looking
+  // for (useful during incident response). Best-effort.
+  void writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "view",
+    detail: `Searched "${q}" (scope=${scope}, regex=${isRegex}) -> ${hits.length} hits`,
+  });
+
+  return c.json({
+    query: q,
+    isRegex,
+    scope,
+    hits,
+    scannedDevices: latestGenByKey.size,
+    scannedVersions: records.length,
+  });
+});
+
+/** Resolve the firewall rules for a version record, using the persisted cache
+ *  and recomputing lazily when missing/stale (same logic as
+ *  GET /versions/:id/firewall). Returns null for a missing record. */
+async function resolveFirewallRules(cfg: AppConfig, id: string): Promise<{
+  rules: FirewallRule[];
+  record: KintoneRecord;
+} | null> {
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return null;
+  const val = (k: string) => rec[k]?.value ?? "";
+  const hash = val("hash");
+  const rawBody = val("body");
+  const detected = detectedFromRecord(rec);
+  let rules = parseFirewallCache(getFwCacheRaw(rec), hash);
+  if (rules === null) {
+    rules = extractFirewallRules(rawBody, detected);
+    void setFwCache(cfg, id, serializeFirewallRules(rules, hash));
+  }
+  return { rules, record: rec };
+}
+
+/** Analogous to {@link resolveFirewallRules} for routing. */
+async function resolveRoutingRoutes(cfg: AppConfig, id: string): Promise<{
+  routes: RoutingRoute[];
+  record: KintoneRecord;
+} | null> {
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return null;
+  const val = (k: string) => rec[k]?.value ?? "";
+  const hash = val("hash");
+  const rawBody = val("body");
+  const detected = detectedFromRecord(rec);
+  let routes = parseRoutingCache(getRoutingCacheRaw(rec), hash);
+  if (routes === null) {
+    routes = extractRoutingRoutes(rawBody, detected);
+    void setRoutingCache(cfg, id, serializeRoutingRoutes(routes, hash));
+  }
+  return { routes, record: rec };
+}
+
+/** GET /api/diff/firewall?before=<id>&after=<id> — structural diff between
+ *  the firewall rule sets of two versions. Uses cached extractions so it is
+ *  fast even for large policies. */
+api.get("/diff/firewall", async (c) => {
+  const cfg = c.var.cfg;
+  const beforeId = c.req.query("before");
+  const afterId = c.req.query("after");
+  if (!beforeId || !afterId) {
+    return c.json(
+      { error: "before and after query params are required" },
+      400,
+    );
+  }
+  const before = await resolveFirewallRules(cfg, beforeId);
+  const after = await resolveFirewallRules(cfg, afterId);
+  if (!before || !after) return c.json({ error: "not found" }, 404);
+
+  const diff = diffFirewallRules(before.rules, after.rules);
+  void writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "diff",
+    customer: before.record["customer"]?.value,
+    hostname: before.record["hostname"]?.value,
+    detail: `Diffed firewall rules`,
+  });
+  return c.json({ diff });
+});
+
+/** GET /api/diff/routing?before=<id>&after=<id> — structural diff between
+ *  the routing tables of two versions. */
+api.get("/diff/routing", async (c) => {
+  const cfg = c.var.cfg;
+  const beforeId = c.req.query("before");
+  const afterId = c.req.query("after");
+  if (!beforeId || !afterId) {
+    return c.json(
+      { error: "before and after query params are required" },
+      400,
+    );
+  }
+  const before = await resolveRoutingRoutes(cfg, beforeId);
+  const after = await resolveRoutingRoutes(cfg, afterId);
+  if (!before || !after) return c.json({ error: "not found" }, 404);
+
+  const diff = diffRoutingRoutes(before.routes, after.routes);
+  void writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "diff",
+    customer: before.record["customer"]?.value,
+    hostname: before.record["hostname"]?.value,
+    detail: `Diffed routing routes`,
+  });
+  return c.json({ diff });
 });

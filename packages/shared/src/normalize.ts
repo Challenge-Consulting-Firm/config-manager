@@ -6,6 +6,10 @@
  *    spurious diffs (e.g. Cisco "!" lines).
  *  - Remove blank lines and trailing whitespace.
  *  - Strip a trailing Device-Manager/CLI banner noise on a best-effort basis.
+ *  - Remove lines that carry no effective configuration meaning: terminal
+ *    `end`/`exit` tokens, `--More--` paging artifacts, IOS-autoinserted
+ *    `ntp clock-period`, and the leading `version X.Y` declaration (already
+ *    captured by OS auto-detection).
  *  - Produce a stable representation so the SHA-256 hash can reliably detect
  *    real configuration changes across generations.
  *
@@ -21,6 +25,21 @@ export interface NormalizeOptions {
 }
 
 const DEFAULT_COMMENT_PREFIXES = ["!"];
+
+/** Lines that carry no effective configuration meaning and would only
+ *  produce spurious diffs. Stripped unconditionally.
+ *
+ *  NOTE: Removing these changes the SHA-256 of bodies that previously
+ *  contained them. Existing Kintone records keep their old hash, so the
+ *  next upload of the same body registers one new generation. After that
+ *  the hashes realign and no-op uploads skip as before. */
+const NOISE_PATTERNS = [
+  /^\s*end\s*$/, // Cisco IOS section terminator
+  /^\s*exit\s*$/, // context-leave token (ASA/Juniper/etc.)
+  /--More--/, // terminal paging artifact
+  /^\s*ntp\s+clock-period\s+\d+/i, // IOS-autoinserted drift-correction line
+  /^\s*version\s+\d[\d.()A-Za-z-]*\s*$/i, // OS version declaration; already captured by auto-detection
+];
 
 /**
  * Normalize a raw uploaded config blob.
@@ -78,11 +97,13 @@ export async function normalizeConfig(
       strippedLines++;
       continue;
     }
+    if (NOISE_PATTERNS.some((re) => re.test(trimmed))) {
+      strippedLines++;
+      continue;
+    }
     out.push(trimmed);
   }
 
-  // Drop a possible trailing "end" duplication is *not* done — "end" is a real
-  // config token for IOS and should be preserved.
   const body = out.join("\n");
   const hash = await sha256(body);
   const encoder = new TextEncoder();
