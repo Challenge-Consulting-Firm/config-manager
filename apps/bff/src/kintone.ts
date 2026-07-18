@@ -15,6 +15,7 @@ import type {
   ConfigVersion,
   DeviceDetection,
   DeviceIdentifiers,
+  MerakiCredential,
   Role,
 } from "@config-manager/shared";
 import { ROLE_LABELS } from "@config-manager/shared";
@@ -56,6 +57,15 @@ const F = {
     hostname: "hostname",
     generation: "generation",
     detail: "detail",
+  },
+  // Meraki credentials app (optional)
+  meraki: {
+    label: "label",
+    networkId: "network_id",
+    apiKey: "api_key",
+    defaultCustomer: "default_customer",
+    defaultHostname: "default_hostname",
+    memo: "memo",
   },
 } as const;
 
@@ -466,4 +476,239 @@ export async function listConfigRecords(
     },
   );
   return res.records;
+}
+
+// ===== Version metadata (edit / delete) =====
+// コンフィグ管理アプリのレコードは「世代」を表す。新規作成 (createVersion) の
+// ほか、誤登録の削除・後からのメタ情報編集 (purpose/note/serial 等) を提供する。
+// ただしコンフィグ本文 (body)・hash・generation は編集不可 (一意性保証のため)。
+
+/** 編集可能なバージョンメタ情報。undefined のフィールドは更新しない。 */
+export interface VersionMetaUpdate {
+  purpose?: string;
+  note?: string;
+  serialNumber?: string;
+  customer?: string;
+  hostname?: string;
+  ipAddress?: string;
+}
+
+/** 既存バージョンのメタ情報を更新する。body/hash/generation は更新不可。
+ *  存在しない ID の場合は 404 相当で例外が飛ぶ (呼び出し元で getPrivacy すること)。 */
+export async function updateVersionMeta(
+  cfg: AppConfig,
+  id: string,
+  update: VersionMetaUpdate,
+): Promise<void> {
+  const fields: Record<string, { value: string }> = {};
+  if (update.purpose !== undefined)
+    fields[F.config.purpose] = { value: update.purpose };
+  if (update.note !== undefined) fields[F.config.note] = { value: update.note };
+  if (update.serialNumber !== undefined)
+    fields[F.config.serialNumber] = { value: update.serialNumber };
+  if (update.customer !== undefined)
+    fields[F.config.customer] = { value: update.customer };
+  if (update.hostname !== undefined)
+    fields[F.config.hostname] = { value: update.hostname };
+  if (update.ipAddress !== undefined)
+    fields[F.config.ipAddress] = { value: update.ipAddress };
+
+  await kintoneFetch(cfg, cfg.kintone.configAppToken, "/record.json", {
+    method: "PUT",
+    body: JSON.stringify({
+      app: cfg.kintone.configAppId,
+      id,
+      record: fields,
+    }),
+  });
+}
+
+/** 指定 ID のバージョンレコードを削除する。誤登録の取り消し等で使用。
+ *  削除すると世代番号の歯抜けが生じるが、latestGenerationFor は最大値を追う
+ *  ため重複は発生しない。世代の復元はできないので呼び出し元で確認ダイアログを表示すること。 */
+export async function deleteVersion(
+  cfg: AppConfig,
+  id: string,
+): Promise<void> {
+  await kintoneFetch(cfg, cfg.kintone.configAppToken, "/records.json", {
+    method: "DELETE",
+    body: JSON.stringify({
+      app: cfg.kintone.configAppId,
+      ids: [id],
+    }),
+  });
+}
+
+// ===== Meraki credentials (optional app) =====
+// Meraki 接続情報アプリ（nw_meraki_credentials）は任意。env で
+// KINTONE_MERAKI_APP_ID が未設定の場合、これらの関数は securityError を投げる。
+// API 側で isEnabledMerakiCredentials() でガードして呼び出すこと。
+
+/** Meraki 接続情報アプリが利用可能か（env で ID とトークンが設定されているか）。 */
+export function isEnabledMerakiCredentials(cfg: AppConfig): boolean {
+  return (
+    cfg.kintone.merakiAppId.length > 0 &&
+    cfg.kintone.merakiAppToken.length > 0
+  );
+}
+
+function merakiAppGuard(cfg: AppConfig): void {
+  if (!isEnabledMerakiCredentials(cfg)) {
+    throw new Error(
+      "Meraki 接続情報アプリが未設定です。KINTONE_MERAKI_APP_ID / KINTONE_MERAKI_APP_TOKEN を設定してください。",
+    );
+  }
+}
+
+function toMerakiCredential(rec: KintoneRecord): MerakiCredential {
+  const val = (k: string) => rec[k]?.value ?? "";
+  return {
+    id: rec.$id.value,
+    label: val(F.meraki.label),
+    networkId: val(F.meraki.networkId),
+    apiKey: val(F.meraki.apiKey),
+    defaultCustomer: val(F.meraki.defaultCustomer) || undefined,
+    defaultHostname: val(F.meraki.defaultHostname) || undefined,
+    memo: val(F.meraki.memo) || undefined,
+    updatedAt: new Date(val("更新日時") || Date.now()).getTime(),
+  };
+}
+
+/** 登録済み Meraki 接続情報を一覧取得する。 */
+export async function listMerakiCredentials(
+  cfg: AppConfig,
+): Promise<MerakiCredential[]> {
+  merakiAppGuard(cfg);
+  const res = await kintoneFetch<{ records: KintoneRecord[] }>(
+    cfg,
+    cfg.kintone.merakiAppToken,
+    "/records.json",
+    {
+      method: "POST",
+      headers: { "X-HTTP-Method-Override": "GET" },
+      body: JSON.stringify({
+        app: cfg.kintone.merakiAppId,
+        query: `order by $id desc limit 500`,
+      }),
+    },
+  );
+  return res.records.map(toMerakiCredential);
+}
+
+/** Meraki 接続情報を 1 件取得する。 */
+export async function getMerakiCredential(
+  cfg: AppConfig,
+  id: string,
+): Promise<MerakiCredential | null> {
+  merakiAppGuard(cfg);
+  try {
+    const res = await kintoneFetch<KintoneGetRecordResponse>(
+      cfg,
+      cfg.kintone.merakiAppToken,
+      "/record.json",
+      {
+        method: "POST",
+        headers: { "X-HTTP-Method-Override": "GET" },
+        body: JSON.stringify({ app: cfg.kintone.merakiAppId, id }),
+      },
+    );
+    return toMerakiCredential(res.record);
+  } catch {
+    return null;
+  }
+}
+
+/** Meraki 接続情報を新規登録する。 */
+export async function createMerakiCredential(
+  cfg: AppConfig,
+  args: {
+    label: string;
+    networkId: string;
+    apiKey: string;
+    defaultCustomer?: string;
+    defaultHostname?: string;
+    memo?: string;
+  },
+): Promise<MerakiCredential> {
+  merakiAppGuard(cfg);
+  const fields: Record<string, { value: string }> = {
+    [F.meraki.label]: { value: args.label },
+    [F.meraki.networkId]: { value: args.networkId },
+    [F.meraki.apiKey]: { value: args.apiKey },
+  };
+  if (args.defaultCustomer)
+    fields[F.meraki.defaultCustomer] = { value: args.defaultCustomer };
+  if (args.defaultHostname)
+    fields[F.meraki.defaultHostname] = { value: args.defaultHostname };
+  if (args.memo) fields[F.meraki.memo] = { value: args.memo };
+
+  const res = await kintoneFetch<{ id: string; revision: string }>(
+    cfg,
+    cfg.kintone.merakiAppToken,
+    "/record.json",
+    {
+      method: "POST",
+      body: JSON.stringify({ app: cfg.kintone.merakiAppId, record: fields }),
+    },
+  );
+  return {
+    id: res.id,
+    label: args.label,
+    networkId: args.networkId,
+    apiKey: args.apiKey,
+    defaultCustomer: args.defaultCustomer,
+    defaultHostname: args.defaultHostname,
+    memo: args.memo,
+    updatedAt: Date.now(),
+  };
+}
+
+/** Meraki 接続情報を更新する。未指定のフィールドは更新しない。 */
+export async function updateMerakiCredential(
+  cfg: AppConfig,
+  id: string,
+  args: Partial<{
+    label: string;
+    networkId: string;
+    apiKey: string;
+    defaultCustomer: string;
+    defaultHostname: string;
+    memo: string;
+  }>,
+): Promise<void> {
+  merakiAppGuard(cfg);
+  const fields: Record<string, { value: string }> = {};
+  if (args.label !== undefined) fields[F.meraki.label] = { value: args.label };
+  if (args.networkId !== undefined)
+    fields[F.meraki.networkId] = { value: args.networkId };
+  if (args.apiKey !== undefined) fields[F.meraki.apiKey] = { value: args.apiKey };
+  if (args.defaultCustomer !== undefined)
+    fields[F.meraki.defaultCustomer] = { value: args.defaultCustomer };
+  if (args.defaultHostname !== undefined)
+    fields[F.meraki.defaultHostname] = { value: args.defaultHostname };
+  if (args.memo !== undefined) fields[F.meraki.memo] = { value: args.memo };
+
+  await kintoneFetch(cfg, cfg.kintone.merakiAppToken, "/record.json", {
+    method: "PUT",
+    body: JSON.stringify({
+      app: cfg.kintone.merakiAppId,
+      id,
+      record: fields,
+    }),
+  });
+}
+
+/** Meraki 接続情報を削除する。 */
+export async function deleteMerakiCredential(
+  cfg: AppConfig,
+  id: string,
+): Promise<void> {
+  merakiAppGuard(cfg);
+  await kintoneFetch(cfg, cfg.kintone.merakiAppToken, "/records.json", {
+    method: "DELETE",
+    body: JSON.stringify({
+      app: cfg.kintone.merakiAppId,
+      ids: [id],
+    }),
+  });
 }

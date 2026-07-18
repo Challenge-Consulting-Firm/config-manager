@@ -5,7 +5,7 @@ import type {
   Device,
   DeviceIdentifiers,
 } from "@config-manager/shared";
-import { ROLE_LABELS } from "@config-manager/shared";
+import { MERAKI_DUMP_HEADER, ROLE_LABELS } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
 import { RoleBadge } from "../components/RoleBadge";
 
@@ -13,6 +13,20 @@ interface PromoteResult {
   created?: { id: string; generation: number };
   skipped?: boolean;
   reason?: string;
+}
+
+/** 編集モーダルの対象バージョン。null で閉じる。 */
+interface EditTarget {
+  id: string;
+  generation: number;
+  ids: DeviceIdentifiers;
+}
+
+/** 削除確認の対象バージョン。null で閉じる。 */
+interface DeleteTarget {
+  id: string;
+  generation: number;
+  ids: DeviceIdentifiers;
 }
 
 export function DeviceDetailPage() {
@@ -29,6 +43,14 @@ export function DeviceDetailPage() {
   const [promoteIp, setPromoteIp] = useState("");
   const [promoting, setPromoting] = useState(false);
   const [promoteMsg, setPromoteMsg] = useState<string | null>(null);
+  // 編集・削除 UI の状態。
+  const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  const [metaMsg, setMetaMsg] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
+  const [metaSubmitting, setMetaSubmitting] = useState(false);
 
   useEffect(() => {
     if (!decodedKey) return;
@@ -142,6 +164,31 @@ export function DeviceDetailPage() {
   const peerVerb =
     identifiers?.role === "production" ? "予備機" : "本番機";
 
+  // 現在表示中のバージョンが Meraki 取得由来かを判定。
+  // 保存済み本文は normalize でコメント行（`!` 始まり）が除去されるため、
+  // ヘッダ行での判定は保存済み世代には効かない。アップロード時に生本文で
+  // 計算・保存された detected.vendor を第一判定に使い、ヘッダ判定は
+  // 後方互換（normalize 前の本文を扱うケース）として残す。
+  const isMerakiDevice =
+    body?.detected?.vendor === "Cisco Meraki" ||
+    !!body?.body?.startsWith(MERAKI_DUMP_HEADER);
+
+  // Meraki の network ID を抽出。再取得ボタンの遷移先で networkId の
+  // ヒントとして使う（空でも /meraki 側で手入力・接続情報選択が可能）。
+  const merakiNetworkId = (() => {
+    // 本文の `! Network: name (N_xxx)` 行（normalize 前の本文がある場合のみ）。
+    const fromBody = body?.body?.match(
+      /^!\s*Network:\s+.+?\s+\(([LNQ]_[0-9a-zA-Z]+)\)/m,
+    )?.[1];
+    if (fromBody) return fromBody;
+    // 保存済み世代ではヘッダ行が消えているため、取り込み時に purpose へ
+    // 埋め込まれる `Meraki network <name> (L_xxx)` から拾うフォールバック。
+    const fromPurpose = identifiers?.purpose?.match(
+      /\(([LNQ]_[0-9a-zA-Z]+)\)/,
+    )?.[1];
+    return fromPurpose ?? "";
+  })();
+
   return (
     <div>
       <div className="mb-4 flex items-center justify-between">
@@ -177,12 +224,36 @@ export function DeviceDetailPage() {
           </Link>
         )}
         {identifiers && (
-          <Link
-            to={uploadHrefFor(decodedKey, identifiers)}
-            className="rounded-md bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700"
-          >
-            この機器に新世代をアップロード
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            {isMerakiDevice ? (
+              <Link
+                to={merakiRefetchHrefFor(
+                  decodedKey,
+                  identifiers,
+                  merakiNetworkId,
+                )}
+                className="rounded-md bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700"
+              >
+                Meraki で再取得
+              </Link>
+            ) : (
+              <Link
+                to={uploadHrefFor(decodedKey, identifiers)}
+                className="rounded-md bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700"
+              >
+                この機器に新世代をアップロード
+              </Link>
+            )}
+            {/* 補助ボタン: Meraki 機器でも手動アップロードは可能 (ファイルを持ち込む場合等) */}
+            {isMerakiDevice && (
+              <Link
+                to={uploadHrefFor(decodedKey, identifiers)}
+                className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+              >
+                ファイルでアップロード
+              </Link>
+            )}
+          </div>
         )}
       </div>
 
@@ -255,6 +326,18 @@ export function DeviceDetailPage() {
       {loading && <p className="text-slate-500">読み込み中…</p>}
       {error && <p className="text-red-600">エラー: {error}</p>}
 
+      {metaMsg && (
+        <div
+          className={`mb-4 rounded-md border px-3 py-2 text-sm ${
+            metaMsg.type === "success"
+              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+              : "border-red-200 bg-red-50 text-red-800"
+          }`}
+        >
+          {metaMsg.text}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div className="lg:col-span-1">
           <h2 className="mb-2 text-sm font-semibold uppercase text-slate-500">
@@ -263,8 +346,16 @@ export function DeviceDetailPage() {
           <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
             {versions.map((v) => {
               const isSel = selected.includes(v.id);
+              const versionIds: DeviceIdentifiers = {
+                customer: identifiers?.customer ?? "",
+                hostname: identifiers?.hostname ?? "",
+                ipAddress: identifiers?.ipAddress ?? "",
+                purpose: identifiers?.purpose ?? "",
+                serialNumber: identifiers?.serialNumber ?? "",
+                role: identifiers?.role ?? "production",
+              };
               return (
-                <li key={v.id}>
+                <li key={v.id} className="group relative">
                   <button
                     onClick={() => toggleSelect(v.id)}
                     className={`flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-slate-50 ${
@@ -285,12 +376,43 @@ export function DeviceDetailPage() {
                       {new Date(v.createdAt).toLocaleString("ja-JP")} · {v.lines}行
                     </span>
                   </button>
+                  {/* ホバー時に右上にアクションボタンを表示 */}
+                  <div className="pointer-events-none absolute right-2 top-1.5 flex gap-1 opacity-0 transition group-hover:opacity-100">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditTarget({
+                          id: v.id,
+                          generation: v.generation,
+                          ids: versionIds,
+                        });
+                        setMetaMsg(null);
+                      }}
+                      className="pointer-events-auto rounded border border-slate-300 bg-white px-1.5 py-0.5 text-xs text-slate-700 hover:bg-slate-100"
+                    >
+                      編集
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDeleteTarget({
+                          id: v.id,
+                          generation: v.generation,
+                          ids: versionIds,
+                        });
+                        setMetaMsg(null);
+                      }}
+                      className="pointer-events-auto rounded border border-red-300 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
+                    >
+                      削除
+                    </button>
+                  </div>
                 </li>
               );
             })}
           </ul>
           <p className="mt-2 text-xs text-slate-500">
-            2つ選択するとDiffボタンが有効になります。
+            2つ選択するとDiffボタンが有効になります。世代右上に編集/削除ボタンがあります（ホバーで表示）。
           </p>
         </div>
 
@@ -353,6 +475,77 @@ export function DeviceDetailPage() {
           )}
         </div>
       </div>
+
+      {/* 編集モーダル */}
+      {editTarget && (
+        <EditVersionModal
+          target={editTarget}
+          submitting={metaSubmitting}
+          onClose={() => setEditTarget(null)}
+          onSubmit={async (fields) => {
+            setMetaSubmitting(true);
+            setMetaMsg(null);
+            try {
+              await apiFetch(`/api/versions/${editTarget.id}`, {
+                method: "PUT",
+                body: JSON.stringify(fields),
+              });
+              setMetaMsg({
+                type: "success",
+                text: `世代 #${editTarget.generation} のメタ情報を更新しました。`,
+              });
+              setEditTarget(null);
+              // 表示中のバージョンが更新された場合は再読み込み。
+              if (body?.id === editTarget.id) {
+                await loadVersion(editTarget.id);
+              }
+              await reloadVersions();
+            } catch (e) {
+              setMetaMsg({
+                type: "error",
+                text: e instanceof ApiError ? e.message : String(e),
+              });
+            } finally {
+              setMetaSubmitting(false);
+            }
+          }}
+        />
+      )}
+
+      {/* 削除確認ダイアログ */}
+      {deleteTarget && (
+        <DeleteVersionDialog
+          target={deleteTarget}
+          submitting={metaSubmitting}
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={async () => {
+            setMetaSubmitting(true);
+            setMetaMsg(null);
+            try {
+              await apiFetch(`/api/versions/${deleteTarget.id}`, {
+                method: "DELETE",
+              });
+              setMetaMsg({
+                type: "success",
+                text: `世代 #${deleteTarget.generation} を削除しました。`,
+              });
+              setDeleteTarget(null);
+              // 表示中のバージョンが削除された場合は一覧へ戻る。
+              if (body?.id === deleteTarget.id) {
+                setBody(null);
+              }
+              await reloadVersions();
+            } catch (e) {
+              setMetaMsg({
+                type: "error",
+                text: e instanceof ApiError ? e.message : String(e),
+              });
+            } finally {
+              setMetaSubmitting(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -387,6 +580,29 @@ function uploadHrefFor(
   return `/upload?${q.toString()}`;
 }
 
+/** Build the /meraki URL with identifiers pre-filled, so the same Meraki
+ *  device can be re-fetched without re-typing its metadata. The networkId is
+ *  extracted from the previous config dump and passed so the user can pick it
+ *  up at the credentials selector or paste into the manual input. */
+function merakiRefetchHrefFor(
+  deviceKey: string,
+  ids: DeviceIdentifiers,
+  networkId: string,
+): string {
+  const from = `/devices/${encodeURIComponent(deviceKey)}`;
+  const q = new URLSearchParams({
+    customer: ids.customer,
+    hostname: ids.hostname,
+    ipAddress: ids.ipAddress,
+    purpose: ids.purpose,
+    serialNumber: ids.serialNumber,
+    role: ids.role,
+    networkId,
+    from,
+  });
+  return `/meraki?${q.toString()}`;
+}
+
 function DetectedBadge({ label, value }: { label: string; value: string }) {
   if (!value) return null;
   return (
@@ -394,5 +610,159 @@ function DetectedBadge({ label, value }: { label: string; value: string }) {
       <span className="text-slate-400">{label}</span>
       <span className="font-medium text-slate-800">{value}</span>
     </span>
+  );
+}
+
+/** バージョンメタ情報編集モーダル。
+ *  編集可能なのは用途 (purpose) / メモ (note) / シリアル番号 / IPアドレス / 顧客 / ホスト名。
+ *  コンフィグ本文・hash・generation は変更不可。 */
+function EditVersionModal({
+  target,
+  submitting,
+  onClose,
+  onSubmit,
+}: {
+  target: EditTarget;
+  submitting: boolean;
+  onClose: () => void;
+  onSubmit: (fields: {
+    purpose?: string;
+    note?: string;
+    serialNumber?: string;
+    customer?: string;
+    hostname?: string;
+    ipAddress?: string;
+  }) => Promise<void>;
+}) {
+  const [customer, setCustomer] = useState(target.ids.customer);
+  const [hostname, setHostname] = useState(target.ids.hostname);
+  const [ipAddress, setIpAddress] = useState(target.ids.ipAddress);
+  const [purpose, setPurpose] = useState(target.ids.purpose);
+  const [serialNumber, setSerialNumber] = useState(target.ids.serialNumber);
+  const [note, setNote] = useState(""); // note は詳細 API から取得していないので空欄から開始
+  const inputCls =
+    "w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg bg-white p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="mb-1 text-lg font-semibold text-slate-900">
+          世代 #{target.generation} のメタ情報を編集
+        </h2>
+        <p className="mb-4 text-xs text-slate-500">
+          コンフィグ本文・世代番号は変更できません。空文字を送信するとそのフィールドはクリアされます。
+        </p>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">顧客</span>
+            <input value={customer} onChange={(e) => setCustomer(e.target.value)} className={inputCls} />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">ホスト名</span>
+            <input value={hostname} onChange={(e) => setHostname(e.target.value)} className={inputCls} />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">IPアドレス *</span>
+            <input value={ipAddress} onChange={(e) => setIpAddress(e.target.value)} className={inputCls} />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">シリアル番号</span>
+            <input value={serialNumber} onChange={(e) => setSerialNumber(e.target.value)} className={inputCls} />
+          </label>
+          <label className="block sm:col-span-2">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">用途</span>
+            <input value={purpose} onChange={(e) => setPurpose(e.target.value)} className={inputCls} />
+          </label>
+          <label className="block sm:col-span-2">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">メモ</span>
+            <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3} className={inputCls} />
+          </label>
+        </div>
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            キャンセル
+          </button>
+          <button
+            disabled={submitting || !ipAddress.trim()}
+            onClick={() =>
+              onSubmit({
+                customer: customer.trim(),
+                hostname: hostname.trim(),
+                ipAddress: ipAddress.trim(),
+                purpose: purpose.trim(),
+                serialNumber: serialNumber.trim(),
+                note,
+              })
+            }
+            className="rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            {submitting ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** バージョン削除の確認ダイアログ。 */
+function DeleteVersionDialog({
+  target,
+  submitting,
+  onClose,
+  onConfirm,
+}: {
+  target: DeleteTarget;
+  submitting: boolean;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-lg bg-white p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="mb-2 text-lg font-semibold text-red-700">
+          世代 #{target.generation} を削除しますか？
+        </h2>
+        <p className="mb-1 text-sm text-slate-700">
+          対象: {target.ids.customer} / {target.ids.hostname}
+        </p>
+        <p className="mb-4 text-sm text-slate-700">
+          IP: <span className="mono">{target.ids.ipAddress}</span>
+        </p>
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span className="font-semibold">注意:</span> 削除すると世代の復元はできません。コンフィグ本文のバックアップが必要な場合は先にダウンロードしてください。
+          世代の歯抜けが生じますが、次回アップロード時の世代番号は最大値+1になります。
+        </div>
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            キャンセル
+          </button>
+          <button
+            disabled={submitting}
+            onClick={onConfirm}
+            className="rounded-md bg-red-600 px-4 py-2 text-sm text-white hover:bg-red-700 disabled:opacity-50"
+          >
+            {submitting ? "削除中…" : "削除する"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

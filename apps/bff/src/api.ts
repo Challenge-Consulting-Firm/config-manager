@@ -21,6 +21,14 @@ import {
   setFwCache,
   setRoutingCache,
   writeAudit,
+  createMerakiCredential,
+  deleteMerakiCredential,
+  deleteVersion,
+  getMerakiCredential,
+  isEnabledMerakiCredentials,
+  listMerakiCredentials,
+  updateMerakiCredential,
+  updateVersionMeta,
 } from "./kintone.js";
 import {
   diffConfigs,
@@ -33,7 +41,9 @@ import {
   parseFirewallCache,
   parseRoutingCache,
   serializeFirewallRules,
+  serializeMerakiConfig,
   serializeRoutingRoutes,
+  summarizeMerakiImport,
 } from "@config-manager/shared";
 import type {
   AuthUser,
@@ -44,6 +54,7 @@ import type {
   Role,
   RoutingRoute,
 } from "@config-manager/shared";
+import { fetchMerakiConfig } from "./meraki.js";
 
 interface Env {
   Variables: {
@@ -401,6 +412,380 @@ api.post("/promote", async (c) => {
   return c.json({ created }, 201);
 });
 
+interface MerakiImportBody {
+  networkId: string;
+  apiKey?: string;
+  /** 登録済み Meraki 接続情報のレコード ID。指定時は networkId/apiKey
+   *  より優先され、さらにデフォルト顧客・ホスト名も補完に使う。 */
+  credentialId?: string;
+  customer: string;
+  hostname: string;
+  ipAddress?: string;
+  purpose?: string;
+  serialNumber?: string;
+  role?: Role;
+  note?: string;
+}
+
+/** POST /api/meraki/import — Meraki Dashboard API から対象ネットワークの
+ *  設定を取得し、通常のコンフィグ世代として新規登録する。
+ *
+ *  処理フローは通常アップロードと同一で、取得した設定をテキストへ
+ *  シリアライズしたうえで normalizeConfig → 重複スキップ判定 →
+ *  createVersion → writeAudit に渡す。これにより、既存の Diff 表示・
+ *  FW/ルーティング抽出・監査ログ・本番/予備管理をすべて再利用できる。
+ *
+ *  認証情報の優先順位: credentialId > 要求ボディ (networkId/apiKey) >
+ *  環境変数 MERAKI_API_KEY（apiKey のみ）。credentialId 指定時は、
+ *  customer/hostname が未入力ならデフォルト値で補完する。 */
+api.post("/meraki/import", async (c) => {
+  const cfg = c.var.cfg;
+  const payload = await c.req.json<MerakiImportBody>().catch(() => null);
+  if (!payload) return c.json({ error: "invalid JSON body" }, 400);
+
+  // 1. 認証情報を解決。credentialId 指定時は Kintone から取得し、networkId /
+  //    apiKey / デフォルト識別子を上書き優先する。
+  let resolvedNetworkId = textField(payload.networkId);
+  let resolvedApiKey = textField(payload.apiKey);
+  let defaultCustomer = "";
+  let defaultHostname = "";
+  const credentialId = textField(payload.credentialId);
+  if (credentialId) {
+    if (!isEnabledMerakiCredentials(cfg)) {
+      return c.json(
+        { error: "Meraki 接続情報アプリが未設定です（credentialId を使うには KINTONE_MERAKI_APP_ID が必要です）" },
+        400,
+      );
+    }
+    const cred = await getMerakiCredential(cfg, credentialId);
+    if (!cred) {
+      return c.json({ error: `Meraki 接続情報が見つかりません (id=${credentialId})` }, 404);
+    }
+    resolvedNetworkId = cred.networkId;
+    resolvedApiKey = cred.apiKey;
+    defaultCustomer = cred.defaultCustomer ?? "";
+    defaultHostname = cred.defaultHostname ?? "";
+  }
+  // 要求ボディの apiKey が未指定なら環境変数へフォールバック。
+  if (!resolvedApiKey) resolvedApiKey = cfg.meraki.apiKey;
+
+  if (!resolvedNetworkId) {
+    return c.json({ error: "networkId または credentialId は必須です" }, 400);
+  }
+  if (!resolvedApiKey) {
+    return c.json(
+      {
+        error:
+          "Meraki API キーが指定されていません（credentialId / 要求ボディ apiKey / 環境変数 MERAKI_API_KEY のいずれかが必要です）",
+      },
+      400,
+    );
+  }
+
+  // 2. 識別子を確定。credentialId 由来のデフォルト → 要求ボディ順で優先。
+  const customer = textField(payload.customer) || defaultCustomer;
+  const hostname = textField(payload.hostname) || defaultHostname;
+  const ipAddress = textField(payload.ipAddress);
+  const purpose = textField(payload.purpose);
+  const serialNumber = textField(payload.serialNumber);
+  const note =
+    typeof payload.note === "string" ? payload.note : undefined;
+  const role: Role = payload.role === "spare" ? "spare" : "production";
+
+  if (!customer || !hostname) {
+    return c.json(
+      { error: "customer, hostname は必須です（credentialId のデフォルト値または要求ボディで指定してください）" },
+      400,
+    );
+  }
+
+  // 3. Meraki API から取得。ネットワークが取れない場合は例外が飛ぶので
+  //    クライアントへ 502 扱いで返す。
+  let fetchResult;
+  try {
+    fetchResult = await fetchMerakiConfig(resolvedNetworkId, resolvedApiKey, {
+      apiBase: cfg.meraki.apiBase,
+      timeoutMs: cfg.meraki.timeoutMs,
+      maxRetries: cfg.meraki.maxRetries,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: `Meraki API 取得失敗: ${msg}` }, 502);
+  }
+  const { dump } = fetchResult;
+  const summary = summarizeMerakiImport(dump);
+
+  // 4. コンフィグ本文をテキスト化し、以降は通常アップロードと同じフロー。
+  const rawBody = serializeMerakiConfig(dump);
+  const detected = detectDeviceInfo(rawBody);
+  const normalized = await normalizeConfig(rawBody, {
+    commentPrefixes: cfg.commentPrefixes,
+  });
+  const fwRules = extractFirewallRules(rawBody, detected);
+  const fwRulesJson = serializeFirewallRules(fwRules, normalized.hash);
+  const routingRoutes = extractRoutingRoutes(rawBody, detected);
+  const routingRoutesJson = serializeRoutingRoutes(routingRoutes, normalized.hash);
+
+  // IP はユーザー入力を優先。未入力時は以下の優先順位で補完:
+  //   1. lanIp (プライベート IP / VLAN のゲートウェイ IP 等) - 既定で推奨
+  //   2. publicIp (WAN 側 IP / uplinks/statuses から取得)
+  // プライベート IP が一般的な運用 IP であるため、lanIp を優先する。
+  const resolvedIp =
+    ipAddress ||
+    dump.devices.find((d) => d.lanIp)?.lanIp ||
+    dump.devices.find((d) => d.publicIp)?.publicIp ||
+    "";
+
+  // Kintone のコンフィグ管理アプリは ip_address を必須項目としているため、
+  // 補完後も空の場合は早期エラーにする。放置すると createVersion が 400 になり、
+  // Hono のデフォルトエラーハンドラから "Internal Server Error" が返って
+  // クライアント側の JSON パースを壊す原因になる。
+  if (!resolvedIp) {
+    return c.json(
+      {
+        error:
+          "IPアドレスが取得できませんでした。取得画面で明示的に入力するか、ネットワーク内のデバイスに lanIp/publicIp が設定されているか確認してください。",
+        summary,
+        network: {
+          id: dump.network.id,
+          name: dump.network.name,
+          productTypes: dump.network.productTypes,
+        },
+      },
+      400,
+    );
+  }
+
+  const identifiers = {
+    customer,
+    hostname,
+    ipAddress: resolvedIp,
+    purpose: purpose || `Meraki network ${dump.network.name} (${dump.network.id})`,
+    // シリアル番号はユーザー入力を優先。未入力時はネットワーク内の最初の
+    // デバイス (通常は MX appliance) のシリアルを補完。ネットワーク単位で
+    // 取得しているため代表 1 件のみ採録する。
+    serialNumber: serialNumber || dump.devices.find((d) => d.serial)?.serial || "",
+    role,
+  };
+
+  const prevGen = await latestGenerationFor(cfg, identifiers);
+  const prevVersions = await listVersions(cfg, identifiers);
+  const latest = prevVersions.find((v) => v.generation === prevGen);
+  if (latest && latest.hash === normalized.hash) {
+    return c.json({
+      skipped: true,
+      reason: "最新世代と同一のコンフィグです。新世代は作成されませんでした。",
+      generation: latest.generation,
+      hash: latest.hash,
+      summary,
+      network: {
+        id: dump.network.id,
+        name: dump.network.name,
+        productTypes: dump.network.productTypes,
+      },
+    });
+  }
+
+  const nextGen = prevGen + 1;
+  const created = await createVersion(cfg, {
+    identifiers,
+    generation: nextGen,
+    body: normalized.body,
+    hash: normalized.hash,
+    size: normalized.size,
+    lines: normalized.lines,
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    note:
+      note ??
+      `Meraki import: network=${dump.network.name} (${dump.network.id}), devices=${summary.deviceCount}, failedSections=${summary.failedSections}`,
+    detected,
+    fwRulesJson,
+    routingRoutesJson,
+  });
+
+  await writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "upload",
+    customer,
+    hostname,
+    generation: nextGen,
+    detail:
+      `Meraki import: network=${dump.network.name} (${dump.network.id}); ` +
+      `products=${dump.network.productTypes.join(",")}; ` +
+      `devices=${summary.deviceCount}; failedSections=${summary.failedSections}`,
+  });
+
+  return c.json(
+    {
+      created,
+      strippedLines: normalized.strippedLines,
+      summary,
+      network: {
+        id: dump.network.id,
+        name: dump.network.name,
+        productTypes: dump.network.productTypes,
+      },
+    },
+    201,
+  );
+});
+
+// ===== Meraki credentials (CRUD) =====
+// これらのエンドポイントは KINTONE_MERAKI_APP_ID が未設定の場合 503 を返す。
+
+interface MerakiCredentialBody {
+  label?: string;
+  networkId?: string;
+  apiKey?: string;
+  defaultCustomer?: string;
+  defaultHostname?: string;
+  memo?: string;
+}
+
+function credentialBodyError(payload: MerakiCredentialBody): string | null {
+  if (!payload.label || !payload.label.trim()) return "label は必須です";
+  if (!payload.networkId || !payload.networkId.trim())
+    return "networkId は必須です";
+  if (!payload.apiKey || !payload.apiKey.trim()) return "apiKey は必須です";
+  return null;
+}
+
+/** Meraki 接続情報アプリの有効/無効と、一覧取得。
+ *  GET /api/meraki/credentials → 接続情報一覧（apiKey は隠してラスト 4 文字のみ）
+ *  POST /api/meraki/credentials → 新規登録
+ *  PUT /api/meraki/credentials/:id → 更新
+ *  DELETE /api/meraki/credentials/:id → 削除 */
+api.get("/meraki/credentials", async (c) => {
+  const cfg = c.var.cfg;
+  if (!isEnabledMerakiCredentials(cfg)) {
+    return c.json({
+      enabled: false,
+      credentials: [],
+      error: "Meraki 接続情報アプリが未設定です",
+    });
+  }
+  const credentials = await listMerakiCredentials(cfg);
+  // apiKey は全文返すと画面上に漏れるため、ラスト 4 文字のみマスク表示。
+  // 取得時に再度 Kintone から読み直すため、この API 応答のマスクは UI 表示専用。
+  const masked = credentials.map((c2) => ({
+    ...c2,
+    apiKey: maskApiKey(c2.apiKey),
+  }));
+  return c.json({ enabled: true, credentials: masked });
+});
+
+api.post("/meraki/credentials", async (c) => {
+  const cfg = c.var.cfg;
+  if (!isEnabledMerakiCredentials(cfg)) {
+    return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
+  }
+  const payload = await c.req.json<MerakiCredentialBody>().catch(() => null);
+  if (!payload) return c.json({ error: "invalid JSON body" }, 400);
+  const err = credentialBodyError(payload);
+  if (err) return c.json({ error: err }, 400);
+
+  try {
+    const created = await createMerakiCredential(cfg, {
+      label: payload.label!.trim(),
+      networkId: payload.networkId!.trim(),
+      apiKey: payload.apiKey!.trim(),
+      defaultCustomer: payload.defaultCustomer?.trim() || undefined,
+      defaultHostname: payload.defaultHostname?.trim() || undefined,
+      memo: payload.memo?.trim() || undefined,
+    });
+    await writeAudit(cfg, {
+      operator: c.var.user.displayName,
+      operatorEmail: c.var.user.email,
+      action: "upload",
+      detail: `Meraki 接続情報を登録: ${created.label} (network=${created.networkId})`,
+    });
+    return c.json({ credential: { ...created, apiKey: maskApiKey(created.apiKey) } }, 201);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: `登録失敗: ${msg}` }, 500);
+  }
+});
+
+api.put("/meraki/credentials/:id", async (c) => {
+  const cfg = c.var.cfg;
+  if (!isEnabledMerakiCredentials(cfg)) {
+    return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
+  }
+  const id = c.req.param("id");
+  const payload = await c.req.json<MerakiCredentialBody>().catch(() => null);
+  if (!payload) return c.json({ error: "invalid JSON body" }, 400);
+  // label/networkId/apiKey は必須だが、更新時は未指定のフィールドはそのまま残す。
+  // ただし 3 つとも未指定だと意味がないので、何れか 1 つは指定を要求する。
+  if (
+    payload.label === undefined &&
+    payload.networkId === undefined &&
+    payload.apiKey === undefined &&
+    payload.defaultCustomer === undefined &&
+    payload.defaultHostname === undefined &&
+    payload.memo === undefined
+  ) {
+    return c.json({ error: "更新対象フィールドがありません" }, 400);
+  }
+
+  try {
+    await updateMerakiCredential(cfg, id, {
+      label: payload.label?.trim(),
+      networkId: payload.networkId?.trim(),
+      apiKey: payload.apiKey?.trim(),
+      defaultCustomer: payload.defaultCustomer?.trim(),
+      defaultHostname: payload.defaultHostname?.trim(),
+      memo: payload.memo?.trim(),
+    });
+    await writeAudit(cfg, {
+      operator: c.var.user.displayName,
+      operatorEmail: c.var.user.email,
+      action: "upload",
+      detail: `Meraki 接続情報を更新: id=${id}`,
+    });
+    const refreshed = await getMerakiCredential(cfg, id);
+    return c.json({
+      credential: refreshed
+        ? { ...refreshed, apiKey: maskApiKey(refreshed.apiKey) }
+        : null,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: `更新失敗: ${msg}` }, 500);
+  }
+});
+
+api.delete("/meraki/credentials/:id", async (c) => {
+  const cfg = c.var.cfg;
+  if (!isEnabledMerakiCredentials(cfg)) {
+    return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
+  }
+  const id = c.req.param("id");
+  const existing = await getMerakiCredential(cfg, id);
+  if (!existing) return c.json({ error: "not found" }, 404);
+  try {
+    await deleteMerakiCredential(cfg, id);
+    await writeAudit(cfg, {
+      operator: c.var.user.displayName,
+      operatorEmail: c.var.user.email,
+      action: "delete",
+      detail: `Meraki 接続情報を削除: ${existing.label} (network=${existing.networkId})`,
+    });
+    return c.json({ ok: true });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: `削除失敗: ${msg}` }, 500);
+  }
+});
+
+/** API キーをマスク表示用に変換（ラスト 4 文字のみ残す）。 */
+function maskApiKey(key: string): string {
+  if (!key) return "";
+  if (key.length <= 4) return "****";
+  return "*".repeat(key.length - 4) + key.slice(-4);
+}
+
 /** GET /api/diff?before=<id>&after=<id> — diff two versions. */
 api.get("/diff", async (c) => {
   const cfg = c.var.cfg;
@@ -436,6 +821,107 @@ api.get("/diff", async (c) => {
   });
 
   return c.json({ diff });
+});
+
+interface VersionMetaBody {
+  purpose?: string;
+  note?: string;
+  serialNumber?: string;
+  customer?: string;
+  hostname?: string;
+  ipAddress?: string;
+}
+
+/** PUT /api/versions/:id — 既存バージョンのメタ情報を編集する。
+ *  編集可能なのは purpose / note / serialNumber / customer / hostname /
+ *  ipAddress のみ。body・hash・generation・detected は変更不可 (一意性保証)。
+ *  誤登録のメタ情報修正や、後からの用途・メモ追加に使う。 */
+api.put("/versions/:id", async (c) => {
+  const cfg = c.var.cfg;
+  const id = c.req.param("id");
+  const payload = await c.req.json<VersionMetaBody>().catch(() => null);
+  if (!payload) return c.json({ error: "invalid JSON body" }, 400);
+
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+  const before = identifiersFromRecord(rec);
+
+  // 未指定のフィールドは更新しない。空文字列明示的な場合はクリア可能。
+  const update: VersionMetaBody = {};
+  if (payload.purpose !== undefined) update.purpose = payload.purpose.trim();
+  if (payload.note !== undefined) update.note = payload.note;
+  if (payload.serialNumber !== undefined)
+    update.serialNumber = payload.serialNumber.trim();
+  if (payload.customer !== undefined) update.customer = payload.customer.trim();
+  if (payload.hostname !== undefined) update.hostname = payload.hostname.trim();
+  if (payload.ipAddress !== undefined) {
+    const trimmed = payload.ipAddress.trim();
+    if (!trimmed) {
+      return c.json(
+        { error: "IPアドレスは必須項目のため空にはできません" },
+        400,
+      );
+    }
+    update.ipAddress = trimmed;
+  }
+
+  // 何れも指定が無い場合は更新不要。
+  if (Object.keys(update).length === 0) {
+    return c.json({ error: "更新対象フィールドがありません" }, 400);
+  }
+
+  try {
+    await updateVersionMeta(cfg, id, update);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: `更新失敗: ${msg}` }, 500);
+  }
+
+  // 変更内容を監査ログへ。どのフィールドが変わったかを detail に記録。
+  const changedFields = Object.keys(update);
+  await writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "edit",
+    customer: update.customer ?? before.customer,
+    hostname: update.hostname ?? before.hostname,
+    generation: Number.parseInt(rec["generation"]?.value ?? "0", 10) || undefined,
+    detail: `メタ情報を編集: ${changedFields.join(", ")}`,
+  });
+
+  return c.json({ ok: true, updated: changedFields });
+});
+
+/** DELETE /api/versions/:id — バージョンを削除する。
+ *  誤登録の取り消し用。世代の歯抜けが生じるが、latestGenerationFor は
+ *  最大値を追うため重複は発生しない。コンフィグ本文は復元できないため、
+ *  UI 側で確認ダイアログを必ず出すこと。 */
+api.delete("/versions/:id", async (c) => {
+  const cfg = c.var.cfg;
+  const id = c.req.param("id");
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+  const ids = identifiersFromRecord(rec);
+  const generation = Number.parseInt(rec["generation"]?.value ?? "0", 10) || 0;
+
+  try {
+    await deleteVersion(cfg, id);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: `削除失敗: ${msg}` }, 500);
+  }
+
+  await writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "delete",
+    customer: ids.customer,
+    hostname: ids.hostname,
+    generation,
+    detail: `世代 #${generation} を削除 (id=${id})`,
+  });
+
+  return c.json({ ok: true });
 });
 
 /** GET /api/audit — recent operator activity. */

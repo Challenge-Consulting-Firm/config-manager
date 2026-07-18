@@ -25,10 +25,35 @@ export async function apiFetch<T>(
     throw new ApiError(401, "unauthenticated");
   }
   const text = await res.text();
-  const json = text ? JSON.parse(text) : null;
+  // BFF が JSON 以外 (例: Hono デフォルトの "Internal Server Error") を返した
+  // 場合でもクラッシュしないよう、JSON パースは try/catch で保護する。
+  let json: unknown = null;
+  if (text) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      // JSON でないテキストが返ってきた場合は、そのテキストをメッセージとして扱う。
+      // res.ok でなければ下のエラー分岐で ApiError へ流れる。
+      if (!res.ok) {
+        throw new ApiError(
+          res.status,
+          text.slice(0, 500) || `request failed (${res.status})`,
+          text,
+        );
+      }
+      // res.ok なのに JSON でない場合は呼び出し元で扱えるようそのまま返す。
+      throw new ApiError(
+        res.status,
+        `expected JSON response but got: ${text.slice(0, 200)}`,
+        text,
+      );
+    }
+  }
   if (!res.ok) {
     const message =
-      (json && typeof json === "object" && "error" in json && String(json.error)) ||
+      (json && typeof json === "object" && json !== null && "error" in json
+        ? String((json as Record<string, unknown>).error)
+        : "") ||
       `request failed (${res.status})`;
     throw new ApiError(res.status, message, json);
   }

@@ -57,6 +57,30 @@ app.use(logger());
 // is accepted but runaway payloads are rejected early with HTTP 413.
 app.use("*", bodyLimit({ maxSize: 6 * 1024 * 1024 }));
 
+// 末捕獲例外のフォーマットを統一する。/api/* へのリクエストでは JSON を返し、
+// それ以外 (SPA fallback 等) ではプレーンテキストを返す。これにより、ハンドラ内で
+// 例外が飛んだ際に Hono 既定の "Internal Server Error" プレーンテキストが返り、
+// クライアント側で "SyntaxError: Unexpected token 'I'..." と JSON パースに失敗する
+// 問題を防ぐ。開発時 (NODE_ENV !== production) にはエラーメッセージとスタックトーレスも返す。
+app.onError((err, c) => {
+  console.error("[unhandled]", err);
+  const isApi = c.req.path.startsWith("/api/");
+  const message = err instanceof Error ? err.message : String(err);
+  if (isApi) {
+    const body: Record<string, unknown> = {
+      error: cfg.nodeEnv === "production" ? "internal server error" : message,
+    };
+    if (cfg.nodeEnv !== "production" && err instanceof Error) {
+      body.stack = err.stack;
+    }
+    return c.json(body, 500);
+  }
+  return c.text(
+    cfg.nodeEnv === "production" ? "Internal Server Error" : `Error: ${message}`,
+    500,
+  );
+});
+
 // ---- Health check (no auth) ----
 app.get("/healthz", (c) => c.text("ok"));
 

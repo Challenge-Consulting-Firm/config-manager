@@ -192,7 +192,8 @@ export type AuditAction =
   | "view"
   | "diff"
   | "download"
-  | "delete";
+  | "delete"
+  | "edit";
 
 export interface AuditLogEntry {
   id: string;
@@ -281,4 +282,29 @@ export interface RoutingRouteDiff {
   removed: RoutingRoute[];
   changed: RoutingRouteChange[];
   unchanged: number;
+}
+
+// ===== Meraki credentials =====
+
+/** 登録済みの Meraki 接続情報（ネットワーク ID + API キーのセット）。
+ *  Kintone の任意アプリ（nw_meraki_credentials）に保存され、Meraki 取得
+ *  画面から選択して再利用できる。API キーは平文で保存されるため、取扱に
+ *  ついては README の「Meraki 連携」を参照のこと。 */
+export interface MerakiCredential {
+  /** Kintone レコード ID。 */
+  id: string;
+  /** 一覧表示用の名前。 */
+  label: string;
+  /** Meraki ネットワーク ID（L_xxx / N_xxx）。 */
+  networkId: string;
+  /** Meraki API キー。レスポンスに含めるかは BFF 設定に委ねる。 */
+  apiKey: string;
+  /** デフォルト顧客名（任意）。取得画面で補完に使う。 */
+  defaultCustomer?: string;
+  /** デフォルトホスト名（任意）。 */
+  defaultHostname?: string;
+  /** 自由メモ。 */
+  memo?: string;
+  /** 最終更新日時 (ms)。 */
+  updatedAt: number;
 }

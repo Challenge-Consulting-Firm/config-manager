@@ -1,0 +1,38 @@
+{
+  "comment": "Field definitions for the Meraki credentials app (nw_meraki_credentials). Field codes MUST match apps/bff/src/kintone.ts. Apply with: node scripts/setup-kintone.mjs --app meraki",
+  "properties": {
+    "label": {
+      "code": "label",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "表示名",
+      "required": true
+    },
+    "network_id": {
+      "code": "network_id",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "ネットワークID",
+      "required": true
+    },
+    "api_key": {
+      "code": "api_key",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "APIキー",
+      "required": true
+    },
+    "default_customer": {
+      "code": "default_customer",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "デフォルト顧客"
+    },
+    "default_hostname": {
+      "code": "default_hostname",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "デフォルトホスト名"
+    },
+    "memo": {
+      "code": "memo",
+      "type": "MULTI_LINE_TEXT",
+      "label": "メモ"
+    }
+  }
+}

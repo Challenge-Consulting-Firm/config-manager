@@ -40,12 +40,20 @@ export function DevicesPage() {
     <div>
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-xl font-semibold text-slate-900">機器一覧</h1>
-        <Link
-          to="/upload"
-          className="rounded-md bg-blue-600 px-3 py-2 text-sm text-white hover:bg-blue-700"
-        >
-          + コンフィグ登録
-        </Link>
+        <div className="flex gap-2">
+          <Link
+            to="/upload"
+            className="rounded-md bg-blue-600 px-3 py-2 text-sm text-white hover:bg-blue-700"
+          >
+            + コンフィグ登録
+          </Link>
+          <Link
+            to="/meraki"
+            className="rounded-md border border-blue-300 bg-white px-3 py-2 text-sm text-blue-700 hover:bg-blue-50"
+          >
+            Meraki 取得
+          </Link>
+        </div>
       </div>
 
       <div className="mb-4 flex flex-wrap items-center gap-3">

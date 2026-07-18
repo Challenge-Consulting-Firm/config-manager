@@ -1,15 +1,23 @@
 #!/usr/bin/env node
 /**
- * Create the Kintone field definitions for the config-management and audit-log
- * apps. The field codes here MUST match the codes read/written by the BFF in
- * apps/bff/src/kintone.ts.
+ * Create the Kintone field definitions for the config-management, audit-log,
+ * and Meraki credentials apps. The field codes here MUST match the codes
+ * read/written by the BFF in apps/bff/src/kintone.ts.
  *
  * Authentication: this script uses the **API token** of the *target app* (the
- * app whose fields are being created). The token must have app-management
- * permission enabled. No Kintone user ID/password is required.
+ * app whose fields are being created). The token must have **アプリ管理**
+ * (app management) permission enabled because field creation calls the preview
+ * (form settings) API. No Kintone user ID/password is required.
+ *
+ * IMPORTANT: This setup-only token is DIFFERENT from the operation token
+ * configured in README > B-4. The operation token only needs record
+ * read/add/update permissions. After running this script, DELETE the
+ * app-management token from the Kintone portal and keep only the operation
+ * token in .env. See README > B-4 for the permission design.
  *
  *   - For --app config it uses KINTONE_CONFIG_APP_TOKEN / KINTONE_CONFIG_APP_ID
  *   - For --app audit  it uses KINTONE_AUDIT_APP_TOKEN  / KINTONE_AUDIT_APP_ID
+ *   - For --app meraki it uses KINTONE_MERAKI_APP_TOKEN / KINTONE_MERAKI_APP_ID
  *
  * Note: API tokens can ADD/DELETE form fields (preview APIs) on this Kintone
  * domain, but CANNOT read app settings (GET returns 401). So this script only
@@ -18,13 +26,16 @@
  * apply. Inspect the form in the Kintone portal to see results.
  *
  * Usage:
- *   1. In the target app's 設定 > APIトークン, generate a token and enable the
- *      アプリ管理 (app management) permission, then click アプリを更新.
+ *   1. In the target app's 設定 > APIトークン, generate a **temporary** token
+ *      with アプリ管理 (app management) permission, then click アプリを更新.
  *   2. Put the token + app id in .env.
  *   3. Run:
  *        node scripts/setup-kintone.mjs --app config
  *        node scripts/setup-kintone.mjs --app audit
+ *        node scripts/setup-kintone.mjs --app meraki
  *        node scripts/setup-kintone.mjs --app all
+ *   4. After success, DELETE this temporary token in the Kintone portal and
+ *      switch .env back to the operation token (record permissions only).
  */
 
 import { readFileSync } from "node:fs";
@@ -79,7 +90,15 @@ function targetFor(which) {
       file: "audit-app-fields.json",
     };
   }
-  die(`Unknown --app value: ${which}. Use config | audit | all.`);
+  if (which === "meraki") {
+    return {
+      label: "Meraki 接続情報",
+      token: process.env.KINTONE_MERAKI_APP_TOKEN,
+      appId: process.env.KINTONE_MERAKI_APP_ID,
+      file: "meraki-app-fields.json",
+    };
+  }
+  die(`Unknown --app value: ${which}. Use config | audit | meraki | all.`);
 }
 
 const DOMAIN = process.env.KINTONE_DOMAIN;
@@ -105,8 +124,10 @@ async function applyFields({ label, token, appId, file }) {
   if (!token || token.startsWith("your-")) {
     die(
       `${label}: the API token is not set (still placeholder). Generate a ` +
-        `token with app-management permission in the app's 設定 > APIトークン ` +
-        `and set it in .env.`,
+        `**temporary** token with アプリ管理 (app management) permission in ` +
+        `the app's 設定 > APIトークン and set it in .env. After running this ` +
+        `script, delete this token and switch back to the operation token ` +
+        `(record permissions only). See README > B-4.`,
     );
   }
   if (!appId) die(`${label}: the app id is not set in .env.`);
@@ -175,14 +196,16 @@ async function applyFields({ label, token, appId, file }) {
 async function main() {
   const idx = process.argv.indexOf("--app");
   const which = idx >= 0 ? process.argv[idx + 1] : "all";
-  const targets = which === "all" ? ["config", "audit"] : [which];
+  const targets = which === "all" ? ["config", "audit", "meraki"] : [which];
   for (const t of targets) {
     await applyFields(targetFor(t));
   }
   console.log(
     "\n✓ Done. Open each app's 設定 > フォーム in the portal to verify the " +
-      "fields, then make sure the API token has the record read/add/update " +
-      "permissions (and app management if you'll re-run this script).",
+      "fields.\n" +
+      "  IMPORTANT: Delete the temporary アプリ管理 token used for this " +
+      "setup and switch .env back to the operation token (record permissions " +
+      "only). See README > B-4.",
   );
 }
 

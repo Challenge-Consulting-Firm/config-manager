@@ -3,6 +3,8 @@ import { useAuth } from "./auth";
 import { DevicesPage } from "./pages/DevicesPage";
 import { DeviceDetailPage } from "./pages/DeviceDetailPage";
 import { UploadPage } from "./pages/UploadPage";
+import { MerakiImportPage } from "./pages/MerakiImportPage";
+import { MerakiCredentialsPage } from "./pages/MerakiCredentialsPage";
 import { DiffPage } from "./pages/DiffPage";
 import { SearchPage } from "./pages/SearchPage";
 import { AuditPage } from "./pages/AuditPage";
@@ -58,6 +60,8 @@ export default function App() {
           <nav className="flex items-center gap-1 text-sm">
             <NavItem to="/">機器一覧</NavItem>
             <NavItem to="/upload">アップロード</NavItem>
+            <NavItem to="/meraki">Meraki 取得</NavItem>
+            <NavItem to="/meraki/credentials">接続情報</NavItem>
             <NavItem to="/search">検索</NavItem>
             <NavItem to="/audit">作業履歴</NavItem>
           </nav>
@@ -81,6 +85,8 @@ export default function App() {
           <Route path="/" element={<DevicesPage />} />
           <Route path="/devices/:key" element={<DeviceDetailPage />} />
           <Route path="/upload" element={<UploadPage />} />
+          <Route path="/meraki" element={<MerakiImportPage />} />
+          <Route path="/meraki/credentials" element={<MerakiCredentialsPage />} />
           <Route path="/diff" element={<DiffPage />} />
           <Route path="/search" element={<SearchPage />} />
           <Route path="/versions/:id/firewall" element={<FirewallPage />} />

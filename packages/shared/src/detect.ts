@@ -404,6 +404,56 @@ const rules: Rule[] = [
       };
     },
   },
+  // ----- Cisco Meraki (Dashboard API ダンプ) -----
+  // apps/bff/src/meraki.ts が Meraki Dashboard API から取得した結果を
+  // テキストへシリアライズしたもの。先頭行の固定ヘッダ
+  // `! Meraki Network Configuration Dump` で確実に識別できる。
+  {
+    name: "cisco-meraki",
+    detect: (lines) => {
+      const header = lines.find((l) =>
+        /^!\s*Meraki Network Configuration Dump/i.test(l),
+      );
+      if (!header) return null;
+      const nameLine = lines.find((l) =>
+        /^!\s*Network:\s+(.+)\s+\(([^)]+)\)/i.test(l),
+      );
+      const hostname = nameLine
+        ? (nameLine.match(/^!\s*Network:\s+(.+?)\s+\(([^)]+)\)/i)?.[1] ??
+          "")
+        : "";
+      const productsLine = lines.find((l) =>
+        /^!\s*Products:/i.test(l),
+      );
+      const products = productsLine
+        ? (productsLine.match(/^!\s*Products:\s*(.+)$/i)?.[1] ?? "").trim()
+        : "";
+      // device 行から管理 IP を拾う。lanIp (プライベート IP) を優先し、
+      // 無ければ publicIp (WAN IP) にフォールバックする。
+      const lanIpLine = lines.find((l) =>
+        /^device\s+.*lanIp=(\d+\.\d+\.\d+\.\d+)/i.test(l),
+      );
+      const publicIpLine = lines.find((l) =>
+        /^device\s+.*publicIp=(\d+\.\d+\.\d+\.\d+)/i.test(l),
+      );
+      const ipAddress = lanIpLine
+        ? (lanIpLine.match(/lanIp=(\d+\.\d+\.\d+\.\d+)/i)?.[1] ?? "")
+        : publicIpLine
+          ? (publicIpLine.match(/publicIp=(\d+\.\d+\.\d+\.\d+)/i)?.[1] ?? "")
+          : "";
+      return {
+        vendor: "Cisco Meraki",
+        // 製品タイプも OS 欄に含めておく（MX+MS+MR 等）。
+        os: products ? `Meraki (${products})` : "Meraki",
+        osVersion: "",
+        // ダンプに単一の機種は無い（ネットワーク全体）ので model は空。
+        model: "",
+        hostname,
+        ipAddress,
+        confidence: 0.95,
+      };
+    },
+  },
 ];
 
 /** Detect vendor/OS/model from a raw config body. Returns EMPTY_DETECTION

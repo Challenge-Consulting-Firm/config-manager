@@ -20,7 +20,8 @@
         "view": { "label": "view", "index": 1 },
         "diff": { "label": "diff", "index": 2 },
         "download": { "label": "download", "index": 3 },
-        "delete": { "label": "delete", "index": 4 }
+        "delete": { "label": "delete", "index": 4 },
+        "edit": { "label": "edit", "index": 5 }
       }
     },
     "customer": {
