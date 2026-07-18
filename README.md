@@ -67,16 +67,16 @@ Kintone ポータルから、**フィールド未定義の空アプリ**を 2 �
 
 `scripts/kintone/*.json` にフィールド定義があります（コード・種類・ラベル）。これを Kintone に反映するスクリプトを用意しています。
 
-**注意:** フォーム設定（フィールドの追加）は **API トークンでは実行できません**。Kintone ユーザー（アプリ管理権限）の **パスワード認証** が必要です。Kintone が SAML（Entra ID）専用でパスワード認証が無効な場合は B-3 の手動手順を使ってください。
+**認証:** スクリプトは各アプリの **API トークン**（`X-Cybozu-API-Token`）でフィールド作成を実行します。Kintone ユーザーの ID/パスワードは不要です。ただしフォーム設定（preview API）を呼ぶため、対象アプリの **API トークンで「アプリ管理」権限を有効** にする必要があります（「設定 > APIトークン」で生成後に「アプリを更新」を忘れないこと）。
 
-`.env` に以下を設定:
+`.env` に以下を設定します（B-1 でメモしたアプリ ID と、各アプリで発行した API トークン）:
 
 ```env
 KINTONE_DOMAIN=xxx.cybozu.com
 KINTONE_CONFIG_APP_ID=338
+KINTONE_CONFIG_APP_TOKEN=（コンフィグ管理アプリの API トークン）
 KINTONE_AUDIT_APP_ID=339
-KINTONE_ADMIN_USERNAME=（アプリ管理権限のある Kintone ユーザー名）
-KINTONE_ADMIN_PASSWORD=（上記ユーザーのパスワード）
+KINTONE_AUDIT_APP_TOKEN=（作業履歴アプリの API トークン）
 ```
 
 実行:
