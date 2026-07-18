@@ -1,25 +1,28 @@
-# fly.io configuration for the config-manager BFF (also serves the SPA).
-# Generate a real one with `fly launch`, then layer in the values below.
+# fly.toml app configuration file generated for config-manager on 2026-07-18T16:13:10+09:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "config-manager"
-primary_region = "nrt"
+app = 'config-manager'
+primary_region = 'nrt'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [http_service]
   internal_port = 3000
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
   [http_service.concurrency]
-    type = "requests"
+    type = 'requests'
     hard_limit = 250
     soft_limit = 200
 
 [[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
+  memory = '512mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 512

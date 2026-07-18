@@ -14,8 +14,6 @@ const COOKIE_NAME = "cm_session";
 
 export interface SessionData {
   user?: AuthUser;
-  accessToken?: string;
-  refreshToken?: string;
   pkceVerifier?: string;
   oauthState?: string;
   returnTo?: string;
@@ -64,7 +62,9 @@ export class Session {
     this.destroyed = true;
     setCookie(this.ctx, COOKIE_NAME, "", {
       httpOnly: true,
-      sameSite: "Lax",
+      // Match the cookie attributes used in save(); otherwise some browsers
+      // ignore the expiry on the deletion path.
+      sameSite: cookieSameSite(this.options.secure),
       secure: this.options.secure,
       path: "/",
       expires: new Date(0),
@@ -80,12 +80,32 @@ export class Session {
     });
     setCookie(this.ctx, COOKIE_NAME, sealed, {
       httpOnly: true,
-      sameSite: "Lax",
+      // SameSite=None is required so the session cookie survives the
+      // cross-site redirect chain from login.microsoftonline.com back to
+      // /auth/callback. On fly.dev (a public suffix in the PSL) Lax cookies
+      // set during that chain are deferred/rejected by modern browsers,
+      // which manifests as a 401 loop right after a successful OIDC login.
+      // None requires Secure, so we only use it when secure=true (prod);
+      // local dev keeps Lax because HTTP cannot use Secure.
+      sameSite: cookieSameSite(this.options.secure),
       secure: this.options.secure,
       path: "/",
       maxAge: 60 * 60 * 24 * 7,
     });
+    // Log the size so we can detect 4 KiB browser-limit overruns in Fly logs.
+    // Browsers silently drop cookies larger than ~4096 bytes, which previously
+    // caused a post-login 401 loop.
+    console.log(
+      `[session] saved cookie: ${sealed.length} bytes, keys=${Object.keys(this.data).join(",") || "(empty)"}`,
+    );
   }
+}
+
+/** SameSite policy: `None` (with Secure) in production so the OIDC
+ *  cross-site redirect callback can set the session cookie; `Lax` in
+ *  local dev because HTTP cannot use `Secure` (required for `None`). */
+function cookieSameSite(secure: boolean): "None" | "Lax" {
+  return secure ? "None" : "Lax";
 }
 
 export async function getSession(

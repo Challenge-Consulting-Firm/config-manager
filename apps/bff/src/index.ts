@@ -119,12 +119,34 @@ app.get("/auth/callback", async (c) => {
     }
 
     session.set("user", user);
-    session.set("accessToken", tokens.access_token);
-    if (tokens.refresh_token) session.set("refreshToken", tokens.refresh_token);
+    // We intentionally do NOT store the access/refresh tokens in the cookie
+    // session: they are only needed for the optional group-membership check
+    // above, and storing them bloats the encrypted cookie past the 4 KiB
+    // browser limit — the browser then silently drops it, causing a 401 loop.
+    // If a refresh / Graph call becomes necessary later, move to a server-side
+    // session store instead of expanding the cookie.
     session.clearTransient();
     await session.save();
     const returnTo = session.get("returnTo") || "/";
-    return c.redirect(returnTo);
+    // IMPORTANT: return an HTML interstitial that does a same-origin client-side
+    // redirect, instead of a 302. When the OIDC callback arrives via a
+    // cross-site redirect from login.microsoftonline.com, browsers (Chrome on
+    // fly.dev which is in the Public Suffix List, Safari/ITP) sometimes defer
+    // or drop Set-Cookie issued alongside a 302 in that chain — which leaves
+    // the session cookie unset and /auth/me returns 401 in a loop. Serving a
+    // 200 HTML page first lets the Set-Cookie land in a same-origin response,
+    // and the subsequent navigation is a normal same-origin request that
+    // carries the cookie.
+    return c.html(
+      `<!doctype html><html><head><meta charset="utf-8">` +
+        `<title>Logging in…</title>` +
+        `<meta http-equiv="refresh" content="0; url=${escapeHtml(returnTo)}">` +
+        `<script>location.replace(${JSON.stringify(returnTo)});</script>` +
+        `</head><body>` +
+        `<p>ログインしました。続行中…</p>` +
+        `<p><a href="${escapeHtml(returnTo)}">進む</a></p>` +
+        `</body></html>`,
+    );
   } catch (err) {
     console.error("[auth/callback] token exchange failed:", err);
     return c.text("Authentication failed. See server logs.", 500);
@@ -221,5 +243,17 @@ serve(
     }
   },
 );
+
+/** Minimal HTML escaper for interpolating user-controllable paths into the
+ *  OIDC callback interstitial page. `returnTo` is constrained to start with
+ *  `/` by /auth/login, but we still escape defensively. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 
