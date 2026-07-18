@@ -23,13 +23,25 @@ export default function App() {
   if (!user) {
     // Should normally be redirected by the BFF; offer a manual login link.
     return (
-      <div className="flex h-screen items-center justify-center">
-        <a
-          href="/auth/login"
-          className="rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
-        >
-          Entra ID でログイン
-        </a>
+      <div className="flex h-screen items-center justify-center bg-slate-50">
+        <div className="w-full max-w-sm rounded-lg border border-slate-200 bg-white p-8 text-center shadow-sm">
+          <AppIcon className="mx-auto h-14 w-14 rounded-md" />
+          <h1 className="mt-4 text-xl font-semibold text-slate-900">
+            NW Config Manager
+          </h1>
+          <p className="mt-1 text-sm text-slate-500">
+            ネットワーク機器設定管理システム
+          </p>
+          <p className="mt-4 text-sm text-slate-600">
+            続行するには Entra ID でログインしてください。
+          </p>
+          <a
+            href="/auth/login"
+            className="mt-6 inline-block w-full rounded-md bg-blue-600 px-4 py-2 text-white hover:bg-blue-700"
+          >
+            Entra ID でログイン
+          </a>
+        </div>
       </div>
     );
   }
