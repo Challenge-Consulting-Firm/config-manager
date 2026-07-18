@@ -1,0 +1,105 @@
+{
+  "comment": "Field definitions for the NW config-management app (nw_configs). Field codes MUST match apps/bff/src/kintone.ts. Apply with: node scripts/setup-kintone.mjs --app config",
+  "properties": {
+    "customer": {
+      "code": "customer",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "顧客",
+      "required": true
+    },
+    "hostname": {
+      "code": "hostname",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "ホスト名",
+      "required": true
+    },
+    "ip_address": {
+      "code": "ip_address",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "IPアドレス",
+      "required": true
+    },
+    "purpose": {
+      "code": "purpose",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "用途"
+    },
+    "serial_number": {
+      "code": "serial_number",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "シリアル番号"
+    },
+    "vendor": {
+      "code": "vendor",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "ベンダー（自動）"
+    },
+    "device_os": {
+      "code": "device_os",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "OS（自動）"
+    },
+    "os_version": {
+      "code": "os_version",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "OSバージョン（自動）"
+    },
+    "detected_model": {
+      "code": "detected_model",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "機種（自動）"
+    },
+    "fw_rules_json": {
+      "code": "fw_rules_json",
+      "type": "MULTI_LINE_TEXT",
+      "label": "FWポリシー抽出結果（JSON）"
+    },
+    "role": {
+      "code": "role",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "稼働区分",
+      "required": true
+    },
+    "generation": {
+      "code": "generation",
+      "type": "NUMBER",
+      "label": "世代番号",
+      "required": true
+    },
+    "body": {
+      "code": "body",
+      "type": "MULTI_LINE_TEXT",
+      "label": "コンフィグ本文"
+    },
+    "hash": {
+      "code": "hash",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "ハッシュ"
+    },
+    "operator": {
+      "code": "operator",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "作業者"
+    },
+    "operator_email": {
+      "code": "operator_email",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "作業者メール"
+    },
+    "note": {
+      "code": "note",
+      "type": "MULTI_LINE_TEXT",
+      "label": "メモ"
+    },
+    "size": {
+      "code": "size",
+      "type": "NUMBER",
+      "label": "サイズ(バイト)"
+    },
+    "lines": {
+      "code": "lines",
+      "type": "NUMBER",
+      "label": "行数"
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "comment": "Field definitions for the audit-log app (nw_audit_logs). Field codes MUST match apps/bff/src/kintone.ts. Apply with: node scripts/setup-kintone.mjs --app audit",
+  "properties": {
+    "operator": {
+      "code": "operator",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "作業者"
+    },
+    "operator_email": {
+      "code": "operator_email",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "作業者メール"
+    },
+    "action": {
+      "code": "action",
+      "type": "DROP_DOWN",
+      "label": "操作",
+      "options": {
+        "upload": { "label": "upload", "index": 0 },
+        "view": { "label": "view", "index": 1 },
+        "diff": { "label": "diff", "index": 2 },
+        "download": { "label": "download", "index": 3 },
+        "delete": { "label": "delete", "index": 4 }
+      }
+    },
+    "customer": {
+      "code": "customer",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "顧客"
+    },
+    "hostname": {
+      "code": "hostname",
+      "type": "SINGLE_LINE_TEXT",
+      "label": "ホスト名"
+    },
+    "generation": {
+      "code": "generation",
+      "type": "NUMBER",
+      "label": "世代番号"
+    },
+    "detail": {
+      "code": "detail",
+      "type": "MULTI_LINE_TEXT",
+      "label": "詳細"
+    }
+  }
+}
