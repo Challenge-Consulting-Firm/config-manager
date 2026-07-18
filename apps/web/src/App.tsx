@@ -6,6 +6,8 @@ import { UploadPage } from "./pages/UploadPage";
 import { DiffPage } from "./pages/DiffPage";
 import { AuditPage } from "./pages/AuditPage";
 import { FirewallPage } from "./pages/FirewallPage";
+import { RoutingPage } from "./pages/RoutingPage";
+import { AppIcon } from "./components/AppIcon";
 
 export default function App() {
   const { user, loading, logout } = useAuth();
@@ -37,7 +39,7 @@ export default function App() {
       <header className="border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
           <Link to="/" className="flex items-center gap-2 font-semibold text-slate-900">
-            <span className="flex h-8 w-8 items-center justify-center rounded bg-blue-600 text-white">N</span>
+            <AppIcon className="h-8 w-8 rounded-md" />
             NW Config Manager
           </Link>
           <nav className="flex items-center gap-1 text-sm">
@@ -67,6 +69,7 @@ export default function App() {
           <Route path="/upload" element={<UploadPage />} />
           <Route path="/diff" element={<DiffPage />} />
           <Route path="/versions/:id/firewall" element={<FirewallPage />} />
+          <Route path="/versions/:id/routing" element={<RoutingPage />} />
           <Route path="/audit" element={<AuditPage />} />
         </Routes>
       </main>

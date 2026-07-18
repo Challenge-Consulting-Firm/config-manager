@@ -27,6 +27,8 @@ Kintone の API トークンをブラウザに晒さないため、fly.io 上の
 - ドラッグ & ドロップでアップロード（`.conf` / `.cfg` / `.txt` / `.log`）。
 - アップロード時に **コメント行・空白行・末尾空白** を除去して SHA-256 を計算し、実質的な変更だけを世代として残す。
 - Web 上で任意の 2 世代を Diff 表示（サイドバイサイド、`+/-` 表示、パッチ形式でダウンロード可）。
+- **FWポリシー / ACL マトリクス**：コンフィグからFWルール・ACLを抽出し、一覧表示・送信元×宛先マトリクス表示・Excel/CSV出力が可能（Cisco IOS/IOS-XE/NX-OS/ASA、Juniper、Fortinet、YAMAHA に対応）。
+- **ルーティングテーブル可視化**：コンフィグからスタティックルート・接続インターフェース・OSPF/BGP サマリを抽出し、ルート一覧・プロトコル別マトリクス表示・Excel/CSV出力が可能。Excel出力には「Routes」「Matrix」「Protocol Summary」の 3 シートが含まれます。
 - 識別子として **顧客・IPアドレス・ホスト名・用途・シリアル番号・稼働区分（本番/予備）** を持つ。
 - **本番/予備のタグ管理**。予備機は「本番への昇格」アクションで、最新コンフィグを本番新世代として登録可能（故障時差し替えを想定）。
 - **本番↔予備比較**：同じ顧客・ホスト名の本番機と予備機の最新コンフィグを1クリックで Diff 表示。
@@ -108,6 +110,8 @@ node scripts/setup-kintone.mjs --app audit
 | メモ | 文字列(複数行) | `note` |
 | サイズ | 数値 | `size` |
 | 行数 | 数値 | `lines` |
+| FWポリシー抽出結果（JSON） | 文字列(複数行) | `fw_rules_json` |
+| ルーティング抽出結果（JSON） | 文字列(複数行) | `routing_routes_json` |
 
 **作業履歴アプリ:**
 
@@ -227,10 +231,11 @@ config-manager/
 │   │   └── scripts/copy-assets.js
 │   └── web/        # React + Vite + Tailwind
 │       └── src/
-│           ├── pages/        # 機器一覧 / 詳細 / アップロード / Diff / 履歴
-│           └── components/DiffViewer.tsx
+│           ├── pages/        # 機器一覧 / 詳細 / アップロード / Diff / FWマトリクス / ルーティング / 履歴
+│           ├── components/DiffViewer.tsx
+│           └── utils/        # firewallExport.ts / routingExport.ts
 ├── packages/
-│   └── shared/     # 型定義 + 正規化ロジック + LCS ベース diff + OS/機種識別
+│   └── shared/     # 型定義 + 正規化ロジック + LCS ベース diff + OS/機種識別 + FW抽出 + ルーティング抽出
 ├── scripts/
 │   ├── setup-kintone.mjs          # Kintone アプリのフィールド一括作成
 │   └── kintone/                   # フィールド定義 JSON（config / audit）
@@ -244,3 +249,4 @@ config-manager/
 - ID トークンをデコードするだけで署名検証は最低限。BFF が信頼する HTTPS トークンエンドポイント経由でのみトークンを取得しているため実用上は安全ですが、厳密には JWKS 検証を追加するとより強固です。
 - 大容量コンフィグ（数百 KB 超）の場合は Kintone のフィールドサイズ上限（文字列複数行は 1 レコードあたり 10MB まで、ただし REST では推奨 64KB 程度）に注意してください。
 - コンフィグ本文は平文で Kintone に保存します。機密情報（PSK など）のマスキングが必要な場合は、正規化ロジックに追加してください。
+- ルーティング抽出はベストエフォートです。OSPF/BGP はサマリ情報（エリア番号・AS番号・ネイバー・`network` 宣言）を抽出し、実際の学習経路（show ip route の出力）はコンフィグからは取れないため含まれません。複雑な再配送や route-map は raw 行としてのみ記録されます。

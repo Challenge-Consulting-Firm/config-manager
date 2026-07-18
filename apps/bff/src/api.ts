@@ -11,20 +11,25 @@ import {
   detectedFromRecord,
   getVersionRecord,
   getFwCacheRaw,
+  getRoutingCacheRaw,
   identifiersFromRecord,
   latestGenerationFor,
   listAudit,
   listVersions,
   setFwCache,
+  setRoutingCache,
   writeAudit,
 } from "./kintone.js";
 import {
   diffConfigs,
   detectDeviceInfo,
   extractFirewallRules,
+  extractRoutingRoutes,
   normalizeConfig,
   parseFirewallCache,
+  parseRoutingCache,
   serializeFirewallRules,
+  serializeRoutingRoutes,
 } from "@config-manager/shared";
 import type {
   AuthUser,
@@ -180,6 +185,34 @@ api.get("/versions/:id/firewall", async (c) => {
   return c.json({ rules, fromCache, count: rules.length });
 });
 
+/** GET /api/versions/:id/routing — cached routing routes. Returns the
+ *  persisted extraction result; if missing or stale (body hash mismatch),
+ *  recomputes on the fly and persists for next time. This keeps the routing
+ *  page fast regardless of config size or route count. */
+api.get("/versions/:id/routing", async (c) => {
+  const cfg = c.var.cfg;
+  const id = c.req.param("id");
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+
+  const val = (k: string) => rec[k]?.value ?? "";
+  const hash = val("hash");
+  const rawBody = val("body");
+  const detected = detectedFromRecord(rec);
+
+  // Try the cache first.
+  let routes = parseRoutingCache(getRoutingCacheRaw(rec), hash);
+  let fromCache = routes !== null;
+  if (routes === null) {
+    // Cache miss: recompute and persist.
+    routes = extractRoutingRoutes(rawBody, detected);
+    void setRoutingCache(cfg, id, serializeRoutingRoutes(routes, hash));
+    fromCache = false;
+  }
+
+  return c.json({ routes, fromCache, count: routes.length });
+});
+
 interface UploadBody {
   customer?: string;
   hostname?: string;
@@ -236,6 +269,9 @@ api.post("/upload", async (c) => {
   // matrix page does not need to re-parse on every view.
   const fwRules = extractFirewallRules(body, detected);
   const fwRulesJson = serializeFirewallRules(fwRules, normalized.hash);
+  // Likewise extract routing info once at upload time.
+  const routingRoutes = extractRoutingRoutes(body, detected);
+  const routingRoutesJson = serializeRoutingRoutes(routingRoutes, normalized.hash);
 
   // Detect an unchanged config (same hash as latest) and short-circuit.
   const prevGen = await latestGenerationFor(cfg, { customer, hostname, ipAddress, role });
@@ -263,6 +299,7 @@ api.post("/upload", async (c) => {
     note,
     detected,
     fwRulesJson,
+    routingRoutesJson,
   });
 
   await writeAudit(cfg, {
@@ -341,6 +378,7 @@ api.post("/promote", async (c) => {
     note: payload.note ?? `Promoted from spare (serial ${src.serialNumber || "-"})`,
     detected,
     fwRulesJson: serializeFirewallRules(extractFirewallRules(body, detected), hash),
+    routingRoutesJson: serializeRoutingRoutes(extractRoutingRoutes(body, detected), hash),
   });
 
   await writeAudit(cfg, {

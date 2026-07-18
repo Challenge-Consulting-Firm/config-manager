@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { useDropzone, type FileRejection } from "react-dropzone";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { apiFetch, ApiError } from "../apiClient";
 import { detectDeviceInfo, type DeviceDetection, type Role } from "@config-manager/shared";
 
@@ -23,12 +23,18 @@ interface UploadResult {
 }
 
 export function UploadPage() {
-  const [customer, setCustomer] = useState("");
-  const [hostname, setHostname] = useState("");
-  const [ipAddress, setIpAddress] = useState("");
-  const [purpose, setPurpose] = useState("");
-  const [serialNumber, setSerialNumber] = useState("");
-  const [role, setRole] = useState<Role>("production");
+  const [params] = useSearchParams();
+  // Identifier fields can be pre-filled via query params (e.g. when the user
+  // clicks "この機器に新世代をアップロード" on a device detail page). This lets
+  // the same device receive a new config generation without re-typing its
+  // identifiers, avoiding typo-induced device splits.
+  const presetRole: Role = params.get("role") === "spare" ? "spare" : "production";
+  const [customer, setCustomer] = useState(params.get("customer") ?? "");
+  const [hostname, setHostname] = useState(params.get("hostname") ?? "");
+  const [ipAddress, setIpAddress] = useState(params.get("ipAddress") ?? "");
+  const [purpose, setPurpose] = useState(params.get("purpose") ?? "");
+  const [serialNumber, setSerialNumber] = useState(params.get("serialNumber") ?? "");
+  const [role, setRole] = useState<Role>(presetRole);
   const [note, setNote] = useState("");
   const [rawText, setRawText] = useState<string>("");
   const [fileName, setFileName] = useState<string>("");
@@ -39,6 +45,7 @@ export function UploadPage() {
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const returnKey = params.get("from") || "/";
 
   const onDrop = useCallback(
     (files: File[], rejections: FileRejection[]) => {
@@ -64,13 +71,16 @@ export function UploadPage() {
           // Run detection client-side so we can auto-fill hostname / IP.
           const d = detectDeviceInfo(text);
           setDetected(d.confidence > 0 ? d : null);
-          if (d.hostname) {
+          // Only auto-fill hostname / IP when the user did NOT come from a
+          // device-specific link (i.e. no preset value). Otherwise respect the
+          // pre-filled identifiers of the device being updated.
+          if (!hostname && d.hostname) {
             setHostname(d.hostname);
             setAutoHost(true);
           } else {
             setAutoHost(false);
           }
-          if (d.ipAddress) {
+          if (!ipAddress && d.ipAddress) {
             setIpAddress(d.ipAddress);
             setAutoIp(true);
           } else {
@@ -133,12 +143,30 @@ export function UploadPage() {
 
   return (
     <div className="mx-auto max-w-3xl">
+      <div className="mb-2">
+        <button
+          onClick={() => navigate(returnKey)}
+          className="text-sm text-blue-700 hover:underline"
+        >
+          ← 戻る
+        </button>
+      </div>
       <h1 className="mb-4 text-xl font-semibold text-slate-900">
         コンフィグのアップロード
+        {params.get("hostname") && (
+          <span className="ml-2 text-base font-normal text-slate-600">
+            既存機器への新世代追加
+          </span>
+        )}
       </h1>
       <p className="mb-4 text-sm text-slate-600">
         ファイルをドラッグ&ドロップで登録します。コメント行・空白行・末尾空白は
         サーバー側で除去されたうえで世代管理されます。
+        {params.get("hostname") && (
+          <span className="ml-1 text-blue-700">
+            識別情報は選択中の機器から引き継いでいます。
+          </span>
+        )}
       </p>
 
       {/* 自動検出結果パネル */}
@@ -242,7 +270,7 @@ export function UploadPage() {
         </p>
         <div className="flex gap-2">
           <button
-            onClick={() => navigate("/")}
+            onClick={() => navigate(returnKey)}
             className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
           >
             キャンセル
@@ -285,10 +313,10 @@ export function UploadPage() {
                   </div>
                 )}
               <button
-                onClick={() => navigate("/")}
+                onClick={() => navigate(returnKey)}
                 className="ml-2 underline"
               >
-                機器一覧へ戻る
+                {params.get("hostname") ? "機器詳細へ戻る" : "機器一覧へ戻る"}
               </button>
             </>
           )}

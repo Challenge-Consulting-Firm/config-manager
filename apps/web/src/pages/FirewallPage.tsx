@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import type {
-  ConfigVersion,
-  DeviceIdentifiers,
-  FirewallRule,
+import {
+  expandFirewallRule,
+  firewallCategoryLabel,
+  type ConfigVersion,
+  type DeviceIdentifiers,
+  type FirewallRule,
+  type FirewallRuleCategory,
 } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
 import {
@@ -11,7 +14,8 @@ import {
   exportFirewallExcel,
 } from "../utils/firewallExport";
 
-type View = "rules" | "matrix";
+type View = "rules" | "matrix" | "expand";
+type CategoryFilter = "all" | "policy" | "nat" | "dos";
 
 export function FirewallPage() {
   const { id } = useParams<{ id: string }>();
@@ -25,6 +29,7 @@ export function FirewallPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("rules");
+  const [category, setCategory] = useState<CategoryFilter>("all");
   const [filter, setFilter] = useState("");
   const [exporting, setExporting] = useState(false);
 
@@ -55,15 +60,35 @@ export function FirewallPage() {
     })();
   }, [id]);
 
+  const categoryCounts = useMemo(() => {
+    const counts: Record<CategoryFilter, number> = {
+      all: rules.length,
+      policy: 0,
+      nat: 0,
+      dos: 0,
+    };
+    for (const r of rules) {
+      const c = r.category ?? "policy";
+      if (c === "nat" || c === "dos") counts[c]++;
+      else counts.policy++;
+    }
+    return counts;
+  }, [rules]);
+
+  const categoryFiltered = useMemo(() => {
+    if (category === "all") return rules;
+    return rules.filter((r) => (r.category ?? "policy") === category);
+  }, [rules, category]);
+
   const filtered = useMemo(() => {
     const terms = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return rules;
-    return rules.filter((r) => {
+    if (terms.length === 0) return categoryFiltered;
+    return categoryFiltered.filter((r) => {
       const hay =
-        `${r.name} ${r.action} ${r.protocol} ${r.source} ${r.destination} ${r.port}`.toLowerCase();
+        `${r.name} ${r.displayName ?? ""} ${r.category ?? "policy"} ${r.action} ${r.enabled === false ? "disable disabled 無効" : "enable enabled 有効"} ${r.protocol} ${r.source} ${r.destination} ${r.port} ${r.nat?.poolName ?? ""} ${r.comments ?? ""} ${r.attributes ?? ""}`.toLowerCase();
       return terms.every((t) => hay.includes(t));
     });
-  }, [rules, filter]);
+  }, [categoryFiltered, filter]);
 
   const detection = version?.detected;
   const filenameBase = `firewall-${ids?.hostname ?? "device"}-gen${version?.generation ?? "?"}`;
@@ -124,9 +149,28 @@ export function FirewallPage() {
         </div>
       </div>
 
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
+        {(["all", "policy", "nat", "dos"] as const).map((c) => (
+          <button
+            key={c}
+            onClick={() => setCategory(c)}
+            className={`rounded-full border px-3 py-1 ${
+              category === c
+                ? "border-blue-500 bg-blue-50 text-blue-700"
+                : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+            }`}
+          >
+            {categoryLabel(c)}
+            <span className="ml-1 text-xs text-slate-500">
+              {categoryCounts[c]}
+            </span>
+          </button>
+        ))}
+      </div>
+
       <div className="mb-4 flex items-center gap-2">
         <div className="flex items-center gap-1 rounded-md border border-slate-300 bg-white p-0.5 text-sm">
-          {(["rules", "matrix"] as const).map((v) => (
+          {(["rules", "matrix", "expand"] as const).map((v) => (
             <button
               key={v}
               onClick={() => setView(v)}
@@ -136,7 +180,7 @@ export function FirewallPage() {
                   : "text-slate-600 hover:bg-slate-100"
               }`}
             >
-              {v === "rules" ? "ルール一覧" : "マトリクス"}
+              {viewLabel(v)}
             </button>
           ))}
         </div>
@@ -156,7 +200,9 @@ export function FirewallPage() {
         <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800">
           {rules.length === 0
             ? "このコンフィグからFWポリシー/ACLを抽出できませんでした。対応形式（Cisco ACL/ASA、Juniperフィルタ、Fortinetポリシー、YAMAHA ip filter）のコンフィグか確認してください。"
-            : "条件に一致するルールがありません。"}
+            : categoryFiltered.length === 0
+              ? `${categoryLabel(category)} はありません。`
+              : "条件に一致するルールがありません。"}
         </div>
       )}
 
@@ -166,6 +212,10 @@ export function FirewallPage() {
 
       {!loading && !error && filtered.length > 0 && view === "matrix" && (
         <MatrixView rules={filtered} />
+      )}
+
+      {!loading && !error && filtered.length > 0 && view === "expand" && (
+        <ExpandTable rules={filtered} />
       )}
     </div>
   );
@@ -177,7 +227,9 @@ function RulesTable({ rules }: { rules: FirewallRule[] }) {
       <table className="w-full text-sm">
         <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
           <tr>
-            <th className="px-3 py-2">ACL</th>
+            <th className="px-3 py-2">種別</th>
+            <th className="px-3 py-2">Policy</th>
+            <th className="px-3 py-2">Status</th>
             <th className="px-3 py-2">Action</th>
             <th className="px-3 py-2">Proto</th>
             <th className="px-3 py-2">送信元</th>
@@ -189,22 +241,41 @@ function RulesTable({ rules }: { rules: FirewallRule[] }) {
         <tbody className="divide-y divide-slate-100">
           {rules.map((r, i) => (
             <tr key={i} className="hover:bg-slate-50">
-              <td className="px-3 py-1.5 mono text-xs">{r.name}</td>
               <td className="px-3 py-1.5">
-                <span
-                  className={
-                    r.action === "deny"
-                      ? "rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-700"
-                      : "rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-700"
-                  }
-                >
-                  {r.action}
-                </span>
+                <CategoryBadge category={r.category ?? "policy"} />
+              </td>
+              <td className="px-3 py-1.5 text-xs">
+                <div className="mono font-medium">{r.name}</div>
+                {r.displayName && (
+                  <div className="mt-0.5 text-slate-500">{r.displayName}</div>
+                )}
+                {r.comments && (
+                  <div className="mt-0.5 line-clamp-2 text-slate-400">{r.comments}</div>
+                )}
+              </td>
+              <td className="px-3 py-1.5">
+                <StatusBadge enabled={r.enabled} />
+              </td>
+              <td className="px-3 py-1.5">
+                <ActionBadge action={r.action} />
               </td>
               <td className="px-3 py-1.5 mono text-xs">{r.protocol}</td>
               <td className="px-3 py-1.5 mono text-xs">{r.source}</td>
               <td className="px-3 py-1.5 mono text-xs">{r.destination}</td>
-              <td className="px-3 py-1.5 mono text-xs">{r.port}</td>
+              <td className="px-3 py-1.5 mono text-xs">
+                <div>{r.port}</div>
+                {r.nat?.enabled && (
+                  <div className="mt-0.5 text-[11px] text-orange-700">
+                    NAT{r.nat.ippool ? " / IP pool" : ""}
+                    {r.nat.poolName ? `: ${r.nat.poolName}` : ""}
+                  </div>
+                )}
+                {r.attributes && (
+                  <div className="mt-0.5 max-w-xs truncate text-[11px] text-slate-400">
+                    {r.attributes}
+                  </div>
+                )}
+              </td>
               <td className="px-3 py-1.5 text-right text-xs text-slate-400">
                 {r.line}
               </td>
@@ -273,6 +344,9 @@ function MatrixView({ rules }: { rules: FirewallRule[] }) {
                                 : "rounded bg-emerald-50 px-1 py-0.5 text-emerald-700"
                             }
                           >
+                            {r.enabled === false && "[無効] "}
+                            {(r.category ?? "policy") !== "policy" &&
+                              `[${categoryLabel(r.category ?? "policy")}] `}
                             {r.protocol}/{r.port}
                           </span>
                         ))}
@@ -287,6 +361,125 @@ function MatrixView({ rules }: { rules: FirewallRule[] }) {
       </table>
     </div>
   );
+}
+
+function viewLabel(v: View): string {
+  switch (v) {
+    case "rules":
+      return "ルール一覧";
+    case "matrix":
+      return "マトリクス";
+    case "expand":
+      return "組み合わせ展開";
+  }
+}
+
+function ExpandTable({ rules }: { rules: FirewallRule[] }) {
+  const rows = useMemo(() => rules.flatMap(expandFirewallRule), [rules]);
+  return (
+    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+      <p className="border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+        各ポリシーを 送信元 × 宛先 × サービス の組み合わせ単位に展開（{rows.length} 行）
+      </p>
+      <table className="w-full text-sm">
+        <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+          <tr>
+            <th className="px-3 py-2">種別</th>
+            <th className="px-3 py-2">Policy</th>
+            <th className="px-3 py-2">Status</th>
+            <th className="px-3 py-2">Action</th>
+            <th className="px-3 py-2">送信元</th>
+            <th className="px-3 py-2">宛先</th>
+            <th className="px-3 py-2">サービス</th>
+            <th className="px-3 py-2 text-right">行</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {rows.map((row, i) => {
+            const r = row.rule;
+            return (
+              <tr key={i} className="hover:bg-slate-50">
+                <td className="px-3 py-1.5">
+                  <CategoryBadge category={r.category ?? "policy"} />
+                </td>
+                <td className="px-3 py-1.5 text-xs">
+                  <div className="mono font-medium">{r.name}</div>
+                  {r.displayName && (
+                    <div className="mt-0.5 text-slate-500">{r.displayName}</div>
+                  )}
+                </td>
+                <td className="px-3 py-1.5">
+                  <StatusBadge enabled={r.enabled} />
+                </td>
+                <td className="px-3 py-1.5">
+                  <ActionBadge action={r.action} />
+                </td>
+                <td className="px-3 py-1.5 mono text-xs">{row.source}</td>
+                <td className="px-3 py-1.5 mono text-xs">{row.destination}</td>
+                <td className="px-3 py-1.5 mono text-xs">{row.service}</td>
+                <td className="px-3 py-1.5 text-right text-xs text-slate-400">
+                  {r.line}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ----- 共通バッジ・ヘルパー -----
+
+function CategoryBadge({ category }: { category: FirewallRuleCategory }) {
+  return (
+    <span
+      className={`rounded px-1.5 py-0.5 text-xs ${categoryColorClass(category)}`}
+    >
+      {firewallCategoryLabel(category)}
+    </span>
+  );
+}
+
+function StatusBadge({ enabled }: { enabled?: boolean }) {
+  return enabled === false ? (
+    <span className="rounded bg-slate-200 px-1.5 py-0.5 text-xs text-slate-700">
+      無効
+    </span>
+  ) : (
+    <span className="rounded bg-blue-50 px-1.5 py-0.5 text-xs text-blue-700">
+      有効
+    </span>
+  );
+}
+
+function ActionBadge({ action }: { action: FirewallRule["action"] }) {
+  return (
+    <span
+      className={
+        action === "deny"
+          ? "rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-700"
+          : "rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-700"
+      }
+    >
+      {action}
+    </span>
+  );
+}
+
+function categoryColorClass(category: FirewallRuleCategory): string {
+  switch (category) {
+    case "nat":
+      return "bg-orange-100 text-orange-700";
+    case "dos":
+      return "bg-purple-100 text-purple-700";
+    case "policy":
+      return "bg-slate-100 text-slate-700";
+  }
+}
+
+function categoryLabel(category: CategoryFilter): string {
+  return category === "all" ? "すべて" : firewallCategoryLabel(category);
 }
 
 function dedupe<T>(arr: T[]): T[] {

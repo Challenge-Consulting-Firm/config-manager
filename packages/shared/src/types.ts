@@ -14,29 +14,98 @@ export const ROLE_LABELS: Record<Role, string> = {
 
 import type { DeviceDetection } from "./detect.js";
 
+/** A normalized routing entry extracted from a device config.
+ *  Vendor-specific syntax (Cisco ip route, Juniper routing-options static,
+ *  Fortinet router static, YAMAHA ip route) is mapped to this common shape.
+ *
+ *  Both static routes and summarized dynamic-protocol info (OSPF/BGP
+ *  areas, AS numbers, networks) are represented here. */
+export interface RoutingRoute {
+  /** Source vendor that produced this rule (informational). */
+  vendor: string;
+  /** Protocol: "static", "connected", "ospf", "bgp", "rip", "eigrp". */
+  protocol: string;
+  /** Destination network in CIDR notation (e.g. "10.0.0.0/24").
+   *  For summary entries without a single network, the raw target. */
+  network: string;
+  /** Next-hop IP, interface name, or "Null0" / "discard". */
+  nextHop: string;
+  /** Administrative distance (Cisco-style). Empty when not specified. */
+  adminDistance?: number;
+  /** Route metric. Empty when not specified. */
+  metric?: number;
+  /** Outgoing interface when specified directly. */
+  interface?: string;
+  /** Additional attributes: OSPF area, BGP AS, route tag, etc. */
+  attributes?: string;
+  /** 1-based source line number, for reference. */
+  line: number;
+  /** Original raw line text. */
+  raw: string;
+}
+
 /** A normalized firewall/ACL rule extracted from a device config.
  *  Vendor-specific syntax (Cisco ACL, Juniper filter, Fortinet policy,
  *  YAMAHA ip filter) is mapped to this common shape. */
 export interface FirewallRule {
   /** Source vendor that produced this rule (informational). */
   vendor: string;
-  /** ACL / filter / policy name the rule belongs to. */
+  /** ACL / filter / policy id the rule belongs to. */
   name: string;
+  /** Optional human-friendly policy name (FortiGate `set name`, etc.). */
+  displayName?: string;
+  /** Rule category. FortiGate NAT / DoS policies are shown separately. */
+  category?: "policy" | "nat" | "dos";
   /** Permit/accept or deny/reject. */
   action: "permit" | "deny";
-  /** Protocol: tcp, udp, icmp, ip (=any), etc. */
+  /** Whether the policy is enabled. Undefined means the vendor syntax does not expose status. */
+  enabled?: boolean;
+  /** Protocol: tcp, udp, icmp, ip (=any), internet-service, dos, etc. */
   protocol: string;
   /** Source address spec: "any", "1.2.3.4", "10.0.0.0/24", or an
    *  object-group / address-book name in quotes. */
   source: string;
   /** Destination address spec (same shape as source). */
   destination: string;
-  /** Destination port(s): "80", "80,443", "1024-65535", or "any". */
+  /** Destination port(s): "80", "80,443", "1024-65535", service name, or "any". */
   port: string;
+  /** Individual source address objects, when a single policy references
+   *  multiple (FortiGate `set srcaddr "a" "b"`). Used by the expansion view
+   *  to break a policy into srcaddr × dstaddr × service combinations.
+   *  Undefined for vendors/lines that carry a single value. */
+  sourceItems?: string[];
+  /** Individual destination address objects (same shape as sourceItems). */
+  destinationItems?: string[];
+  /** Individual service objects (same shape as sourceItems). */
+  serviceItems?: string[];
+  /** Optional NAT metadata for FortiGate NAT policies. */
+  nat?: {
+    enabled: boolean;
+    ippool?: boolean;
+    poolName?: string;
+  };
+  /** Optional memo/comment from the config. */
+  comments?: string;
+  /** Additional vendor-specific attributes, e.g. DoS anomalies. */
+  attributes?: string;
   /** 1-based source line number, for reference. */
   line: number;
   /** Original raw line text. */
   raw: string;
+}
+
+/** Rule category value (FortiGate policy / NAT / DoS). Extracted as a named
+ *  type so call sites don't need `NonNullable<FirewallRule["category"]>`. */
+export type FirewallRuleCategory = "policy" | "nat" | "dos";
+
+/** A single srcaddr × dstaddr × service combination produced by expanding
+ *  one {@link FirewallRule}. The rule is referenced by pointer so callers can
+ *  reach shared metadata (policy id, status, line number, ...). */
+export interface ExpandedFirewallCombination {
+  rule: FirewallRule;
+  source: string;
+  destination: string;
+  service: string;
 }
 
 /** Identifier fields attached to every config generation. */

@@ -176,6 +176,14 @@ export function DeviceDetailPage() {
             選択した2世代をDiff表示
           </Link>
         )}
+        {identifiers && (
+          <Link
+            to={uploadHrefFor(decodedKey, identifiers)}
+            className="rounded-md bg-emerald-600 px-3 py-2 text-sm text-white hover:bg-emerald-700"
+          >
+            この機器に新世代をアップロード
+          </Link>
+        )}
       </div>
 
       {/* 本番↔予備 comparison panel */}
@@ -316,6 +324,12 @@ export function DeviceDetailPage() {
                   >
                     FW/ACLマトリクス
                   </Link>
+                  <Link
+                    to={`/versions/${body.id}/routing?from=${encodeURIComponent(`/devices/${encodeURIComponent(decodedKey)}`)}`}
+                    className="rounded border border-blue-300 bg-blue-50 px-2 py-0.5 text-blue-700 hover:bg-blue-100"
+                  >
+                    ルーティング
+                  </Link>
                   <button
                     onClick={() => download(body)}
                     className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
@@ -351,6 +365,26 @@ function download(v: ConfigVersion) {
   a.download = `config-gen${v.generation}.txt`;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** Build the /upload URL with identifiers pre-filled, so the same device can
+ *  receive a new config generation without re-typing its metadata. Includes
+ *  a `from` param so the upload page can navigate back here. */
+function uploadHrefFor(
+  deviceKey: string,
+  ids: DeviceIdentifiers,
+): string {
+  const from = `/devices/${encodeURIComponent(deviceKey)}`;
+  const q = new URLSearchParams({
+    customer: ids.customer,
+    hostname: ids.hostname,
+    ipAddress: ids.ipAddress,
+    purpose: ids.purpose,
+    serialNumber: ids.serialNumber,
+    role: ids.role,
+    from,
+  });
+  return `/upload?${q.toString()}`;
 }
 
 function DetectedBadge({ label, value }: { label: string; value: string }) {

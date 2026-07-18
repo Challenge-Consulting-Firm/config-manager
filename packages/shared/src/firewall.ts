@@ -11,7 +11,11 @@
  */
 
 import type { DeviceDetection } from "./detect.js";
-import type { FirewallRule } from "./types.js";
+import type {
+  ExpandedFirewallCombination,
+  FirewallRule,
+  FirewallRuleCategory,
+} from "./types.js";
 
 // ----- cache (de)serialization -----
 
@@ -23,7 +27,7 @@ export interface FirewallCache {
   rules: FirewallRule[];
 }
 
-export const FIREWALL_CACHE_VERSION = 1;
+export const FIREWALL_CACHE_VERSION = 3;
 
 /** Serialize rules to a compact JSON string for storage. */
 export function serializeFirewallRules(
@@ -492,22 +496,77 @@ function extractJuniper(lines: string[], vendor: string): FirewallRule[] {
 
 // ----- Fortinet FortiOS firewall policy -----
 
+interface FortinetCurrent extends Partial<FirewallRule> {
+  line: number;
+  raw: string;
+}
+
+function cleanFortinetValue(value: string): string {
+  return value.replace(/"/g, "").trim();
+}
+
+/** Split a FortiGate multi-value (e.g. `set srcaddr "LAN Users" "DMZ"`) into
+ *  individual object names, respecting double-quoted tokens that may contain
+ *  spaces. Unquoted whitespace-separated tokens are kept as-is. */
+function parseFortinetTokens(rawValue: string): string[] {
+  const tokens: string[] = [];
+  const re = /"([^"]*)"|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(rawValue)) !== null) {
+    const token = (m[1] ?? m[2]).trim();
+    if (token) tokens.push(token);
+  }
+  return tokens;
+}
+
+/** Merge additional item tokens into an existing list, de-duplicating. */
+function mergeItems(existing: string[] | undefined, add: string[]): string[] {
+  return existing ? [...new Set([...existing, ...add])] : add;
+}
+
+function appendInterface(value: string | undefined, intf: string): string {
+  return value ? `${value} (${intf})` : `(${intf})`;
+}
+
+function setAddressKeepingInterface(existing: string | undefined, address: string): string {
+  if (existing?.startsWith("(")) return `${address} ${existing}`;
+  return address;
+}
+
 function extractFortinet(lines: string[], vendor: string): FirewallRule[] {
+  return [
+    ...extractFortinetPolicies(lines, vendor),
+    ...extractFortinetDosPolicies(lines, vendor),
+  ];
+}
+
+function extractFortinetPolicies(lines: string[], vendor: string): FirewallRule[] {
   const rules: FirewallRule[] = [];
   let inPolicy = false;
+  let depth = 0;
   let inEdit = false;
-  let current: Partial<FirewallRule> & { line: number; raw: string } | null = null;
+  let current: FortinetCurrent | null = null;
 
   const flush = () => {
     if (!current) return;
+    const natEnabled = current.nat?.enabled === true;
     rules.push({
       vendor,
       name: String(current.name ?? "policy"),
+      displayName: current.displayName,
+      category: natEnabled ? "nat" : "policy",
       action: current.action ?? "permit",
+      enabled: current.enabled ?? true,
       protocol: current.protocol ?? "any",
       source: current.source ?? "any",
       destination: current.destination ?? "any",
       port: current.port ?? "any",
+      sourceItems: current.sourceItems,
+      destinationItems: current.destinationItems,
+      serviceItems: current.serviceItems,
+      nat: current.nat,
+      comments: current.comments,
+      attributes: current.attributes,
       line: current.line,
       raw: current.raw,
     });
@@ -517,70 +576,279 @@ function extractFortinet(lines: string[], vendor: string): FirewallRule[] {
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i].trim();
     if (!raw) continue;
-    if (/^config\s+firewall\s+(policy|addrgrp|service)\b/i.test(raw)) {
-      if (/policy/i.test(raw)) inPolicy = true;
-      continue;
-    }
-    if (/^end\s*$/i.test(raw)) {
-      if (inEdit) {
-        flush();
-        inEdit = false;
+
+    if (!inPolicy) {
+      if (/^config\s+firewall\s+policy\s*$/i.test(raw)) {
+        inPolicy = true;
+        depth = 1;
       }
-      inPolicy = false;
       continue;
     }
-    if (!inPolicy) continue;
+
+    if (/^config\s+/i.test(raw)) {
+      depth++;
+      continue;
+    }
+
+    if (/^end\s*$/i.test(raw)) {
+      depth--;
+      if (depth === 0) {
+        if (inEdit) flush();
+        inEdit = false;
+        inPolicy = false;
+      }
+      continue;
+    }
+
+    if (depth !== 1) continue;
+
     const editM = raw.match(/^edit\s+(\d+|"[^"]+")/i);
     if (editM) {
       if (inEdit) flush();
       inEdit = true;
       current = {
-        name: editM[1].replace(/"/g, ""),
+        name: cleanFortinetValue(editM[1]),
         action: "permit",
+        enabled: true,
+        category: "policy",
         line: i + 1,
         raw,
       };
       continue;
     }
+
     if (/^next\s*$/i.test(raw)) {
       if (inEdit) flush();
       inEdit = false;
       continue;
     }
+
     if (!current) continue;
-    const setM = raw.match(/^set\s+(\w+)\s+(.+)$/i);
+    const setM = raw.match(/^set\s+([\w-]+)\s+(.+)$/i);
     if (!setM) continue;
     const [, key, val] = setM;
-    const v = val.replace(/"/g, "").trim();
+    const v = cleanFortinetValue(val);
     switch (key.toLowerCase()) {
+      case "name":
+        current.displayName = v;
+        break;
+      case "comments":
+        current.comments = v;
+        break;
       case "srcaddr":
       case "srcaddr6":
-        current.source = v;
+        current.sourceItems = mergeItems(current.sourceItems, parseFortinetTokens(val));
+        current.source = setAddressKeepingInterface(current.source, v);
         break;
       case "dstaddr":
       case "dstaddr6":
-        current.destination = v;
+        current.destinationItems = mergeItems(
+          current.destinationItems,
+          parseFortinetTokens(val),
+        );
+        current.destination = setAddressKeepingInterface(current.destination, v);
         break;
       case "service":
+        current.serviceItems = mergeItems(current.serviceItems, parseFortinetTokens(val));
         current.port = v;
-        current.protocol = "";
+        current.protocol = "service";
+        break;
+      case "internet-service":
+        if (/enable/i.test(v)) {
+          current.protocol = "internet-service";
+          current.port = current.port ?? "internet-service";
+        }
+        break;
+      case "internet-service-name":
+      case "internet-service-id":
+      case "internet-service-group":
+        current.protocol = "internet-service";
+        current.destination = `Internet Service: ${v}`;
+        current.destinationItems = mergeItems(
+          current.destinationItems,
+          parseFortinetTokens(val).map((t) => `Internet Service: ${t}`),
+        );
+        current.port = v;
         break;
       case "action":
-        current.action = /accept/i.test(v) ? "permit" : "deny";
+        current.action = /accept|ipsec/i.test(v) ? "permit" : "deny";
+        break;
+      case "status":
+        current.enabled = !/disable/i.test(v);
+        break;
+      case "nat":
+        current.nat = {
+          enabled: /enable/i.test(v),
+          ippool: current.nat?.ippool,
+          poolName: current.nat?.poolName,
+        };
+        break;
+      case "ippool":
+        current.nat = {
+          enabled: current.nat?.enabled ?? false,
+          ippool: /enable/i.test(v),
+          poolName: current.nat?.poolName,
+        };
+        break;
+      case "poolname":
+        current.nat = {
+          enabled: current.nat?.enabled ?? false,
+          ippool: current.nat?.ippool,
+          poolName: v,
+        };
         break;
       case "srcintf":
-        current.source = current.source
-          ? `${current.source} (${v})`
-          : `(${v})`;
+        current.source = appendInterface(current.source, v);
         break;
       case "dstintf":
-        current.destination = current.destination
-          ? `${current.destination} (${v})`
-          : `(${v})`;
+        current.destination = appendInterface(current.destination, v);
         break;
     }
   }
-  flush();
+  if (inEdit) flush();
+  return rules;
+}
+
+function extractFortinetDosPolicies(lines: string[], vendor: string): FirewallRule[] {
+  const rules: FirewallRule[] = [];
+  let inDosPolicy = false;
+  let depth = 0;
+  let inEdit = false;
+  let current: FortinetCurrent | null = null;
+  let currentAnomaly = "";
+  const anomalies: string[] = [];
+
+  const flush = () => {
+    if (!current) return;
+    rules.push({
+      vendor,
+      name: String(current.name ?? "DoS-policy"),
+      displayName: current.displayName,
+      category: "dos",
+      action: current.action ?? "deny",
+      enabled: current.enabled ?? true,
+      protocol: "dos",
+      source: current.source ?? "any",
+      destination: current.destination ?? "any",
+      port: current.port ?? "any",
+      sourceItems: current.sourceItems,
+      destinationItems: current.destinationItems,
+      serviceItems: current.serviceItems,
+      comments: current.comments,
+      attributes: anomalies.join("; "),
+      line: current.line,
+      raw: current.raw,
+    });
+    current = null;
+    anomalies.length = 0;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw) continue;
+
+    if (!inDosPolicy) {
+      if (/^config\s+firewall\s+DoS-policy\s*$/i.test(raw)) {
+        inDosPolicy = true;
+        depth = 1;
+      }
+      continue;
+    }
+
+    if (/^config\s+/i.test(raw)) {
+      depth++;
+      continue;
+    }
+
+    if (/^end\s*$/i.test(raw)) {
+      depth--;
+      if (depth === 1) currentAnomaly = "";
+      if (depth === 0) {
+        if (inEdit) flush();
+        inEdit = false;
+        inDosPolicy = false;
+      }
+      continue;
+    }
+
+    if (depth === 1) {
+      const editM = raw.match(/^edit\s+(\d+|"[^"]+")/i);
+      if (editM) {
+        if (inEdit) flush();
+        inEdit = true;
+        current = {
+          name: cleanFortinetValue(editM[1]),
+          action: "deny",
+          enabled: true,
+          category: "dos",
+          line: i + 1,
+          raw,
+        };
+        continue;
+      }
+      if (/^next\s*$/i.test(raw)) {
+        if (inEdit) flush();
+        inEdit = false;
+        continue;
+      }
+      if (!current) continue;
+      const setM = raw.match(/^set\s+([\w-]+)\s+(.+)$/i);
+      if (!setM) continue;
+      const [, key, val] = setM;
+      const v = cleanFortinetValue(val);
+      switch (key.toLowerCase()) {
+        case "name":
+          current.displayName = v;
+          break;
+        case "comments":
+          current.comments = v;
+          break;
+        case "interface":
+          current.source = appendInterface(current.source, v);
+          break;
+        case "srcaddr":
+          current.sourceItems = mergeItems(current.sourceItems, parseFortinetTokens(val));
+          current.source = setAddressKeepingInterface(current.source, v);
+          break;
+        case "dstaddr":
+          current.destinationItems = mergeItems(
+            current.destinationItems,
+            parseFortinetTokens(val),
+          );
+          current.destination = setAddressKeepingInterface(current.destination, v);
+          break;
+        case "service":
+          current.serviceItems = mergeItems(current.serviceItems, parseFortinetTokens(val));
+          current.port = v;
+          break;
+        case "status":
+          current.enabled = !/disable/i.test(v);
+          break;
+      }
+      continue;
+    }
+
+    if (depth === 2 && current) {
+      const editM = raw.match(/^edit\s+"?([^"]+)"?/i);
+      if (editM) {
+        currentAnomaly = editM[1];
+        continue;
+      }
+      if (/^next\s*$/i.test(raw)) {
+        currentAnomaly = "";
+        continue;
+      }
+      const setM = raw.match(/^set\s+([\w-]+)\s+(.+)$/i);
+      if (setM && currentAnomaly) {
+        const key = setM[1].toLowerCase();
+        const v = cleanFortinetValue(setM[2]);
+        if (key === "threshold") {
+          anomalies.push(`${currentAnomaly}: threshold ${v}`);
+        }
+      }
+    }
+  }
+  if (inEdit) flush();
   return rules;
 }
 
@@ -712,4 +980,41 @@ function runForVendor(lines: string[], vendor: string): FirewallRule[] {
     default:
       return [];
   }
+}
+
+// ----- presentation helpers (pure, shared by Web UI and exporters) -----
+
+/** Japanese display label for a rule category. */
+export function firewallCategoryLabel(category: FirewallRuleCategory): string {
+  switch (category) {
+    case "nat":
+      return "NATポリシー";
+    case "dos":
+      return "DoS-policy";
+    case "policy":
+      return "FWポリシー";
+  }
+}
+
+/** Expand a rule into the cartesian product of its individual source,
+ *  destination and service objects. Rules without per-item lists
+ *  (non-Fortinet vendors, or single-value lines) degrade to a single row
+ *  using the combined display fields. */
+export function expandFirewallRule(
+  rule: FirewallRule,
+): ExpandedFirewallCombination[] {
+  const sources = rule.sourceItems?.length ? rule.sourceItems : [rule.source];
+  const destinations = rule.destinationItems?.length
+    ? rule.destinationItems
+    : [rule.destination];
+  const services = rule.serviceItems?.length ? rule.serviceItems : [rule.port];
+  const out: ExpandedFirewallCombination[] = [];
+  for (const source of sources) {
+    for (const destination of destinations) {
+      for (const service of services) {
+        out.push({ rule, source, destination, service });
+      }
+    }
+  }
+  return out;
 }

@@ -44,6 +44,8 @@ const F = {
     detectedModel: "detected_model",
     // Cached firewall-rule extraction result (JSON)
     fwRulesJson: "fw_rules_json",
+    // Cached routing-routes extraction result (JSON)
+    routingRoutesJson: "routing_routes_json",
   },
   // Audit app
   audit: {
@@ -240,6 +242,31 @@ export async function setFwCache(
   }
 }
 
+/** Read the persisted routing-routes JSON for a record (or empty string). */
+export function getRoutingCacheRaw(rec: KintoneRecord): string {
+  return rec[F.config.routingRoutesJson]?.value ?? "";
+}
+
+/** Update only the routing_routes_json field of an existing record. */
+export async function setRoutingCache(
+  cfg: AppConfig,
+  recordId: string,
+  routingRoutesJson: string,
+): Promise<void> {
+  try {
+    await kintoneFetch(cfg, cfg.kintone.configAppToken, "/record.json", {
+      method: "PUT",
+      body: JSON.stringify({
+        app: cfg.kintone.configAppId,
+        id: recordId,
+        record: { [F.config.routingRoutesJson]: { value: routingRoutesJson } },
+      }),
+    });
+  } catch (err) {
+    console.error("[routing-cache] failed to persist:", err);
+  }
+}
+
 /** Create a new config version record. */
 export async function createVersion(
   cfg: AppConfig,
@@ -255,6 +282,7 @@ export async function createVersion(
     note?: string;
     detected?: DeviceDetection;
     fwRulesJson?: string;
+    routingRoutesJson?: string;
   },
 ): Promise<ConfigVersion> {
   // Kintone requires each field value wrapped in { value: ... }.
@@ -277,6 +305,7 @@ export async function createVersion(
     [F.config.osVersion]: { value: args.detected?.osVersion ?? "" },
     [F.config.detectedModel]: { value: args.detected?.model ?? "" },
     [F.config.fwRulesJson]: { value: args.fwRulesJson ?? "" },
+    [F.config.routingRoutesJson]: { value: args.routingRoutesJson ?? "" },
   };
   if (args.note) fields[F.config.note] = { value: args.note };
 
