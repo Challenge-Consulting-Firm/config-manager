@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import type {
   ConfigVersion,
   Device,
@@ -31,6 +31,7 @@ interface DeleteTarget {
 
 export function DeviceDetailPage() {
   const { key } = useParams<{ key: string }>();
+  const navigate = useNavigate();
   const decodedKey = key ? decodeURIComponent(key) : "";
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
@@ -46,6 +47,9 @@ export function DeviceDetailPage() {
   // 編集・削除 UI の状態。
   const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+  // 機器（全世代）一括削除ダイアログの表示状態。
+  const [deleteDeviceOpen, setDeleteDeviceOpen] = useState(false);
+  const [deletingDevice, setDeletingDevice] = useState(false);
   const [metaMsg, setMetaMsg] = useState<{
     type: "success" | "error";
     text: string;
@@ -253,6 +257,16 @@ export function DeviceDetailPage() {
                 ファイルでアップロード
               </Link>
             )}
+            {/* 機器自体を全世代まとめて削除する。 */}
+            <button
+              onClick={() => {
+                setDeleteDeviceOpen(true);
+                setMetaMsg(null);
+              }}
+              className="rounded-md border border-red-300 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50"
+            >
+              機器を削除
+            </button>
           </div>
         )}
       </div>
@@ -546,6 +560,41 @@ export function DeviceDetailPage() {
           }}
         />
       )}
+
+      {/* 機器（全世代）一括削除の確認ダイアログ */}
+      {deleteDeviceOpen && identifiers && (
+        <DeleteDeviceDialog
+          identifiers={identifiers}
+          versionCount={versions.length}
+          submitting={deletingDevice}
+          onClose={() => setDeleteDeviceOpen(false)}
+          onConfirm={async () => {
+            setDeletingDevice(true);
+            setMetaMsg(null);
+            try {
+              const res = await apiFetch<{ ok: boolean; deletedCount: number }>(
+                `/api/devices/${encodeURIComponent(decodedKey)}`,
+                { method: "DELETE" },
+              );
+              // 削除完了後は機器一覧へ戻る（この機器はもう存在しない）。
+              navigate("/", {
+                replace: true,
+                state: {
+                  flash: `機器「${identifiers.hostname}」を削除しました（${res.deletedCount} 世代）。`,
+                },
+              });
+            } catch (e) {
+              setMetaMsg({
+                type: "error",
+                text: e instanceof ApiError ? e.message : String(e),
+              });
+              setDeleteDeviceOpen(false);
+            } finally {
+              setDeletingDevice(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -706,6 +755,65 @@ function EditVersionModal({
             className="rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
           >
             {submitting ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 機器（論理デバイス）を全世代まとめて削除する確認ダイアログ。
+ *  バージョン単体削除より影響が大きいため、対象と件数を明示する。 */
+function DeleteDeviceDialog({
+  identifiers,
+  versionCount,
+  submitting,
+  onClose,
+  onConfirm,
+}: {
+  identifiers: DeviceIdentifiers;
+  versionCount: number;
+  submitting: boolean;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-lg bg-white p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="mb-2 text-lg font-semibold text-red-700">
+          機器を削除しますか？
+        </h2>
+        <p className="mb-1 text-sm text-slate-700">
+          対象: {identifiers.customer} / {identifiers.hostname}
+        </p>
+        <p className="mb-4 text-sm text-slate-700">
+          IP: <span className="mono">{identifiers.ipAddress}</span> ·{" "}
+          {ROLE_LABELS[identifiers.role]}機
+        </p>
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+          <span className="font-semibold">注意:</span>{" "}
+          この機器に紐づく<strong>全 {versionCount} 世代</strong>のコンフィグをまとめて削除します。
+          削除すると復元できません。バックアップが必要な場合は先にダウンロードしてください。
+        </div>
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+          >
+            キャンセル
+          </button>
+          <button
+            disabled={submitting}
+            onClick={onConfirm}
+            className="rounded-md bg-red-600 px-4 py-2 text-sm text-white hover:bg-red-700 disabled:opacity-50"
+          >
+            {submitting ? "削除中…" : "機器を削除する"}
           </button>
         </div>
       </div>

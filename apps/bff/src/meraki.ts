@@ -59,6 +59,37 @@ export function isValidApiKey(apiKey: string): boolean {
   return apiKey.trim().length >= 16;
 }
 
+/** デバイスの productType を解決する。Meraki API の /devices 応答では
+ *  productType は通常 'appliance' / 'switch' / 'wireless' 等の文字列だが、
+ *  API バージョンや機種によっては欠損する場合がある。その場合は model
+ *  接头辞 (MX/MR/MS) から推測してフォールバックする。推測也不能な場合は
+ *  元の productType 文字列をそのまま返す（呼び出し側で MR/MX/MS 以外として扱う）。
+ *
+ *  このフォールバックは「ネットワーク内に MR/MX/MS デバイスが見つかりません」
+ *  という誤エラーを回避するための安全策。Meraki の model 命名規則は安定している
+ *  (MX67/MR33/MS120 等) ため、model 推測は実用上十分に信頼できる。 */
+export function resolveMerakiProductType(
+  productType: string,
+  model: string,
+): MerakiProductType | string {
+  if (
+    productType === "appliance" ||
+    productType === "switch" ||
+    productType === "wireless"
+  ) {
+    return productType;
+  }
+  // productType が欠損・未知の場合は model 接头辞から推測する。
+  // MG (cellularGateway) / MV (camera) / MT (sensor) は MX/MR/MS と接头辞が
+  // 異なるため誤判定は起きない。
+  const m = model.toUpperCase();
+  if (m.startsWith("MX")) return "appliance";
+  if (m.startsWith("MR")) return "wireless";
+  if (m.startsWith("MS")) return "switch";
+  // 推測不能なら元の productType を返す（空文字含む）。
+  return productType;
+}
+
 /** 単一エンドポイントを呼び出し、JSON を返す。404 は null を返して呼び出し
  *  側でスキップできるようにする。429 は指数バックオフでリトライ。 */
 async function callMeraki<T>(
@@ -184,12 +215,18 @@ async function fetchNetworkAndDevices(
   const devices: MerakiDeviceInfo[] = [];
   if (Array.isArray(devRes.data)) {
     for (const d of devRes.data) {
+      const modelStr = String(d.model ?? "");
+      // productType は Meraki API 応答から取得するが、欠損する場合は model
+      // 接头辞から推測して補完する（resolveMerakiProductType 参照）。
+      const rawProductType = String(d.productType ?? "");
+      const resolvedProductType = resolveMerakiProductType(rawProductType, modelStr);
       devices.push({
         name: String(d.name ?? ""),
-        model: String(d.model ?? ""),
+        model: modelStr,
         serial: String(d.serial ?? ""),
         mac: String(d.mac ?? ""),
-        productType: String(d.productType ?? ""),
+        productType:
+          typeof resolvedProductType === "string" ? resolvedProductType : "",
         firmware: String(d.firmware ?? ""),
         url: typeof d.url === "string" ? d.url : undefined,
         // /devices 応答の lanIp は MX の場合はデフォルト VLAN のゲートウェイ IP。
@@ -201,6 +238,49 @@ async function fetchNetworkAndDevices(
         status: typeof d.status === "string" ? d.status : undefined,
         raw: d,
       });
+    }
+  }
+
+  // MR (wireless) 等は /networks/{id}/devices 応答に lanIp を持たないことが
+  // 多く、そのままだと「IP が取れないデバイス」として取り込みスキップされて
+  // しまう。組織単位の device statuses は MR/MS/MX すべての実行時 IP
+  // (lanIp / publicIp) を serial 単位で返すため、これで補完する。
+  // networkIds[] で対象ネットワークのみに絞る。失敗時 (404/権限不足等) は
+  // 無視して続行する（従来どおりの挙動へフォールバック）。
+  if (network.organizationId) {
+    const statusesRes = await callMeraki<
+      Array<{
+        serial?: string;
+        lanIp?: string | null;
+        publicIp?: string | null;
+      }>
+    >(
+      `/organizations/${network.organizationId}/devices/statuses?networkIds[]=${encodeURIComponent(networkId)}`,
+      opts,
+    );
+    if (Array.isArray(statusesRes.data)) {
+      const lanIpBySerial = new Map<string, string>();
+      const publicIpBySerial = new Map<string, string>();
+      for (const s of statusesRes.data) {
+        const serial = typeof s.serial === "string" ? s.serial : "";
+        if (!serial) continue;
+        if (typeof s.lanIp === "string" && s.lanIp) {
+          lanIpBySerial.set(serial, s.lanIp);
+        }
+        if (typeof s.publicIp === "string" && s.publicIp) {
+          publicIpBySerial.set(serial, s.publicIp);
+        }
+      }
+      for (const d of devices) {
+        if (!d.lanIp) {
+          const lanIp = lanIpBySerial.get(d.serial);
+          if (lanIp) d.lanIp = lanIp;
+        }
+        if (!d.publicIp) {
+          const publicIp = publicIpBySerial.get(d.serial);
+          if (publicIp) d.publicIp = publicIp;
+        }
+      }
     }
   }
 
@@ -238,6 +318,52 @@ async function fetchNetworkAndDevices(
   }
 
   return { network, devices };
+}
+
+/** appliance の LAN 側 IP（MX のプライベート管理 IP）をセクションから取得する。
+ *  VLAN 構成では各 VLAN の applianceIp のうち、既定 VLAN（id=1）→ 最小 VLAN ID
+ *  → 先頭、の優先で 1 つ選ぶ。Single LAN 構成では applianceIp を直接使う。
+ *  見つからなければ空文字を返す。 */
+function extractApplianceLanIp(sections: MerakiSection[]): string {
+  const pick = (label: string) =>
+    sections.find((s) => s.label === label && !s.error)?.data;
+
+  // VLANs: [{ id, applianceIp, subnet, ... }]
+  const vlans = pick("Appliance / VLANs");
+  if (Array.isArray(vlans) && vlans.length > 0) {
+    const withIp = vlans.filter(
+      (v): v is { id?: unknown; applianceIp: string } =>
+        v !== null &&
+        typeof v === "object" &&
+        typeof (v as { applianceIp?: unknown }).applianceIp === "string" &&
+        !!(v as { applianceIp?: string }).applianceIp,
+    );
+    if (withIp.length > 0) {
+      const byId = (id: number) =>
+        withIp.find((v) => Number((v as { id?: unknown }).id) === id);
+      const chosen =
+        byId(1) ??
+        [...withIp].sort(
+          (a, b) =>
+            Number((a as { id?: unknown }).id ?? Infinity) -
+            Number((b as { id?: unknown }).id ?? Infinity),
+        )[0];
+      if (chosen?.applianceIp) return chosen.applianceIp;
+    }
+  }
+
+  // Single LAN: { applianceIp, subnet, ... }
+  const singleLan = pick("Appliance / Single LAN");
+  if (
+    singleLan !== null &&
+    typeof singleLan === "object" &&
+    typeof (singleLan as { applianceIp?: unknown }).applianceIp === "string"
+  ) {
+    const ip = (singleLan as { applianceIp: string }).applianceIp;
+    if (ip) return ip;
+  }
+
+  return "";
 }
 
 /** 指定ネットワークの MR/MX/MS 設定を全取得し、{@link MerakiConfigDump} を
@@ -293,6 +419,22 @@ export async function fetchMerakiConfig(
   // 全件待つ（個別失敗はセクションに記録済み）。
   const results = await Promise.all(tasks);
   for (const s of results) sections.push(s);
+
+  // MX (appliance) の「プライベート IP」は /devices や uplinks では取れず、
+  // VLAN / Single LAN 設定の applianceIp（＝MX の LAN 側ゲートウェイ IP）が
+  // 実質的な管理プライベート IP になる。ここで appliance デバイスの lanIp を
+  // その値で補完し、取り込み時に publicIp ではなくプライベート IP が選ばれる
+  // ようにする（デバイス単位ループは lanIp を優先する）。
+  if (network.productTypes.includes("appliance")) {
+    const applianceIp = extractApplianceLanIp(sections);
+    if (applianceIp) {
+      for (const d of devices) {
+        if (d.productType === "appliance" && !d.lanIp) {
+          d.lanIp = applianceIp;
+        }
+      }
+    }
+  }
 
   const dump: MerakiConfigDump = {
     exportedAt: new Date().toISOString(),

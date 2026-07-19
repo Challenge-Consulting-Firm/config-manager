@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import type { Device, Role } from "@config-manager/shared";
 import { apiFetch } from "../apiClient";
 import { useStaleWhileRevalidate } from "../hooks/useStaleWhileRevalidate";
@@ -19,6 +19,12 @@ export function DevicesPage() {
   const devices = data?.devices ?? [];
   const [q, setQ] = useState("");
   const [roleFilter, setRoleFilter] = useState<RoleFilter>("all");
+  // 機器削除後などに遷移元から渡されるフラッシュメッセージ。一度表示したら
+  // 閉じられるよう state に取り込む（履歴の state はリロードで消える）。
+  const location = useLocation();
+  const [flash, setFlash] = useState<string | null>(
+    (location.state as { flash?: string } | null)?.flash ?? null,
+  );
 
   const filtered = devices.filter((d) => {
     if (roleFilter !== "all" && d.identifiers.role !== roleFilter) return false;
@@ -49,6 +55,18 @@ export function DevicesPage() {
           </Link>
         </div>
       </div>
+
+      {flash && (
+        <div className="mb-4 flex items-center justify-between rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          <span>{flash}</span>
+          <button
+            onClick={() => setFlash(null)}
+            className="text-emerald-600 hover:text-emerald-900"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <input
