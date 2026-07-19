@@ -1,30 +1,24 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { Device, Role } from "@config-manager/shared";
-import { apiFetch, ApiError } from "../apiClient";
+import { apiFetch } from "../apiClient";
+import { useStaleWhileRevalidate } from "../hooks/useStaleWhileRevalidate";
 import { RoleBadge } from "../components/RoleBadge";
 
 type RoleFilter = "all" | Role;
 
+type DevicesResponse = { devices: Device[] };
+
 export function DevicesPage() {
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // localStorage キャッシュを即時描画しつつ、裏側で最新データを再取得する。
+  // フェッチ成功時にキャッシュも更新されるため、次回訪問時の体感速度が上がる。
+  const { data, loading, error, stale } = useStaleWhileRevalidate<DevicesResponse>(
+    "devices",
+    () => apiFetch<DevicesResponse>("/api/devices"),
+  );
+  const devices = data?.devices ?? [];
   const [q, setQ] = useState("");
   const [roleFilter, setRoleFilter] = useState<RoleFilter>("all");
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await apiFetch<{ devices: Device[] }>("/api/devices");
-        setDevices(res.devices);
-      } catch (e) {
-        setError(e instanceof ApiError ? e.message : String(e));
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, []);
 
   const filtered = devices.filter((d) => {
     if (roleFilter !== "all" && d.identifiers.role !== roleFilter) return false;
@@ -80,6 +74,13 @@ export function DevicesPage() {
         </div>
       </div>
 
+      {/*
+       * stale はキャッシュ表示中（裏で再取得中）の状態。loading はキャッシュも
+       * データも無く初回取得を待っている状態。それぞれメッセージを出し分ける。
+       */}
+      {stale && (
+        <p className="mb-3 text-xs text-slate-400">キャッシュを表示中・最新データを取得しています…</p>
+      )}
       {loading && <p className="text-slate-500">読み込み中…</p>}
       {error && <p className="text-red-600">エラー: {error}</p>}
 
