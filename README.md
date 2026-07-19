@@ -120,6 +120,7 @@ node scripts/setup-kintone.mjs --app meraki
 | 行数 | 数値 | `lines` |
 | FWポリシー抽出結果（JSON） | 文字列(複数行) | `fw_rules_json` |
 | ルーティング抽出結果（JSON） | 文字列(複数行) | `routing_routes_json` |
+| 無線SSID/AP抽出結果（JSON） | 文字列(複数行) | `wireless_json` |
 
 **作業履歴アプリ:**
 

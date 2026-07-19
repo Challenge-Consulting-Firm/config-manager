@@ -284,6 +284,101 @@ export interface RoutingRouteDiff {
   unchanged: number;
 }
 
+// ===== Wireless (SSID / access point) =====
+
+/** A wireless SSID extracted from a Meraki dump (`/wireless/ssids`).
+ *  This is a "static point" snapshot of the SSID configuration, mapped to a
+ *  common shape so it can be listed, exported and diffed like FW/routing. */
+export interface WirelessSsid {
+  /** Source vendor (currently always "Cisco Meraki"). */
+  vendor: string;
+  /** SSID slot number (0-14 for Meraki). */
+  number: number;
+  /** SSID name. */
+  name: string;
+  /** Whether the SSID is enabled/broadcasting. */
+  enabled: boolean;
+  /** Authentication mode: "open", "psk", "8021x-radius", etc. */
+  authMode: string;
+  /** Encryption mode when applicable ("wpa", "wpa-eap", ...). Empty if none. */
+  encryptionMode: string;
+  /** WPA encryption mode ("WPA2 only", "WPA3 Transition Mode", ...). Empty if n/a. */
+  wpaEncryptionMode: string;
+  /** IP assignment mode ("NAT mode", "Bridge mode", "Layer 3 roaming", ...). */
+  ipAssignmentMode: string;
+  /** VLAN tag when the SSID is bridged/tagged. Undefined when not applicable. */
+  vlanId?: number;
+  /** Whether VLAN tagging is used. */
+  useVlanTagging: boolean;
+  /** Band selection ("Dual band operation", "5 GHz band only", ...). Empty if default. */
+  bandSelection: string;
+  /** Per-client bandwidth limit down (Kbps, 0 = unlimited). */
+  perClientBandwidthLimitDown?: number;
+  /** Per-client bandwidth limit up (Kbps, 0 = unlimited). */
+  perClientBandwidthLimitUp?: number;
+  /** Whether the SSID is visible (advertised) vs hidden. */
+  visible: boolean;
+  /** RADIUS server hosts (host:port), joined for display. Empty if none. */
+  radiusServers: string;
+  /** Splash page type ("None", "Click-through splash page", ...). Empty if none. */
+  splashPage: string;
+  /** Additional attributes for display (free-form). */
+  attributes?: string;
+  /** Original raw JSON of this SSID entry. */
+  raw: string;
+}
+
+/** A wireless access point (MR device) extracted from a Meraki dump's
+ *  Devices block. Snapshot of the physical AP inventory. */
+export interface WirelessAccessPoint {
+  /** Source vendor (currently always "Cisco Meraki"). */
+  vendor: string;
+  /** Device name. */
+  name: string;
+  /** Model (e.g. "MR33"). */
+  model: string;
+  /** Serial number (stable identity across generations). */
+  serial: string;
+  /** MAC address. */
+  mac: string;
+  /** Firmware version string. */
+  firmware: string;
+  /** LAN-side (private) IP when known. */
+  lanIp: string;
+  /** Public / WAN-side IP when known. */
+  publicIp: string;
+  /** Original raw device line / info. */
+  raw: string;
+}
+
+// ===== Wireless diff =====
+
+export interface WirelessSsidChange {
+  before: WirelessSsid;
+  after: WirelessSsid;
+}
+
+export interface WirelessAccessPointChange {
+  before: WirelessAccessPoint;
+  after: WirelessAccessPoint;
+}
+
+/** Structural diff between two generations' wireless SSID + AP snapshots. */
+export interface WirelessDiff {
+  ssids: {
+    added: WirelessSsid[];
+    removed: WirelessSsid[];
+    changed: WirelessSsidChange[];
+    unchanged: number;
+  };
+  accessPoints: {
+    added: WirelessAccessPoint[];
+    removed: WirelessAccessPoint[];
+    changed: WirelessAccessPointChange[];
+    unchanged: number;
+  };
+}
+
 // ===== Meraki credentials =====
 
 /** 登録済みの Meraki 接続情報（ネットワーク ID + API キーのセット）。

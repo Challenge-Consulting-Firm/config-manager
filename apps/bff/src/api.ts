@@ -13,6 +13,7 @@ import {
   getVersionRecord,
   getFwCacheRaw,
   getRoutingCacheRaw,
+  getWirelessCacheRaw,
   identifiersFromRecord,
   latestGenerationFor,
   listAudit,
@@ -21,6 +22,7 @@ import {
   listVersionsDetailed,
   setFwCache,
   setRoutingCache,
+  setWirelessCache,
   writeAudit,
   createMerakiCredential,
   deleteMerakiCredential,
@@ -36,15 +38,19 @@ import {
   diffConfigs,
   diffFirewallRules,
   diffRoutingRoutes,
+  diffWireless,
   detectDeviceInfo,
   extractFirewallRules,
   extractRoutingRoutes,
+  extractWireless,
   normalizeConfig,
   parseFirewallCache,
   parseRoutingCache,
+  parseWirelessCache,
   serializeFirewallRules,
   serializeMerakiConfig,
   serializeRoutingRoutes,
+  serializeWireless,
   summarizeMerakiImport,
 } from "@config-manager/shared";
 import type {
@@ -57,6 +63,7 @@ import type {
   MerakiProductType,
   Role,
   RoutingRoute,
+  WirelessExtraction,
 } from "@config-manager/shared";
 import { fetchMerakiConfig } from "./meraki.js";
 
@@ -228,6 +235,37 @@ api.get("/versions/:id/routing", async (c) => {
   return c.json({ routes, fromCache, count: routes.length });
 });
 
+/** GET /api/versions/:id/wireless — cached wireless (SSID + AP) snapshot.
+ *  Returns the persisted extraction; recomputes + persists on cache miss or
+ *  body-hash mismatch. Only Meraki dumps carry wireless data — other vendors
+ *  yield empty lists. */
+api.get("/versions/:id/wireless", async (c) => {
+  const cfg = c.var.cfg;
+  const id = c.req.param("id");
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+
+  const val = (k: string) => rec[k]?.value ?? "";
+  const hash = val("hash");
+  const rawBody = val("body");
+  const detected = detectedFromRecord(rec);
+
+  let extraction = parseWirelessCache(getWirelessCacheRaw(rec), hash);
+  let fromCache = extraction !== null;
+  if (extraction === null) {
+    extraction = extractWireless(rawBody, detected);
+    void setWirelessCache(cfg, id, serializeWireless(extraction, hash));
+    fromCache = false;
+  }
+
+  return c.json({
+    ssids: extraction.ssids,
+    accessPoints: extraction.accessPoints,
+    fromCache,
+    count: extraction.ssids.length + extraction.accessPoints.length,
+  });
+});
+
 interface UploadBody {
   customer?: string;
   hostname?: string;
@@ -287,6 +325,9 @@ api.post("/upload", async (c) => {
   // Likewise extract routing info once at upload time.
   const routingRoutes = extractRoutingRoutes(body, detected);
   const routingRoutesJson = serializeRoutingRoutes(routingRoutes, normalized.hash);
+  // Wireless (SSID + AP) snapshot; empty for non-Meraki configs.
+  const wireless = extractWireless(body, detected);
+  const wirelessJson = serializeWireless(wireless, normalized.hash);
 
   // Detect an unchanged config (same hash as latest) and short-circuit.
   const prevGen = await latestGenerationFor(cfg, { customer, hostname, ipAddress, role });
@@ -315,6 +356,7 @@ api.post("/upload", async (c) => {
     detected,
     fwRulesJson,
     routingRoutesJson,
+    wirelessJson,
   });
 
   await writeAudit(cfg, {
@@ -394,6 +436,7 @@ api.post("/promote", async (c) => {
     detected,
     fwRulesJson: serializeFirewallRules(extractFirewallRules(body, detected), hash),
     routingRoutesJson: serializeRoutingRoutes(extractRoutingRoutes(body, detected), hash),
+    wirelessJson: serializeWireless(extractWireless(body, detected), hash),
   });
 
   await writeAudit(cfg, {
@@ -675,6 +718,8 @@ api.post("/meraki/import", async (c) => {
         routingRoutes,
         normalized.hash,
       );
+      const wireless = extractWireless(rawBody, detected);
+      const wirelessJson = serializeWireless(wireless, normalized.hash);
 
       const identifiers = {
         customer,
@@ -730,6 +775,7 @@ api.post("/meraki/import", async (c) => {
         detected,
         fwRulesJson,
         routingRoutesJson,
+        wirelessJson,
       });
 
       await writeAudit(cfg, {
@@ -1278,6 +1324,25 @@ async function resolveRoutingRoutes(cfg: AppConfig, id: string): Promise<{
   return { routes, record: rec };
 }
 
+/** Analogous to {@link resolveFirewallRules} for wireless (SSID + AP). */
+async function resolveWireless(cfg: AppConfig, id: string): Promise<{
+  extraction: WirelessExtraction;
+  record: KintoneRecord;
+} | null> {
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return null;
+  const val = (k: string) => rec[k]?.value ?? "";
+  const hash = val("hash");
+  const rawBody = val("body");
+  const detected = detectedFromRecord(rec);
+  let extraction = parseWirelessCache(getWirelessCacheRaw(rec), hash);
+  if (extraction === null) {
+    extraction = extractWireless(rawBody, detected);
+    void setWirelessCache(cfg, id, serializeWireless(extraction, hash));
+  }
+  return { extraction, record: rec };
+}
+
 /** GET /api/diff/firewall?before=<id>&after=<id> — structural diff between
  *  the firewall rule sets of two versions. Uses cached extractions so it is
  *  fast even for large policies. */
@@ -1331,6 +1396,34 @@ api.get("/diff/routing", async (c) => {
     customer: before.record["customer"]?.value,
     hostname: before.record["hostname"]?.value,
     detail: `Diffed routing routes`,
+  });
+  return c.json({ diff });
+});
+
+/** GET /api/diff/wireless?before=<id>&after=<id> — structural diff between
+ *  the wireless SSID + AP snapshots of two versions. */
+api.get("/diff/wireless", async (c) => {
+  const cfg = c.var.cfg;
+  const beforeId = c.req.query("before");
+  const afterId = c.req.query("after");
+  if (!beforeId || !afterId) {
+    return c.json(
+      { error: "before and after query params are required" },
+      400,
+    );
+  }
+  const before = await resolveWireless(cfg, beforeId);
+  const after = await resolveWireless(cfg, afterId);
+  if (!before || !after) return c.json({ error: "not found" }, 404);
+
+  const diff = diffWireless(before.extraction, after.extraction);
+  void writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "diff",
+    customer: before.record["customer"]?.value,
+    hostname: before.record["hostname"]?.value,
+    detail: `Diffed wireless SSID/AP`,
   });
   return c.json({ diff });
 });
