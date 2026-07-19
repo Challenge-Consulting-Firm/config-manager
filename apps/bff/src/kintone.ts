@@ -153,11 +153,27 @@ function toConfigVersion(rec: KintoneRecord): ConfigVersion {
   };
 }
 
-/** List config versions, optionally filtered by identifiers. */
-export async function listVersions(
+/** バージョン一覧を「メタ情報＋識別子」のペアで返す。body 本文は含めない。
+ *  /api/devices の一覧構築で、各バージョンの識別子（customer/hostname/
+ *  ipAddress/role）を 1 クエリでまとめて得るために使う。従来は各バージョン
+ *  ごとに getVersionRecord（body 込み・数 MB）を呼んでいたため OOM の温床だった。 */
+export async function listVersionsDetailed(
   cfg: AppConfig,
   filter: Partial<DeviceIdentifiers>,
-): Promise<ConfigVersion[]> {
+): Promise<{ version: ConfigVersion; identifiers: DeviceIdentifiers }[]> {
+  const records = await listVersionRecords(cfg, filter);
+  return records.map((rec) => ({
+    version: toConfigVersion(rec),
+    identifiers: identifiersFromRecord(rec),
+  }));
+}
+
+/** listVersions / listVersionsDetailed 共通の生レコード取得。body を除いた
+ *  必要フィールドのみを最大 500 件取得する。 */
+async function listVersionRecords(
+  cfg: AppConfig,
+  filter: Partial<DeviceIdentifiers>,
+): Promise<KintoneRecord[]> {
   const conds: string[] = [];
   if (filter.customer) {
     conds.push(`${F.config.customer} = ${JSON.stringify(filter.customer)}`);
@@ -171,22 +187,49 @@ export async function listVersions(
   if (filter.role) {
     conds.push(`${F.config.role} = ${JSON.stringify(roleToKintone(filter.role))}`);
   }
-  const query = conds.length
-    ? conds.join(" and ")
-    : "";
+  const query = conds.length ? conds.join(" and ") : "";
   const res = await kintoneFetch<{
     records: KintoneRecord[];
   }>(cfg, cfg.kintone.configAppToken, "/records.json", {
     method: "POST",
-    headers: {
-      "X-HTTP-Method-Override": "GET",
-    },
+    headers: { "X-HTTP-Method-Override": "GET" },
     body: JSON.stringify({
       app: cfg.kintone.configAppId,
       query: `${query} order by ${F.config.generation} desc limit 500`,
+      fields: [
+        "$id",
+        F.config.customer,
+        F.config.hostname,
+        F.config.ipAddress,
+        F.config.purpose,
+        F.config.serialNumber,
+        F.config.role,
+        F.config.generation,
+        F.config.hash,
+        F.config.operator,
+        F.config.operatorEmail,
+        F.config.note,
+        F.config.size,
+        F.config.lines,
+        F.config.vendor,
+        F.config.deviceOs,
+        F.config.osVersion,
+        F.config.detectedModel,
+        "作成日時",
+      ],
     }),
   });
-  return res.records.map(toConfigVersion);
+  return res.records;
+}
+
+/** List config versions, optionally filtered by identifiers. body は含めない
+ *  （一覧・重複判定用途）。本文が必要な場合は getVersionRecord を使うこと。 */
+export async function listVersions(
+  cfg: AppConfig,
+  filter: Partial<DeviceIdentifiers>,
+): Promise<ConfigVersion[]> {
+  const records = await listVersionRecords(cfg, filter);
+  return records.map(toConfigVersion);
 }
 
 interface KintoneGetRecordResponse {
@@ -537,6 +580,27 @@ export async function deleteVersion(
       ids: [id],
     }),
   });
+}
+
+/** 複数のバージョンレコードを一括削除する。機器（＝customer/hostname/
+ *  ipAddress/role で束ねた論理デバイス）を全世代まとめて削除する用途。
+ *  Kintone の DELETE /records.json は 1 回あたり最大 100 件のため、100 件ずつ
+ *  分割して呼び出す。空配列なら何もしない。 */
+export async function deleteVersions(
+  cfg: AppConfig,
+  ids: string[],
+): Promise<void> {
+  if (ids.length === 0) return;
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    await kintoneFetch(cfg, cfg.kintone.configAppToken, "/records.json", {
+      method: "DELETE",
+      body: JSON.stringify({
+        app: cfg.kintone.configAppId,
+        ids: chunk,
+      }),
+    });
+  }
 }
 
 // ===== Meraki credentials (optional app) =====

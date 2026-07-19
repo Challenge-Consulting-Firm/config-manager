@@ -20,6 +20,7 @@ const PROTOCOL_COLORS: Record<string, string> = {
   bgp: "bg-purple-100 text-purple-700",
   rip: "bg-amber-100 text-amber-700",
   eigrp: "bg-cyan-100 text-cyan-700",
+  vpn: "bg-indigo-100 text-indigo-700",
 };
 
 function protoColor(p: string): string {

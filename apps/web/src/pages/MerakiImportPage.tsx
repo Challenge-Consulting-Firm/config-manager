@@ -10,23 +10,37 @@ interface CredentialListResponse {
   error?: string;
 }
 
-/** BFF の /api/meraki/import レスポンス。 */
+/** BFF の /api/meraki/import レスポンス（デバイス単位レコード分割後）。
+ *  ネットワーク内のデバイス 1 件每に結果が 1 エントリ入る。 */
 interface MerakiImportResult {
-  created?: {
-    id: string;
-    generation: number;
-    hash: string;
-    detected?: {
-      vendor: string;
-      os: string;
-      osVersion: string;
+  /** デバイス每の取り込み結果。ネットワーク内の MR/MX/MS 各デバイスに対して
+   *  created / skipped / error のいずれかが立つ。 */
+  results: Array<{
+    device: {
+      serial: string;
+      name: string;
       model: string;
-      confidence: number;
+      productType: string;
+      lanIp?: string;
+      publicIp?: string;
     };
-  };
-  skipped?: boolean;
-  reason?: string;
-  strippedLines?: number;
+    created?: {
+      id: string;
+      generation: number;
+      hash: string;
+      detected?: {
+        vendor: string;
+        os: string;
+        osVersion: string;
+        model: string;
+        confidence: number;
+      };
+    };
+    skipped?: boolean;
+    reason?: string;
+    error?: string;
+    strippedLines?: number;
+  }>;
   summary?: {
     deviceCount: number;
     sectionsByProduct: Record<MerakiProductType, number>;
@@ -69,14 +83,10 @@ export function MerakiImportPage() {
   );
   const [apiKey, setApiKey] = useState("");
 
-  // 識別子（クレデンシャル選択時にデフォルト値で補完）
+  // 識別子。Meraki はネットワーク単位で取り込み、ホスト名・IP・シリアル・用途は
+  // ネットワーク内の各デバイス情報から自動決定するため、UI では入力しない。
+  // customer（顧客）と role（稼働区分）のみユーザーが指定する。
   const [customer, setCustomer] = useState(params.get("customer") ?? "");
-  const [hostname, setHostname] = useState(params.get("hostname") ?? "");
-  const [ipAddress, setIpAddress] = useState(params.get("ipAddress") ?? "");
-  const [purpose, setPurpose] = useState(params.get("purpose") ?? "");
-  const [serialNumber, setSerialNumber] = useState(
-    params.get("serialNumber") ?? "",
-  );
   const [role, setRole] = useState<Role>(
     params.get("role") === "spare" ? "spare" : "production",
   );
@@ -85,6 +95,17 @@ export function MerakiImportPage() {
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<MerakiImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // BFF から diagnostic 情報付きのエラーが返った場合、その詳細を保持して画面表示する。
+  // 現状は「ネットワーク内に MR/MX/MS デバイスが見つからない」エラーで、実際の
+  // productType / model 一覧を返すために使われる。
+  const [errorDetail, setErrorDetail] = useState<
+    | {
+        deviceCount?: number;
+        productTypesFound?: string[];
+        devices?: Array<{ name: string; model: string; serial: string; productType: string }>;
+      }
+    | null
+  >(null);
 
   // クレデンシャル一覧を取得。
   useEffect(() => {
@@ -103,27 +124,25 @@ export function MerakiImportPage() {
     })();
   }, []);
 
-  // クレデンシャル選択時、customer/hostname が未入力ならデフォルト値で補完。
+  // クレデンシャル選択時、customer が未入力ならデフォルト値で補完。
   // networkId/apiKey は BFF 側で credentialId から解決するため、UI 上では
   // 読み取り専用で表示するだけで送信不要。ただし「別のネットワークを手動指定」
   // したいケースに備え、networkId 入力欄は選択を外せば使えるように残す。
   const selected = credentials.find((c) => c.id === credentialId);
   useEffect(() => {
-    if (selected) {
-      if (!customer && selected.defaultCustomer)
-        setCustomer(selected.defaultCustomer);
-      if (!hostname && selected.defaultHostname)
-        setHostname(selected.defaultHostname);
+    if (selected && !customer && selected.defaultCustomer) {
+      setCustomer(selected.defaultCustomer);
     }
-  }, [selected, customer, hostname]);
+  }, [selected, customer]);
 
   async function submit() {
     setError(null);
+    setErrorDetail(null);
     setResult(null);
     if (credentialId) {
       // クレデンシャル選択時は networkId/apiKey は BFF 側で解決。
-      if (!customer.trim() || !hostname.trim()) {
-        setError("顧客・ホスト名は必須です");
+      if (!customer.trim()) {
+        setError("顧客は必須です");
         return;
       }
     } else {
@@ -131,8 +150,8 @@ export function MerakiImportPage() {
         setError("ネットワーク ID または接続情報の選択が必要です");
         return;
       }
-      if (!customer.trim() || !hostname.trim()) {
-        setError("顧客・ホスト名は必須です");
+      if (!customer.trim()) {
+        setError("顧客は必須です");
         return;
       }
     }
@@ -140,7 +159,6 @@ export function MerakiImportPage() {
     try {
       const body: Record<string, string> = {
         customer: customer.trim(),
-        hostname: hostname.trim(),
         role,
       };
       if (credentialId) {
@@ -149,9 +167,6 @@ export function MerakiImportPage() {
         body.networkId = networkId.trim();
         if (apiKey.trim()) body.apiKey = apiKey.trim();
       }
-      if (ipAddress.trim()) body.ipAddress = ipAddress.trim();
-      if (purpose.trim()) body.purpose = purpose.trim();
-      if (serialNumber.trim()) body.serialNumber = serialNumber.trim();
       if (note.trim()) body.note = note.trim();
 
       const res = await apiFetch<MerakiImportResult>("/api/meraki/import", {
@@ -161,6 +176,14 @@ export function MerakiImportPage() {
       setResult(res);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
+      // diagnostic 情報があれば抽出して表示。BFF が { error, diagnostic, ... }
+      // 形式で返すため、ApiError.body から取り出す。
+      if (e instanceof ApiError && e.body && typeof e.body === "object") {
+        const b = e.body as Record<string, unknown>;
+        if (b.diagnostic && typeof b.diagnostic === "object") {
+          setErrorDetail(b.diagnostic as typeof errorDetail);
+        }
+      }
     } finally {
       setSubmitting(false);
     }
@@ -181,9 +204,10 @@ export function MerakiImportPage() {
       </h1>
       <p className="mb-4 text-sm text-slate-600">
         ネットワーク ID と API キーを入力するか、登録済みの接続情報を選択して
-        ください。Meraki Dashboard API から設定を取得して新規世代として保存します。
-        保存後は手動アップロードと同じく Diff・FW/ルーティング抽出・履歴管理が
-        利用できます。
+        ください。<strong>ネットワーク単位</strong>で Meraki Dashboard API から設定を取得し、
+        ネットワーク内の MR/MX/MS デバイスを<strong>機器ごとに自動分割</strong>して新規世代として保存します。
+        ホスト名・IP・シリアルは各デバイスの情報から自動決定されます。
+        保存後は手動アップロードと同じく Diff・FW/ルーティング抽出・履歴管理が利用できます。
       </p>
 
       <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
@@ -273,38 +297,6 @@ export function MerakiImportPage() {
             className={inputCls}
           />
         </Field>
-        <Field label="ホスト名 *">
-          <input
-            value={hostname}
-            onChange={(e) => setHostname(e.target.value)}
-            placeholder="例: Tokyo-Office-MX"
-            className={inputCls}
-          />
-        </Field>
-        <Field label="IPアドレス（省略可）">
-          <input
-            value={ipAddress}
-            onChange={(e) => setIpAddress(e.target.value)}
-            placeholder="未入力時はデバイスの lanIp (プライベート IP) で補完"
-            className={inputCls}
-          />
-        </Field>
-        <Field label="シリアル番号（省略可）">
-          <input
-            value={serialNumber}
-            onChange={(e) => setSerialNumber(e.target.value)}
-            placeholder="Q2XX-XXXX-XXXX"
-            className={inputCls}
-          />
-        </Field>
-        <Field label="用途（省略可）">
-          <input
-            value={purpose}
-            onChange={(e) => setPurpose(e.target.value)}
-            placeholder="未入力時はネットワーク名を自動設定"
-            className={inputCls}
-          />
-        </Field>
         <Field label="メモ（省略可）">
           <input
             value={note}
@@ -313,6 +305,11 @@ export function MerakiImportPage() {
           />
         </Field>
       </div>
+
+      <p className="mt-2 text-xs text-slate-500">
+        ホスト名・IPアドレス・シリアル番号・用途は、ネットワーク内の各デバイス情報から
+        自動で決定されます（ホスト名＝デバイス名、IP＝デバイスの LAN/WAN IP）。
+      </p>
 
       <div className="mt-4 flex items-center gap-6">
         <span className="text-xs font-medium uppercase text-slate-500">
@@ -359,38 +356,124 @@ export function MerakiImportPage() {
         </div>
       </div>
 
-      {error && <p className="mt-4 text-red-600">エラー: {error}</p>}
+      {error && (
+        <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+          <p>エラー: {error}</p>
+          {errorDetail && (
+            <div className="mt-2 text-xs text-red-700">
+              <div>
+                <span className="font-semibold">デバイス数:</span>{" "}
+                {errorDetail.deviceCount ?? "?"}
+              </div>
+              {errorDetail.productTypesFound &&
+                errorDetail.productTypesFound.length > 0 && (
+                  <div className="mt-1">
+                    <span className="font-semibold">検出された productType:</span>{" "}
+                    {errorDetail.productTypesFound.join(", ")}
+                  </div>
+                )}
+              {errorDetail.devices && errorDetail.devices.length > 0 && (
+                <details className="mt-1">
+                  <summary className="cursor-pointer">デバイス一覧</summary>
+                  <ul className="mt-1 list-inside list-disc">
+                    {errorDetail.devices.map((d, i) => (
+                      <li key={i}>
+                        <span className="font-mono">{d.model || "?"}</span>{" "}
+                        ({d.name || "(unnamed)"}, serial={d.serial || "-"},
+                        productType={d.productType || "(empty)"})
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              <p className="mt-2 text-red-600">
+                ※ model が MX/MR/MS で始まる場合は本修正で自動補完されます。
+                それでもこのエラーが出る場合は、BFF ログ (fly logs) で
+                /devices 応答を確認してください。
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       {result && (
         <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
-          {result.skipped ? (
-            <>
-              変更なし — 最新世代と同一のコンフィグです。新世代は作成されませんでした。
-              {result.reason ? `（${result.reason}）` : ""}
-            </>
-          ) : (
-            <>
-              世代 #{result.created?.generation} を登録しました（
-              {result.strippedLines ?? 0} 行のコメント/空白行を除去）。
-              {result.created?.detected &&
-                (result.created.detected.vendor ||
-                  result.created.detected.os) && (
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <span className="font-semibold uppercase text-xs">
-                      自動検出:
-                    </span>
-                    <Detected>{result.created.detected.vendor}</Detected>
-                    <Detected>{result.created.detected.os}</Detected>
-                  </div>
-                )}
-              <button
-                onClick={() => navigate(returnKey)}
-                className="ml-2 underline"
-              >
-                {params.get("hostname") ? "機器詳細へ戻る" : "機器一覧へ戻る"}
-              </button>
-            </>
+          {/* デバイス每の取り込み結果一覧 */}
+          {result.results.length > 0 && (
+            <div className="mb-3">
+              <div className="font-semibold">
+                取り込み結果: {result.results.length} 件
+              </div>
+              <ul className="mt-2 space-y-2">
+                {result.results.map((r, i) => {
+                  const productLabel =
+                    PRODUCT_LABELS[r.device.productType as MerakiProductType]?.split(" ")[0] ||
+                    r.device.productType;
+                  return (
+                    <li
+                      key={(r.device.serial || "") + "-" + i}
+                      className="rounded bg-white/70 p-2 text-xs"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono font-semibold">
+                          {productLabel}
+                        </span>
+                        <span>{r.device.name || "(unnamed)"}</span>
+                        <span className="text-slate-500">
+                          serial={r.device.serial || "-"}
+                        </span>
+                        <span className="text-slate-500">
+                          model={r.device.model || "-"}
+                        </span>
+                        {r.device.lanIp && (
+                          <span className="text-slate-500">
+                            lanIp={r.device.lanIp}
+                          </span>
+                        )}
+                        {r.device.publicIp && (
+                          <span className="text-slate-500">
+                            publicIp={r.device.publicIp}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1">
+                        {r.created ? (
+                          <span>
+                            ✅ 世代 #{r.created.generation} を登録（
+                            {r.strippedLines ?? 0} 行のコメント/空白行を除去）
+                            {r.created.detected &&
+                              (r.created.detected.vendor ||
+                                r.created.detected.os) && (
+                                <span className="ml-2">
+                                  [{r.created.detected.vendor || "?"}/{" "}
+                                  {r.created.detected.os || "?"}]
+                                </span>
+                              )}
+                          </span>
+                        ) : r.skipped ? (
+                          <span className="text-slate-600">
+                            ⏭︎ スキップ:{" "}
+                            {r.reason || "最新世代と同一のコンフィグです"}
+                          </span>
+                        ) : (
+                          <span className="text-red-700">
+                            ❌ エラー: {r.error}
+                          </span>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
           )}
+
+          <button
+            onClick={() => navigate(returnKey)}
+            className="underline"
+          >
+            {params.get("hostname") ? "機器詳細へ戻る" : "機器一覧へ戻る"}
+          </button>
 
           {result.network && (
             <div className="mt-3 rounded bg-white/70 p-2 text-xs">
@@ -483,15 +566,6 @@ export function MerakiImportPage() {
         </div>
       )}
     </div>
-  );
-}
-
-function Detected({ children }: { children: React.ReactNode }) {
-  if (!children) return null;
-  return (
-    <span className="rounded bg-white px-2 py-0.5 ring-1 ring-emerald-200">
-      {children}
-    </span>
   );
 }
 

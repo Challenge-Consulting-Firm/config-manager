@@ -13,6 +13,7 @@
  */
 
 import type { DeviceDetection } from "./detect.js";
+import { collectMerakiJsonBlocks } from "./firewall.js";
 import type {
   RoutingRoute,
   RoutingRouteChange,
@@ -29,7 +30,9 @@ export interface RoutingCache {
   routes: RoutingRoute[];
 }
 
-export const ROUTING_CACHE_VERSION = 1;
+// v2: added Meraki (Dashboard JSON) route extraction (S2S VPN subnets + static
+// routes). Bumping invalidates older caches so Meraki records recompute.
+export const ROUTING_CACHE_VERSION = 2;
 
 /** Serialize routes to a compact JSON string for storage. */
 export function serializeRoutingRoutes(
@@ -736,8 +739,99 @@ function extractYamaha(lines: string[]): RoutingRoute[] {
 // ----- dispatcher -----
 
 /** Quick structural sniff to pick a parser when the vendor is unknown. */
+// ----- Cisco Meraki (Dashboard API JSON dump) -----
+
+/** Extract routing info from a Meraki dump. Two sources:
+ *   - Static Routes: `[{ name, subnet, gatewayIp, enabled }]` (routed mode only)
+ *   - Site-to-site VPN: `{ mode, hubs, subnets: [{ localSubnet, useVpn }] }`.
+ *     Each `useVpn: true` local subnet is an advertised VPN route; in spoke
+ *     mode the hub is the effective next hop for remote networks. We surface
+ *     the advertised subnets as protocol="vpn" so the routing view shows what
+ *     the appliance participates in even without a classic routing table
+ *     (e.g. passthrough / bridge mode MX). */
+function extractMeraki(lines: string[], vendor: string): RoutingRoute[] {
+  const routes: RoutingRoute[] = [];
+  const text = lines.join("\n");
+  let seq = 0;
+  for (const { value } of collectMerakiJsonBlocks(text)) {
+    // Static routes: array of { subnet, gatewayIp, ... }.
+    if (Array.isArray(value)) {
+      const isStatic = value.some(
+        (r) =>
+          r !== null &&
+          typeof r === "object" &&
+          "subnet" in r &&
+          "gatewayIp" in r,
+      );
+      if (isStatic) {
+        for (const r of value) {
+          if (r === null || typeof r !== "object") continue;
+          const o = r as Record<string, unknown>;
+          seq++;
+          routes.push({
+            vendor,
+            protocol: "static",
+            network: String(o.subnet ?? ""),
+            nextHop: String(o.gatewayIp ?? ""),
+            attributes:
+              [
+                typeof o.name === "string" && o.name ? `name=${o.name}` : "",
+                o.enabled === false ? "disabled" : "",
+              ]
+                .filter(Boolean)
+                .join(" ") || undefined,
+            line: seq,
+            raw: JSON.stringify(r),
+          });
+        }
+      }
+      continue;
+    }
+    // Site-to-site VPN object: { mode, hubs, subnets }.
+    if (value !== null && typeof value === "object") {
+      const o = value as Record<string, unknown>;
+      if ("mode" in o && Array.isArray(o.subnets)) {
+        const mode = String(o.mode ?? "");
+        const hubs = Array.isArray(o.hubs) ? o.hubs : [];
+        const hubId =
+          hubs.length > 0 &&
+          hubs[0] !== null &&
+          typeof hubs[0] === "object"
+            ? String((hubs[0] as Record<string, unknown>).hubId ?? "")
+            : "";
+        for (const s of o.subnets as unknown[]) {
+          if (s === null || typeof s !== "object") continue;
+          const sub = s as Record<string, unknown>;
+          if (sub.useVpn !== true) continue; // only VPN-advertised subnets
+          const local = String(sub.localSubnet ?? "");
+          if (!local) continue;
+          seq++;
+          routes.push({
+            vendor,
+            protocol: "vpn",
+            network: local,
+            nextHop: mode === "spoke" && hubId ? `hub:${hubId}` : "site-to-site VPN",
+            attributes: `mode=${mode || "?"}`,
+            line: seq,
+            raw: JSON.stringify(s),
+          });
+        }
+      }
+    }
+  }
+  return routes;
+}
+
 function guessVendorFromConfig(lines: string[]): string {
   const has = (re: RegExp) => lines.some((l) => re.test(l));
+  // Meraki: fixed dump header, or S2S VPN localSubnet / static-route JSON keys.
+  if (
+    has(/Meraki Network Configuration Dump/) ||
+    has(/"localSubnet"/) ||
+    has(/"gatewayIp"/)
+  ) {
+    return "Cisco Meraki";
+  }
   if (has(/^set\s+routing-options\s+/i) || has(/^routing-options\s*\{?/i)) return "Juniper";
   if (has(/^config\s+router\s+(static|bgp|ospf)/i) || has(/^#config-version=/i)) return "Fortinet";
   if (has(/^\s*ip\s+lan\d+\s+address\s+/i)) return "YAMAHA";
@@ -774,7 +868,7 @@ export function extractRoutingRoutes(
   }
 
   let best: RoutingRoute[] = [];
-  for (const v of ["Cisco", "Juniper", "Fortinet", "YAMAHA"]) {
+  for (const v of ["Cisco Meraki", "Cisco", "Juniper", "Fortinet", "YAMAHA"]) {
     const r = runForVendor(lines, v);
     if (r.length > best.length) best = r;
   }
@@ -783,6 +877,8 @@ export function extractRoutingRoutes(
 
 function runForVendor(lines: string[], vendor: string): RoutingRoute[] {
   switch (vendor) {
+    case "Cisco Meraki":
+      return extractMeraki(lines, vendor);
     case "Cisco":
       return extractCisco(lines, vendor);
     case "Juniper":

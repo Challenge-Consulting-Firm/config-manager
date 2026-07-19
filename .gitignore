@@ -10,3 +10,5 @@ build
 coverage
 .vscode/*
 !.vscode/extensions.json
+.claude/
+tmp/

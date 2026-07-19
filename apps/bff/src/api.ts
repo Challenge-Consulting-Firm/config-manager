@@ -18,12 +18,14 @@ import {
   listAudit,
   listConfigRecords,
   listVersions,
+  listVersionsDetailed,
   setFwCache,
   setRoutingCache,
   writeAudit,
   createMerakiCredential,
   deleteMerakiCredential,
   deleteVersion,
+  deleteVersions,
   getMerakiCredential,
   isEnabledMerakiCredentials,
   listMerakiCredentials,
@@ -51,6 +53,8 @@ import type {
   ConfigVersion,
   Device,
   FirewallRule,
+  MerakiDeviceInfo,
+  MerakiProductType,
   Role,
   RoutingRoute,
 } from "@config-manager/shared";
@@ -76,24 +80,17 @@ api.get("/me", (c) => c.json(c.var.user));
 api.get("/devices", async (c) => {
   const cfg = c.var.cfg;
   const { customer, hostname, role } = c.req.query();
-  const versions = await listVersions(cfg, {
+  // body 本文を含まない一覧＋識別子を 1 クエリで取得する。以前は各バージョンを
+  // getVersionRecord（body 込み・Meraki では数 MB）で読み直しており、レコードが
+  // 増えると OOM していた。
+  const detailed = await listVersionsDetailed(cfg, {
     customer: customer || undefined,
     hostname: hostname || undefined,
     role: (role as Role) || undefined,
   });
 
-  // Fetch identifiers for each version by reading its record.
-  // For performance we cache by id.
-  const idCache = new Map<string, ReturnType<typeof identifiersFromRecord>>();
   const devices = new Map<string, Device>();
-  for (const v of versions) {
-    let ids = idCache.get(v.id);
-    if (!ids) {
-      const rec = await getVersionRecord(cfg, v.id);
-      if (!rec) continue;
-      ids = identifiersFromRecord(rec);
-      idCache.set(v.id, ids);
-    }
+  for (const { version: v, identifiers: ids } of detailed) {
     // Production and spare are distinct devices even with the same hostname.
     const key = `${ids.customer}|${ids.hostname}|${ids.ipAddress}|${ids.role}`;
     const existing = devices.get(key);
@@ -415,11 +412,15 @@ api.post("/promote", async (c) => {
 interface MerakiImportBody {
   networkId: string;
   apiKey?: string;
-  /** 登録済み Meraki 接続情報のレコード ID。指定時は networkId/apiKey
+  /** 登録済 Meraki 接続情報のレコード ID。指定時は networkId/apiKey
    *  より優先され、さらにデフォルト顧客・ホスト名も補完に使う。 */
   credentialId?: string;
   customer: string;
+  /** デバイス name が取れない場合のフォールバックホスト名。デバイス name が
+   *  存在する場合はその name が優先される（デバイス単位レコード化のため）。 */
   hostname: string;
+  /** 未指定時は各デバイスの lanIp / publicIp で補完。指定時は全デバイスの
+   *  IP を強制上書きするため、複数デバイスを抱えるネットワークでは推奨しない。 */
   ipAddress?: string;
   purpose?: string;
   serialNumber?: string;
@@ -427,17 +428,64 @@ interface MerakiImportBody {
   note?: string;
 }
 
+/** Meraki import のデバイス每結果。ネットワーク内のデバイス 1 件につき 1
+ *  レコード作成（またはスキップ・エラー）を返す。Meraki はネットワーク単位
+ *  で設定を保持するため、同一 productType の複数デバイス（例: MR 3 台）は
+ *  コンフィグ本体が同一になるが、シリアル・IP・ホスト名で識別する。 */
+interface MerakiImportDeviceResult {
+  /** 取り込み対象デバイスの識別情報。UI 側で結果一覧を並べるのに使う。 */
+  device: {
+    serial: string;
+    name: string;
+    model: string;
+    productType: string;
+    lanIp?: string;
+    publicIp?: string;
+  };
+  /** createVersion が成功した場合の結果。skipped/error のどちらかのみ立つ。 */
+  created?: {
+    id: string;
+    generation: number;
+    hash: string;
+    detected?: {
+      vendor: string;
+      os: string;
+      osVersion: string;
+      model: string;
+      confidence: number;
+    };
+  };
+  /** 最新世代と同一コンフィグと判定されて新世代作成をスキップした場合。 */
+  skipped?: boolean;
+  reason?: string;
+  /** このデバイスの取り込みで失敗した場合のエラー理由。 */
+  error?: string;
+  /** normalize で除去されたコメント/空白行数。created のみ。 */
+  strippedLines?: number;
+}
+
 /** POST /api/meraki/import — Meraki Dashboard API から対象ネットワークの
- *  設定を取得し、通常のコンフィグ世代として新規登録する。
+ *  設定を取得し、**ネットワーク内のデバイス 1 件每**に新規世代として登録する。
  *
- *  処理フローは通常アップロードと同一で、取得した設定をテキストへ
- *  シリアライズしたうえで normalizeConfig → 重複スキップ判定 →
- *  createVersion → writeAudit に渡す。これにより、既存の Diff 表示・
- *  FW/ルーティング抽出・監査ログ・本番/予備管理をすべて再利用できる。
+ *  Meraki は設定をネットワーク単位で保持するため、ネットワーク内の全デバイス
+ *  が共通のネットワーク設定（VLAN/FW/SSID/ルーティング等）を共有する。本
+ *  エンドポイントでは「デバイスの productType に属するセクションのみ」を
+ *  シリアライズし、各デバイスを 1 レコードとして扱う。これにより「同一
+ *  ネットワークの MR と MX が同一レコードになる」問題を回避する。
+ *
+ *  識別子の決定（デバイス每）:
+ *    - customer: 要求ボディ（全デバイス共通）
+ *    - hostname: device.name → device.serial → 要求ボディ（フォールバック）
+ *    - ipAddress: 要求ボディ → device.lanIp → device.publicIp の順
+ *    - serialNumber: device.serial
+ *    - purpose: 要求ボディ → `${productType} in ${networkName}`
  *
  *  認証情報の優先順位: credentialId > 要求ボディ (networkId/apiKey) >
  *  環境変数 MERAKI_API_KEY（apiKey のみ）。credentialId 指定時は、
- *  customer/hostname が未入力ならデフォルト値で補完する。 */
+ *  customer/hostname が未入力ならデフォルト値で補完する。
+ *
+ *  トランザクション性は持たない：一部デバイスの取り込みに失敗しても、成功
+ *  したデバイスは保存し、results 配列で個別結果を返す。 */
 api.post("/meraki/import", async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<MerakiImportBody>().catch(() => null);
@@ -482,19 +530,23 @@ api.post("/meraki/import", async (c) => {
     );
   }
 
-  // 2. 識別子を確定。credentialId 由来のデフォルト → 要求ボディ順で優先。
+  // 2. 共通識別子を確定。Meraki はネットワーク単位で取り込み、hostname /
+  //    ipAddress / serialNumber / purpose はすべて各デバイスの情報から自動
+  //    決定する。したがってユーザー入力で必須なのは customer のみ。
+  //    payload.hostname / defaultHostname は name も serial も持たない稀な
+  //    デバイス向けのフォールバックとしてのみ使う（未指定可）。
   const customer = textField(payload.customer) || defaultCustomer;
-  const hostname = textField(payload.hostname) || defaultHostname;
-  const ipAddress = textField(payload.ipAddress);
-  const purpose = textField(payload.purpose);
-  const serialNumber = textField(payload.serialNumber);
+  const fallbackHostname = textField(payload.hostname) || defaultHostname;
+  const inputIpAddress = textField(payload.ipAddress);
+  const inputPurpose = textField(payload.purpose);
+  const inputSerialNumber = textField(payload.serialNumber);
   const note =
     typeof payload.note === "string" ? payload.note : undefined;
   const role: Role = payload.role === "spare" ? "spare" : "production";
 
-  if (!customer || !hostname) {
+  if (!customer) {
     return c.json(
-      { error: "customer, hostname は必須です（credentialId のデフォルト値または要求ボディで指定してください）" },
+      { error: "customer は必須です（credentialId のデフォルト値または要求ボディで指定してください）" },
       400,
     );
   }
@@ -510,41 +562,40 @@ api.post("/meraki/import", async (c) => {
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return c.json({ error: `Meraki API 取得失敗: ${msg}` }, 502);
+    return c.json({ error: "Meraki API 取得失敗: " + msg }, 502);
   }
   const { dump } = fetchResult;
   const summary = summarizeMerakiImport(dump);
 
-  // 4. コンフィグ本文をテキスト化し、以降は通常アップロードと同じフロー。
-  const rawBody = serializeMerakiConfig(dump);
-  const detected = detectDeviceInfo(rawBody);
-  const normalized = await normalizeConfig(rawBody, {
-    commentPrefixes: cfg.commentPrefixes,
-  });
-  const fwRules = extractFirewallRules(rawBody, detected);
-  const fwRulesJson = serializeFirewallRules(fwRules, normalized.hash);
-  const routingRoutes = extractRoutingRoutes(rawBody, detected);
-  const routingRoutesJson = serializeRoutingRoutes(routingRoutes, normalized.hash);
-
-  // IP はユーザー入力を優先。未入力時は以下の優先順位で補完:
-  //   1. lanIp (プライベート IP / VLAN のゲートウェイ IP 等) - 既定で推奨
-  //   2. publicIp (WAN 側 IP / uplinks/statuses から取得)
-  // プライベート IP が一般的な運用 IP であるため、lanIp を優先する。
-  const resolvedIp =
-    ipAddress ||
-    dump.devices.find((d) => d.lanIp)?.lanIp ||
-    dump.devices.find((d) => d.publicIp)?.publicIp ||
-    "";
-
-  // Kintone のコンフィグ管理アプリは ip_address を必須項目としているため、
-  // 補完後も空の場合は早期エラーにする。放置すると createVersion が 400 になり、
-  // Hono のデフォルトエラーハンドラから "Internal Server Error" が返って
-  // クライアント側の JSON パースを壊す原因になる。
-  if (!resolvedIp) {
+  // ネットワーク内に MR/MX/MS デバイスが 1 件も無い場合は早期エラー。
+  // (cell/camera/sensor 等のみのネットワーク)
+  const supportedDevices = dump.devices.filter(
+    (d): d is MerakiDeviceInfo & { productType: MerakiProductType } =>
+      d.productType === "appliance" ||
+      d.productType === "switch" ||
+      d.productType === "wireless",
+  );
+  if (supportedDevices.length === 0) {
+    // 诊断情報: 実際に取得したデバイスの productType / model を返す。
+    // UI 側で「なぜ MR/MX/MS と判定されなかったか」を確認できるようにする。
+    const deviceDiagnostics = dump.devices.map((d) => ({
+      name: d.name || "",
+      model: d.model || "",
+      serial: d.serial || "",
+      productType: d.productType || "",
+    }));
+    const productTypesFound = Array.from(
+      new Set(deviceDiagnostics.map((d) => d.productType || "(empty)")),
+    );
     return c.json(
       {
         error:
-          "IPアドレスが取得できませんでした。取得画面で明示的に入力するか、ネットワーク内のデバイスに lanIp/publicIp が設定されているか確認してください。",
+          "ネットワーク内に MR/MX/MS デバイスが見つかりませんでした（cell/camera/sensor 等のみの可能性があります）",
+        diagnostic: {
+          deviceCount: dump.devices.length,
+          productTypesFound,
+          devices: deviceDiagnostics,
+        },
         summary,
         network: {
           id: dump.network.id,
@@ -556,71 +607,172 @@ api.post("/meraki/import", async (c) => {
     );
   }
 
-  const identifiers = {
-    customer,
-    hostname,
-    ipAddress: resolvedIp,
-    purpose: purpose || `Meraki network ${dump.network.name} (${dump.network.id})`,
-    // シリアル番号はユーザー入力を優先。未入力時はネットワーク内の最初の
-    // デバイス (通常は MX appliance) のシリアルを補完。ネットワーク単位で
-    // 取得しているため代表 1 件のみ採録する。
-    serialNumber: serialNumber || dump.devices.find((d) => d.serial)?.serial || "",
-    role,
-  };
+  // 4. デバイス每にレコード作成を試みる。同一ネットワーク内で device.name が
+  //    重複・空の場合は serial サフィックスして hostname 衝突を回避する
+  //    （listVersions が customer/hostname/ipAddress/role で絞るため）。
+  const usedHostnames = new Set<string>();
+  const results: MerakiImportDeviceResult[] = [];
+  const operator = c.var.user.displayName;
+  const operatorEmail = c.var.user.email;
 
-  const prevGen = await latestGenerationFor(cfg, identifiers);
-  const prevVersions = await listVersions(cfg, identifiers);
-  const latest = prevVersions.find((v) => v.generation === prevGen);
-  if (latest && latest.hash === normalized.hash) {
-    return c.json({
-      skipped: true,
-      reason: "最新世代と同一のコンフィグです。新世代は作成されませんでした。",
-      generation: latest.generation,
-      hash: latest.hash,
-      summary,
-      network: {
-        id: dump.network.id,
-        name: dump.network.name,
-        productTypes: dump.network.productTypes,
-      },
-    });
+  for (const device of supportedDevices) {
+    const pt = device.productType;
+    const deviceSummary: MerakiImportDeviceResult["device"] = {
+      serial: device.serial || "",
+      name: device.name || "",
+      model: device.model || "",
+      productType: pt,
+      lanIp: device.lanIp,
+      publicIp: device.publicIp,
+    };
+
+    try {
+      // 4-1. hostname を決定。device.name → device.serial → 要求ボディ →
+      //      mac の順。ネットワーク単位取り込みでは hostname 入力が無いため、
+      //      デバイス情報から必ず一意な名前を導出する。
+      let deviceHostname =
+        device.name || device.serial || fallbackHostname || device.mac;
+      if (usedHostnames.has(deviceHostname)) {
+        const suffix = device.serial || device.mac || pt;
+        deviceHostname = deviceHostname + "-" + suffix;
+      }
+      if (usedHostnames.has(deviceHostname)) {
+        // それでも衝突する場合は index 付与（極めてレアなケース）。
+        let i = 2;
+        while (usedHostnames.has(deviceHostname + "-" + i)) i++;
+        deviceHostname = deviceHostname + "-" + i;
+      }
+      usedHostnames.add(deviceHostname);
+
+      // 4-2. IP を決定。ユーザー入力 → lanIp → publicIp の順。
+      //      lanIp が無いデバイス（例: WAN 側 MR）は publicIp を、それも無い場合は
+      //      スキップして results へ反映する（他デバイスへは影響させない）。
+      const deviceIp = inputIpAddress || device.lanIp || device.publicIp || "";
+      if (!deviceIp) {
+        results.push({
+          device: deviceSummary,
+          skipped: true,
+          reason:
+            "IPアドレスが取得できませんでした（lanIp/publicIp のいずれも未設定）。",
+        });
+        continue;
+      }
+
+      // 4-3. productType フィルタしたシリアライズ。focusDevice で対象デバイスを
+      //      ヘッダへ強調表示し、どのデバイス向けのダンプか一目で分かるようにする。
+      const rawBody = serializeMerakiConfig(dump, {
+        productType: pt,
+        focusDevice: device,
+      });
+      const detected = detectDeviceInfo(rawBody);
+      const normalized = await normalizeConfig(rawBody, {
+        commentPrefixes: cfg.commentPrefixes,
+      });
+      const fwRules = extractFirewallRules(rawBody, detected);
+      const fwRulesJson = serializeFirewallRules(fwRules, normalized.hash);
+      const routingRoutes = extractRoutingRoutes(rawBody, detected);
+      const routingRoutesJson = serializeRoutingRoutes(
+        routingRoutes,
+        normalized.hash,
+      );
+
+      const identifiers = {
+        customer,
+        hostname: deviceHostname,
+        ipAddress: deviceIp,
+        purpose:
+          inputPurpose ||
+          pt + " in " + dump.network.name + " (" + dump.network.id + ")",
+        // シリアルはデバイス情報を優先。空欄の場合のみユーザー入力で補完。
+        serialNumber: device.serial || inputSerialNumber || "",
+        role,
+      };
+
+      // 4-4. 重複スキップ判定。同一 customer/hostname/ipAddress/role の最新世代と
+      //      hash が一致する場合は新世代を作らない。
+      const prevGen = await latestGenerationFor(cfg, identifiers);
+      const prevVersions = await listVersions(cfg, identifiers);
+      const latest = prevVersions.find((v) => v.generation === prevGen);
+      if (latest && latest.hash === normalized.hash) {
+        results.push({
+          device: deviceSummary,
+          skipped: true,
+          reason: "最新世代と同一のコンフィグです。新世代は作成されませんでした。",
+        });
+        continue;
+      }
+
+      // 4-5. createVersion。失敗した場合は catch で results へ反映して次デバイスへ。
+      const nextGen = prevGen + 1;
+      const created = await createVersion(cfg, {
+        identifiers,
+        generation: nextGen,
+        body: normalized.body,
+        hash: normalized.hash,
+        size: normalized.size,
+        lines: normalized.lines,
+        operator,
+        operatorEmail,
+        note:
+          note ??
+          "Meraki import: network=" +
+            dump.network.name +
+            " (" +
+            dump.network.id +
+            "), device=" +
+            (device.name || "(unnamed)") +
+            ", serial=" +
+            (device.serial || "-") +
+            ", product=" +
+            pt +
+            ", failedSections=" +
+            summary.failedSections,
+        detected,
+        fwRulesJson,
+        routingRoutesJson,
+      });
+
+      await writeAudit(cfg, {
+        operator,
+        operatorEmail,
+        action: "upload",
+        customer,
+        hostname: deviceHostname,
+        generation: nextGen,
+        detail:
+          "Meraki import: network=" +
+          dump.network.name +
+          " (" +
+          dump.network.id +
+          "); device=" +
+          (device.name || "(unnamed)") +
+          "; serial=" +
+          (device.serial || "-") +
+          "; product=" +
+          pt +
+          "; failedSections=" +
+          summary.failedSections,
+      });
+
+      results.push({
+        device: deviceSummary,
+        created: {
+          id: created.id,
+          generation: created.generation,
+          hash: created.hash,
+          detected: created.detected,
+        },
+        strippedLines: normalized.strippedLines,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      results.push({ device: deviceSummary, error: msg });
+    }
   }
-
-  const nextGen = prevGen + 1;
-  const created = await createVersion(cfg, {
-    identifiers,
-    generation: nextGen,
-    body: normalized.body,
-    hash: normalized.hash,
-    size: normalized.size,
-    lines: normalized.lines,
-    operator: c.var.user.displayName,
-    operatorEmail: c.var.user.email,
-    note:
-      note ??
-      `Meraki import: network=${dump.network.name} (${dump.network.id}), devices=${summary.deviceCount}, failedSections=${summary.failedSections}`,
-    detected,
-    fwRulesJson,
-    routingRoutesJson,
-  });
-
-  await writeAudit(cfg, {
-    operator: c.var.user.displayName,
-    operatorEmail: c.var.user.email,
-    action: "upload",
-    customer,
-    hostname,
-    generation: nextGen,
-    detail:
-      `Meraki import: network=${dump.network.name} (${dump.network.id}); ` +
-      `products=${dump.network.productTypes.join(",")}; ` +
-      `devices=${summary.deviceCount}; failedSections=${summary.failedSections}`,
-  });
 
   return c.json(
     {
-      created,
-      strippedLines: normalized.strippedLines,
+      results,
       summary,
       network: {
         id: dump.network.id,
@@ -922,6 +1074,48 @@ api.delete("/versions/:id", async (c) => {
   });
 
   return c.json({ ok: true });
+});
+
+/** DELETE /api/devices/:key — 機器（論理デバイス）を関連コンフィグごと一括削除
+ *  する。key は customer|hostname|ipAddress|role（GET /api/devices の id と同形式）。
+ *  その識別子に紐づく全世代のコンフィグレコードを削除する。コンフィグ本文は
+ *  復元できないため、UI 側で確認ダイアログを必ず出すこと。 */
+api.delete("/devices/:key", async (c) => {
+  const cfg = c.var.cfg;
+  const key = c.req.param("key");
+  const [customer, hostname, ipAddress, role] = key.split("|");
+  if (!customer || !hostname) {
+    return c.json({ error: "不正なデバイスキーです" }, 400);
+  }
+  const versions = await listVersions(cfg, {
+    customer,
+    hostname,
+    ipAddress,
+    role: (role as Role) || undefined,
+  });
+  if (versions.length === 0) {
+    return c.json({ error: "対象の機器が見つかりません" }, 404);
+  }
+
+  const ids = versions.map((v) => v.id);
+  try {
+    await deleteVersions(cfg, ids);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: `削除失敗: ${msg}` }, 500);
+  }
+
+  await writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "delete",
+    customer,
+    hostname,
+    generation: 0,
+    detail: `機器を一括削除: ${hostname} (ip=${ipAddress || "-"}, role=${role || "-"}) — 全 ${ids.length} 世代`,
+  });
+
+  return c.json({ ok: true, deletedCount: ids.length });
 });
 
 /** GET /api/audit — recent operator activity. */

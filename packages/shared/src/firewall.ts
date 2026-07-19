@@ -29,7 +29,10 @@ export interface FirewallCache {
   rules: FirewallRule[];
 }
 
-export const FIREWALL_CACHE_VERSION = 3;
+// v4: added Meraki (Dashboard JSON) firewall policy extraction. Bumping the
+// version invalidates older caches (notably Meraki records that cached an empty
+// ruleset before this parser existed) so they recompute on next read.
+export const FIREWALL_CACHE_VERSION = 4;
 
 /** Serialize rules to a compact JSON string for storage. */
 export function serializeFirewallRules(
@@ -910,12 +913,159 @@ function extractYamaha(lines: string[], vendor: string): FirewallRule[] {
   return rules;
 }
 
+// ----- Cisco Meraki (Dashboard API JSON dump) -----
+
+/** Scan forward from a `{` or `[` and return the index just past the matching
+ *  close bracket, respecting JSON string literals and escapes. Returns -1 if
+ *  the value is unbalanced (truncated). */
+function scanBalancedJson(text: string, start: number): number {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/** Split a Meraki dump into its embedded JSON blocks. Works on the raw dump
+ *  (which carries `! ===== <label> =====` section headers) and on the
+ *  normalized body (where all `!` comment lines are stripped and only the JSON
+ *  values remain, concatenated). Non-JSON text between blocks is skipped.
+ *  Exported so the routing extractor can reuse the same block scanner. */
+export function collectMerakiJsonBlocks(
+  text: string,
+): { label: string; value: unknown }[] {
+  const blocks: { label: string; value: unknown }[] = [];
+  let currentLabel = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "!") {
+      // Comment / section-header line: capture the label if present, skip line.
+      let j = text.indexOf("\n", i);
+      if (j === -1) j = n;
+      const m = text.slice(i, j).match(/^!\s*=+\s*(.+?)\s*=+\s*$/);
+      if (m) currentLabel = m[1];
+      i = j + 1;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      const end = scanBalancedJson(text, i);
+      if (end > i) {
+        try {
+          blocks.push({ label: currentLabel, value: JSON.parse(text.slice(i, end)) });
+        } catch {
+          // Not valid JSON (should not happen for our dumps); skip.
+        }
+        i = end;
+        continue;
+      }
+    }
+    i++;
+  }
+  return blocks;
+}
+
+/** Meraki CIDR fields use the literal "Any"; normalize to lowercase "any". */
+function merakiCidr(v: unknown): string {
+  if (typeof v !== "string" || !v) return "any";
+  return v.toLowerCase() === "any" ? "any" : v;
+}
+
+/** Meraki port fields may be a string ("Any", "443", "1-1024") or number. */
+function merakiPort(v: unknown): string {
+  if (v === undefined || v === null || v === "") return "any";
+  const s = String(v);
+  return s.toLowerCase() === "any" ? "any" : s;
+}
+
+/** Extract Meraki MX firewall policy (L3 / cellular firewall rules) from a
+ *  serialized Dashboard dump. These sections are JSON of the form
+ *  `{ "rules": [ { policy, protocol, srcCidr, srcPort, destCidr, destPort,
+ *  comment } ] }`. We identify firewall blocks structurally by the presence of
+ *  `srcCidr` / `destCidr` on the rule objects, so the same code path works
+ *  whether or not the `! ===== ... =====` headers survived normalization. */
+function extractMeraki(lines: string[], vendor: string): FirewallRule[] {
+  const rules: FirewallRule[] = [];
+  const text = lines.join("\n");
+  let seq = 0;
+  for (const { label, value } of collectMerakiJsonBlocks(text)) {
+    const ruleArr: unknown[] | null = Array.isArray(value)
+      ? value
+      : value &&
+          typeof value === "object" &&
+          Array.isArray((value as { rules?: unknown }).rules)
+        ? ((value as { rules: unknown[] }).rules)
+        : null;
+    if (!ruleArr) continue;
+    // Only L3 / cellular firewall rules carry srcCidr / destCidr. This skips
+    // VLANs, static routes, port-forwarding, and other JSON sections.
+    const isFirewall = ruleArr.some(
+      (r) =>
+        r !== null &&
+        typeof r === "object" &&
+        ("srcCidr" in r || "destCidr" in r),
+    );
+    if (!isFirewall) continue;
+    const name = label || "Meraki L3 Firewall";
+    for (const r of ruleArr) {
+      if (r === null || typeof r !== "object") continue;
+      const o = r as Record<string, unknown>;
+      const policy = String(o.policy ?? "").toLowerCase();
+      const action: "permit" | "deny" = policy === "deny" ? "deny" : "permit";
+      const srcPort = merakiPort(o.srcPort);
+      const destPort = merakiPort(o.destPort);
+      const port =
+        srcPort !== "any" ? `src ${srcPort} / dst ${destPort}` : destPort;
+      const comment = typeof o.comment === "string" ? o.comment : "";
+      seq++;
+      rules.push({
+        vendor,
+        name,
+        category: "policy",
+        action,
+        protocol: String(o.protocol ?? "any").toLowerCase() || "any",
+        source: merakiCidr(o.srcCidr),
+        destination: merakiCidr(o.destCidr),
+        port,
+        comments: comment || undefined,
+        line: seq,
+        raw: JSON.stringify(r),
+      });
+    }
+  }
+  return rules;
+}
+
 // ----- dispatcher -----
 
 /** Quick structural sniff to pick a parser when the vendor is unknown
  *  (e.g. an old record uploaded before auto-detection existed). */
 function guessVendorFromConfig(lines: string[]): string {
   const has = (re: RegExp) => lines.some((l) => re.test(l));
+  // Meraki dumps carry a fixed header and/or JSON firewall rule objects with
+  // srcCidr / destCidr. Detect either so old records (uploaded before vendor
+  // detection recognized Meraki) still resolve to the Meraki parser.
+  if (
+    has(/Meraki Network Configuration Dump/) ||
+    has(/"srcCidr"|"destCidr"/)
+  ) {
+    return "Cisco Meraki";
+  }
   if (has(/^set\s+security\s+policies\s+/i) || has(/^set\s+firewall\s+filter\s+/i)) {
     return "Juniper";
   }
@@ -962,7 +1112,7 @@ export function extractFirewallRules(
 
   // Last resort: try every parser, return the one with the most hits.
   let best: FirewallRule[] = [];
-  for (const v of ["Cisco", "Juniper", "Fortinet", "YAMAHA"]) {
+  for (const v of ["Cisco Meraki", "Cisco", "Juniper", "Fortinet", "YAMAHA"]) {
     const r = runForVendor(lines, v);
     if (r.length > best.length) best = r;
   }
@@ -971,6 +1121,8 @@ export function extractFirewallRules(
 
 function runForVendor(lines: string[], vendor: string): FirewallRule[] {
   switch (vendor) {
+    case "Cisco Meraki":
+      return extractMeraki(lines, vendor);
     case "Cisco":
       return extractCisco(lines, vendor);
     case "Juniper":

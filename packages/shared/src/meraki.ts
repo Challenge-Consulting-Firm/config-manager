@@ -113,7 +113,7 @@ export const MERAKI_ENDPOINTS: Record<
     { label: "Appliance / Port Forwarding Rules", endpoint: "/networks/{id}/appliance/portForwardingRules" },
     { label: "Appliance / 1:1 NAT Rules", endpoint: "/networks/{id}/appliance/oneToOneNatRules" },
     { label: "Appliance / 1:Many NAT Rules", endpoint: "/networks/{id}/appliance/oneToManyNatRules" },
-    { label: "Appliance / Site-to-site VPN", endpoint: "/networks/{id}/appliance/siteToSiteVpn" },
+    { label: "Appliance / Site-to-site VPN", endpoint: "/networks/{id}/appliance/vpn/siteToSiteVpn" },
     { label: "Appliance / VPN Traffic Shaping", endpoint: "/networks/{id}/appliance/trafficShaping" },
     { label: "Appliance / Traffic Shaping Rules", endpoint: "/networks/{id}/appliance/trafficShaping/rules" },
     { label: "Appliance / Uplinks Configuration", endpoint: "/networks/{id}/appliance/uplinks/configure" },
@@ -121,11 +121,11 @@ export const MERAKI_ENDPOINTS: Record<
     { label: "Appliance / Content Filtering", endpoint: "/networks/{id}/appliance/contentFiltering" },
     { label: "Appliance / Intrusion Settings", endpoint: "/networks/{id}/appliance/intrusion" },
     { label: "Appliance / Malware Settings", endpoint: "/networks/{id}/appliance/malware" },
-    { label: "Appliance / OSPF", endpoint: "/networks/{id}/appliance/routing/ospf" },
-    { label: "Appliance / BGP", endpoint: "/networks/{id}/appliance/routing/bgp" },
-    { label: "Appliance / DHCP", endpoint: "/networks/{id}/appliance/dhcp" },
-    { label: "Appliance / SD-WAN", endpoint: "/networks/{id}/appliance/sdwan" },
-    { label: "Appliance / LAN Settings", endpoint: "/networks/{id}/appliance/lan" },
+    // BGP は VPN 配下 (/appliance/vpn/bgp)。旧 /appliance/routing/bgp と
+    // /appliance/routing/ospf は MX に存在せず常に 404 を返していたため、
+    // OSPF は削除し BGP のみ正しいパスへ修正した。routed モード無効時は 400
+    // (skipped) になる。
+    { label: "Appliance / BGP", endpoint: "/networks/{id}/appliance/vpn/bgp" },
   ],
   // ===== MS (Switch) =====
   switch: [
@@ -156,7 +156,10 @@ export const MERAKI_ENDPOINTS: Record<
     { label: "Wireless / SSIDs", endpoint: "/networks/{id}/wireless/ssids" },
     { label: "Wireless / Settings", endpoint: "/networks/{id}/wireless/settings" },
     { label: "Wireless / RF Profiles", endpoint: "/networks/{id}/wireless/rfProfiles" },
-    { label: "Wireless / Air Marshal", endpoint: "/networks/{id}/wireless/airMarshal" },
+    // ※ Air Marshal (/wireless/airMarshal) は取得しない。これは「設定」ではなく
+    //   周辺で検知した不正 AP のスキャン結果（bssid/rssi/firstSeen/lastSeen を
+    //   持つ運用時系列データ）で、数 MB・数十万行に膨れ上がり、取得の度に内容が
+    //   変わるため毎回新世代が作られる。コンフィグ世代管理の対象外。
     { label: "Wireless / Bluetooth", endpoint: "/networks/{id}/wireless/bluetooth/settings" },
     { label: "Wireless / Bonjour Forwarding", endpoint: "/networks/{id}/wireless/bonjourForwarding" },
     { label: "Wireless / Splash Settings", endpoint: "/networks/{id}/wireless/splash/settings" },
@@ -177,6 +180,23 @@ export const MERAKI_ENDPOINTS: Record<
  *  されるため、ハッシュの安定性を損なわない。 */
 export const MERAKI_DUMP_HEADER = "! Meraki Network Configuration Dump";
 
+/** {@link serializeMerakiConfig} のオプション。省略時は従来どおりネットワーク
+ *  全体を1テキストへ出力する（後方互換）。 デバイス単位レコード分割時は
+ *  `productType` でその製品のセクションのみに絞り込み、`focusDevice` で
+ *  ヘッダにデバイス強調行を追加する。 */
+export interface SerializeMerakiConfigOptions {
+  /** 出力対象にする製品タイプ。指定時はその productType に属するセクション
+   *  のみを出力し、他製品のセクションは取り込まない。省略時は全 productType
+   *  を出力（従来挙動）。Meraki の設定はネットワーク単位で保持されるため、
+   *  デバイス単位レコードを作る場合は「そのデバイスの製品に属する設定」を
+   *  代表値として採用する。 */
+  productType?: MerakiProductType;
+  /** ヘッダに強調表示するデバイス。デバイス単位レコード生成時に指定すると、
+   *  `! Focus Device:` 行を追加して哪个のデバイスへ向けたダンプかを明示する。
+   *  また Devices ブロックの先頭へ対象デバイスを移動する。 */
+  focusDevice?: MerakiDeviceInfo;
+}
+
 /**
  * {@link MerakiConfigDump} を show-run 相当のテキストへシリアライズする。
  *
@@ -186,6 +206,7 @@ export const MERAKI_DUMP_HEADER = "! Meraki Network Configuration Dump";
  * ! Network: <name> (<id>)
  * ! Organization: <orgId>
  * ! Products: appliance, switch, wireless
+ * ! Focus Device: serial=<serial> model=<model> name=<name> product=<pt>
  * ! Exported: <ISO8601>
  * !
  * ! ===== Devices =====
@@ -201,9 +222,18 @@ export const MERAKI_DUMP_HEADER = "! Meraki Network Configuration Dump";
  * 対象となる。JSON は `JSON.stringify(value, null, 2)` で整形するため、同一
  * 設定なら常に同一テキストが得られる（key 順序は Meraki API 応答に依存する
  * ため、実運用上は API 側の安定性に依存する）。
+ *
+ * `options.productType` 指定時は、その製品のセクションのみを出力する
+ * （デバイス単位レコード向け）。省略時は全製品のセクションを出力する
+ * （従来挙動、ネットワーク単位レコード向け）。
  */
-export function serializeMerakiConfig(dump: MerakiConfigDump): string {
+export function serializeMerakiConfig(
+  dump: MerakiConfigDump,
+  options?: SerializeMerakiConfigOptions,
+): string {
   const lines: string[] = [];
+  const focusDevice = options?.focusDevice;
+  const productType = options?.productType;
   lines.push(MERAKI_DUMP_HEADER);
   lines.push(`! Network: ${dump.network.name} (${dump.network.id})`);
   lines.push(`! Organization: ${dump.network.organizationId}`);
@@ -221,14 +251,34 @@ export function serializeMerakiConfig(dump: MerakiConfigDump): string {
     const first = dump.network.notes.split(/\r?\n/)[0];
     lines.push(`! Notes: ${first}`);
   }
+  if (focusDevice) {
+    // デバイス単位レコード向けに、対象デバイスをヘッダへ強調表示する。
+    // 正規化で除去されるコメント行のため、ハッシュ計算へは影響しない。
+    const parts = [
+      `serial=${focusDevice.serial || "-"}`,
+      `model=${focusDevice.model || "-"}`,
+      `name=${focusDevice.name || "-"}`,
+    ];
+    if (focusDevice.productType) {
+      parts.push(`product=${focusDevice.productType}`);
+    }
+    if (focusDevice.mac) parts.push(`mac=${focusDevice.mac}`);
+    if (focusDevice.lanIp) parts.push(`lanIp=${focusDevice.lanIp}`);
+    if (focusDevice.publicIp) parts.push(`publicIp=${focusDevice.publicIp}`);
+    lines.push(`! Focus Device: ${parts.join(" ")}`);
+  }
   lines.push(`! Exported: ${dump.exportedAt}`);
   lines.push(`! API Base: ${dump.apiBase}`);
   lines.push("!");
 
   // ----- Devices -----
-  if (dump.devices.length > 0) {
+  // focusDevice 指定時は、対象デバイスを一覧の先頭へ移動して目視性を上げる。
+  const orderedDevices = focusDevice
+    ? [focusDevice, ...dump.devices.filter((d) => d !== focusDevice)]
+    : dump.devices;
+  if (orderedDevices.length > 0) {
     lines.push("! ===== Devices =====");
-    for (const d of dump.devices) {
+    for (const d of orderedDevices) {
       const parts = [
         `serial=${d.serial || "-"}`,
         `model=${d.model || "-"}`,
@@ -246,15 +296,24 @@ export function serializeMerakiConfig(dump: MerakiConfigDump): string {
 
   // ----- Sections (per product type) -----
   // 出力順序を固定するため productTypes の順 → endpoint 定義順に並べる。
+  // productType 指定時はその製品のセクションのみ残す（デバイス単位レコード）。
+  const productFilter = productType;
   const ordered: MerakiSection[] = [];
-  for (const pt of dump.network.productTypes) {
+  const candidateTypes = productFilter
+    ? [productFilter]
+    : dump.network.productTypes;
+  for (const pt of candidateTypes) {
     for (const s of dump.sections.filter((x) => x.productType === pt)) {
       ordered.push(s);
     }
   }
-  // ネットワークの productTypes に無いセクションが混入した場合の安全策。
-  for (const s of dump.sections) {
-    if (!dump.network.productTypes.includes(s.productType)) ordered.push(s);
+  // productType 指定時は他製品のセクションを混入させない（従来は安全策として
+  // ネットワーク productTypes に無いセクションも並べていたが、デバイス単位
+  // 出力ではノイズになるため除外する）。
+  if (!productFilter) {
+    for (const s of dump.sections) {
+      if (!dump.network.productTypes.includes(s.productType)) ordered.push(s);
+    }
   }
 
   for (const s of ordered) {
