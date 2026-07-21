@@ -379,6 +379,55 @@ export interface WirelessDiff {
   };
 }
 
+// ===== VLAN configuration =====
+
+/** A VLAN definition extracted from a switch config. Vendor-neutral: Cisco
+ *  IOS (`vlan N` / `name`), YAMAHA SWX (`vlan database` / `vlan N name`),
+ *  and ELECOM (`vlan N` / `vlan A-B`) all map to this shape. */
+export interface VlanDefinition {
+  /** Source vendor (informational). */
+  vendor: string;
+  /** VLAN ID (1-4094). */
+  id: number;
+  /** VLAN name/label when declared. Empty when the config only lists the ID. */
+  name: string;
+  /** Access ports assigned to this VLAN (untagged members). */
+  accessPorts: string[];
+  /** Trunk ports that carry this VLAN tagged. */
+  taggedPorts: string[];
+  /** Ports for which this VLAN is the native/untagged VLAN on a trunk. */
+  nativePorts: string[];
+  /** Additional attributes for display (free-form). */
+  attributes?: string;
+}
+
+/** A physical switch port and its VLAN membership, extracted from an
+ *  `interface <port>` block. Vendor-neutral. */
+export interface VlanPort {
+  /** Source vendor (informational). */
+  vendor: string;
+  /** Interface / port name (e.g. "port1.3", "xgi2", "GigabitEthernet0/1"). */
+  name: string;
+  /** switchport mode: "access", "trunk", or "" when not declared. */
+  mode: string;
+  /** Access VLAN ID when the port is in access mode. Undefined otherwise. */
+  accessVlan?: number;
+  /** Native (untagged) VLAN ID on a trunk. Undefined when not set. */
+  nativeVlan?: number;
+  /** Tagged VLAN IDs allowed on a trunk. */
+  allowedVlans: number[];
+  /** Port description when present. */
+  description: string;
+  /** 1-based source line of the interface block. */
+  line: number;
+}
+
+/** The parsed VLAN extraction result (definitions + ports together). */
+export interface VlanExtraction {
+  vlans: VlanDefinition[];
+  ports: VlanPort[];
+}
+
 // ===== Meraki credentials =====
 
 /** 登録済みの Meraki 接続情報（ネットワーク ID + API キーのセット）。

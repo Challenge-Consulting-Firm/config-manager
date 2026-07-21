@@ -32,7 +32,13 @@ export interface RoutingCache {
 
 // v2: added Meraki (Dashboard JSON) route extraction (S2S VPN subnets + static
 // routes). Bumping invalidates older caches so Meraki records recompute.
-export const ROUTING_CACHE_VERSION = 2;
+// v3: Yamaha SWX support — fixed CIDR-form static-route next-hop parsing and
+// added block-form (`interface vlanN` / `ip address`) connected routes.
+// v4: ELECOM EHB support (`ip address ... mask` connected + `ip
+// default-gateway` static default route).
+// v5: Buffalo BS-GS support (`ip address` space-mask connected + `ip
+// default-gateway` / dotted `ip route` static default).
+export const ROUTING_CACHE_VERSION = 5;
 
 /** Serialize routes to a compact JSON string for storage. */
 export function serializeRoutingRoutes(
@@ -686,38 +692,47 @@ function extractFortinet(lines: string[]): RoutingRoute[] {
 
 // ----- YAMAHA RT -----
 
+const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
+
 function extractYamaha(lines: string[]): RoutingRoute[] {
   const routes: RoutingRoute[] = [];
-  // `ip route <dest>/<prefix> <gateway>` or `ip route <dest> <mask> <gateway>`
+  // Static routes. Two syntaxes coexist across the RT and SWX families:
+  //   ip route 10.0.0.0/24 192.168.1.1          (dest already CIDR — SWX/RTX)
+  //   ip route 0.0.0.0/0 gateway 192.168.1.1    (RTX `gateway` keyword)
+  //   ip route 10.0.0.0 255.255.255.0 10.0.0.1  (dotted mask)
   lines.forEach((raw, idx) => {
-    const m = raw.match(/^\s*ip\s+route\s+(\S+)(?:\s+(\S+))?\s+(\S+)/i);
+    const m = raw.match(/^\s*ip\s+route\s+(.+)$/i);
     if (!m) return;
-    const dest = m[1];
-    const maybeMask = m[2];
-    const gateway = m[3];
-    // Two forms:
-    //   ip route 10.0.0.0/24 192.168.1.1   (dest already CIDR)
-    //   ip route 10.0.0.0 255.255.255.0 192.168.1.1
+    const tokens = m[1].trim().split(/\s+/);
+    if (tokens.length < 2) return;
+    const dest = tokens[0];
+
     let network: string;
-    let nextHop: string;
-    if (maybeMask && /^\d{1,3}(\.\d{1,3}){3}$/.test(maybeMask)) {
-      network = toCidr(dest, maybeMask);
-      nextHop = gateway;
+    let rest: string[];
+    if (!isCidr(dest) && IPV4_RE.test(dest) && IPV4_RE.test(tokens[1])) {
+      // Dotted-mask form: `<dest> <mask> <gateway>` (dest is a bare address and
+      // the second token is the netmask, not the gateway).
+      network = toCidr(dest, tokens[1]);
+      rest = tokens.slice(2);
     } else {
+      // CIDR (or bare) dest form: `<dest/prefix> [gateway] <next-hop>`.
       network = toCidr(dest);
-      nextHop = maybeMask; // gateway is actually `maybeMask` here
+      rest = tokens.slice(1);
     }
+    // Skip the RTX `gateway` keyword when present; the next token is the hop.
+    const nextHop = rest.find((t) => t.toLowerCase() !== "gateway") ?? "";
+    if (!nextHop) return;
     routes.push({
       vendor: "YAMAHA",
       protocol: "static",
       network,
-      nextHop: /^\d{1,3}(\.\d{1,3}){3}$/.test(nextHop) ? `${nextHop}/32` : nextHop,
+      nextHop: IPV4_RE.test(nextHop) ? `${nextHop}/32` : nextHop,
       line: idx + 1,
       raw,
     });
   });
 
-  // Connected interface addresses: `ip lan1 address 192.168.1.1/24`
+  // RT-style single-line connected addresses: `ip lan1 address 192.168.1.1/24`.
   lines.forEach((raw, idx) => {
     const m = raw.match(/^\s*ip\s+(lan\d+|pp|tunnel\d+|vlan\d+)\s+address\s+(\d+\.\d+\.\d+\.\d+\/\d+)/i);
     if (m) {
@@ -733,7 +748,173 @@ function extractYamaha(lines: string[]): RoutingRoute[] {
     }
   });
 
+  // SWX-style block form: an `interface vlanN` block containing an
+  // `ip address A.B.C.D/prefix` line (Cisco-like indentation). The address
+  // may also appear in dotted-mask form.
+  routes.push(...extractYamahaSwxConnected(lines));
+
   return routes;
+}
+
+/** Scan `interface <name>` blocks for `ip address` lines (SWX switches use
+ *  Cisco-style indented interface blocks rather than RT's single-line
+ *  `ip lanN address`). */
+function extractYamahaSwxConnected(lines: string[]): RoutingRoute[] {
+  const routes: RoutingRoute[] = [];
+  let currentIf = "";
+  lines.forEach((raw, idx) => {
+    const ifM = raw.match(/^\s*interface\s+(\S+)/i);
+    if (ifM) {
+      currentIf = ifM[1];
+      return;
+    }
+    if (!currentIf) return;
+    // CIDR form: `ip address 192.168.100.254/24`.
+    const cidrM = raw.match(/^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+\/\d+)\b/i);
+    if (cidrM) {
+      routes.push({
+        vendor: "YAMAHA",
+        protocol: "connected",
+        network: cidrM[1],
+        nextHop: "directly-connected",
+        interface: currentIf,
+        line: idx + 1,
+        raw: raw.trim(),
+      });
+      return;
+    }
+    // Dotted-mask form: `ip address 192.168.1.1 255.255.255.0`.
+    const maskM = raw.match(
+      /^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\b/i,
+    );
+    if (maskM) {
+      routes.push({
+        vendor: "YAMAHA",
+        protocol: "connected",
+        network: toCidr(maskM[1], maskM[2]),
+        nextHop: "directly-connected",
+        interface: currentIf,
+        line: idx + 1,
+        raw: raw.trim(),
+      });
+    }
+  });
+  return routes;
+}
+
+// ----- ELECOM EHB switch -----
+
+/** ELECOM EHB switches expose only a management IP and a default gateway.
+ *   - `ip address A.B.C.D mask M.M.M.M`  -> connected (management SVI)
+ *   - `ip default-gateway A.B.C.D`       -> static default route (0.0.0.0/0)
+ *  There are no dynamic routing protocols or per-interface addresses. */
+function extractElecom(lines: string[]): RoutingRoute[] {
+  const routes: RoutingRoute[] = [];
+  lines.forEach((raw, idx) => {
+    const addrM = raw.match(
+      /^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+mask\s+(\d+\.\d+\.\d+\.\d+)/i,
+    );
+    if (addrM) {
+      routes.push({
+        vendor: "ELECOM",
+        protocol: "connected",
+        network: toCidr(addrM[1], addrM[2]),
+        nextHop: "directly-connected",
+        line: idx + 1,
+        raw: raw.trim(),
+      });
+      return;
+    }
+    const gwM = raw.match(/^\s*ip\s+default-gateway\s+(\d+\.\d+\.\d+\.\d+)/i);
+    if (gwM) {
+      routes.push({
+        vendor: "ELECOM",
+        protocol: "static",
+        network: "0.0.0.0/0",
+        nextHop: `${gwM[1]}/32`,
+        line: idx + 1,
+        raw: raw.trim(),
+      });
+    }
+  });
+  return routes;
+}
+
+// ----- Buffalo BS-GS switch -----
+
+/** Buffalo BS-GS switches use a small routing surface:
+ *   - `ip address A.B.C.D M.M.M.M`      -> connected (global + `interface vlanN`)
+ *   - `ip default-gateway A.B.C.D`       -> static default route
+ *   - `ip route 0.0.0.0 0.0.0.0 A.B.C.D` -> static default (Cisco dotted form)
+ *  The mask is space-separated (no `mask` keyword, unlike ELECOM). Connected
+ *  addresses are de-duplicated because the management address is repeated both
+ *  globally and inside `interface vlan1`. */
+function extractBuffalo(lines: string[]): RoutingRoute[] {
+  const routes: RoutingRoute[] = [];
+  let currentIf = "";
+  const seenConnected = new Set<string>();
+
+  lines.forEach((raw, idx) => {
+    const ifM = raw.match(/^\s*interface\s+(\S+)/i);
+    if (ifM) {
+      currentIf = ifM[1];
+      return;
+    }
+    const addrM = raw.match(
+      /^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)/i,
+    );
+    if (addrM) {
+      const network = toCidr(addrM[1], addrM[2]);
+      if (!seenConnected.has(network)) {
+        seenConnected.add(network);
+        routes.push({
+          vendor: "Buffalo",
+          protocol: "connected",
+          network,
+          nextHop: "directly-connected",
+          interface: /^vlan\d+/i.test(currentIf) ? currentIf : undefined,
+          line: idx + 1,
+          raw: raw.trim(),
+        });
+      }
+      return;
+    }
+    const gwM = raw.match(/^\s*ip\s+default-gateway\s+(\d+\.\d+\.\d+\.\d+)/i);
+    if (gwM) {
+      routes.push({
+        vendor: "Buffalo",
+        protocol: "static",
+        network: "0.0.0.0/0",
+        nextHop: `${gwM[1]}/32`,
+        line: idx + 1,
+        raw: raw.trim(),
+      });
+      return;
+    }
+    // `ip route <dest> <mask> <gateway>` (Cisco dotted form).
+    const routeM = raw.match(
+      /^\s*ip\s+route\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)/i,
+    );
+    if (routeM) {
+      routes.push({
+        vendor: "Buffalo",
+        protocol: "static",
+        network: toCidr(routeM[1], routeM[2]),
+        nextHop: `${routeM[3]}/32`,
+        line: idx + 1,
+        raw: raw.trim(),
+      });
+    }
+  });
+  // `ip default-gateway` and `ip route 0.0.0.0 0.0.0.0 ...` often coexist and
+  // express the same default route; collapse identical (network, nextHop) pairs.
+  const seen = new Set<string>();
+  return routes.filter((r) => {
+    const key = `${r.protocol}|${r.network}|${r.nextHop}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // ----- dispatcher -----
@@ -834,7 +1015,32 @@ function guessVendorFromConfig(lines: string[]): string {
   }
   if (has(/^set\s+routing-options\s+/i) || has(/^routing-options\s*\{?/i)) return "Juniper";
   if (has(/^config\s+router\s+(static|bgp|ospf)/i) || has(/^#config-version=/i)) return "Fortinet";
+  // Buffalo BS-GS: fixed start banner, or `interface vlanN` + `member N`.
+  if (
+    has(/^!\s*--\s*start of\s+BS-\S+\s+config/i) ||
+    has(/^\s*member\s+[\d,\s-]+$/i) ||
+    has(/^\s*PVID\s+\d+/i)
+  ) {
+    return "Buffalo";
+  }
+  // ELECOM EHB: fixed banner or `ip address ... mask ...` + default-gateway.
+  if (
+    has(/^SYSTEM\s+CONFIG\s+FILE\s*::=\s*BEGIN/i) ||
+    has(/^!\s*System Description:.*EHB-/i) ||
+    (has(/^\s*ip\s+address\s+\d+\.\d+\.\d+\.\d+\s+mask\s+/i) &&
+      has(/^\s*ip\s+default-gateway\s+/i))
+  ) {
+    return "ELECOM";
+  }
   if (has(/^\s*ip\s+lan\d+\s+address\s+/i)) return "YAMAHA";
+  // SWX switches: `interface port1.N` + (l2ms | vlan database). Checked before
+  // the Cisco `ip route` catch-all so a SWX config isn't misread as Cisco.
+  if (
+    has(/^\s*interface\s+port\d+\.\d+/i) &&
+    (has(/^\s*l2ms\b/i) || has(/^\s*vlan\s+database\s*$/i))
+  ) {
+    return "YAMAHA";
+  }
   if (
     has(/^\s*ip\s+route\s+/i) ||
     has(/^\s*route\s+\S+\s+\d+\.\d+\.\d+\.\d+\s+/i) ||
@@ -868,7 +1074,7 @@ export function extractRoutingRoutes(
   }
 
   let best: RoutingRoute[] = [];
-  for (const v of ["Cisco Meraki", "Cisco", "Juniper", "Fortinet", "YAMAHA"]) {
+  for (const v of ["Cisco Meraki", "Cisco", "Juniper", "Fortinet", "YAMAHA", "ELECOM", "Buffalo"]) {
     const r = runForVendor(lines, v);
     if (r.length > best.length) best = r;
   }
@@ -887,6 +1093,10 @@ function runForVendor(lines: string[], vendor: string): RoutingRoute[] {
       return extractFortinet(lines);
     case "YAMAHA":
       return extractYamaha(lines);
+    case "ELECOM":
+      return extractElecom(lines);
+    case "Buffalo":
+      return extractBuffalo(lines);
     default:
       return [];
   }

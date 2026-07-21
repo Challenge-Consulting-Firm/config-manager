@@ -43,6 +43,7 @@ import {
   extractFirewallRules,
   extractRoutingRoutes,
   extractWireless,
+  extractVlans,
   normalizeConfig,
   parseFirewallCache,
   parseRoutingCache,
@@ -263,6 +264,28 @@ api.get("/versions/:id/wireless", async (c) => {
     accessPoints: extraction.accessPoints,
     fromCache,
     count: extraction.ssids.length + extraction.accessPoints.length,
+  });
+});
+
+/** GET /api/versions/:id/vlan — VLAN definitions + port membership for a
+ *  version. Unlike FW/routing/wireless this is NOT cached to Kintone: VLAN
+ *  data is small and cheap to recompute, so it is parsed from the stored body
+ *  on every request. Structural (vendor-neutral) so any switch config with the
+ *  common `vlan` / `switchport` grammar works. */
+api.get("/versions/:id/vlan", async (c) => {
+  const cfg = c.var.cfg;
+  const id = c.req.param("id");
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+
+  const val = (k: string) => rec[k]?.value ?? "";
+  const detected = detectedFromRecord(rec);
+  const extraction = extractVlans(val("body"), detected?.vendor ?? "");
+
+  return c.json({
+    vlans: extraction.vlans,
+    ports: extraction.ports,
+    count: extraction.vlans.length,
   });
 });
 

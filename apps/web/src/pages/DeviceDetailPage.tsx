@@ -472,6 +472,12 @@ export function DeviceDetailPage() {
                   >
                     無線SSID/AP
                   </Link>
+                  <Link
+                    to={`/versions/${body.id}/vlan?from=${encodeURIComponent(`/devices/${encodeURIComponent(decodedKey)}`)}`}
+                    className="rounded border border-blue-300 bg-blue-50 px-2 py-0.5 text-blue-700 hover:bg-blue-100"
+                  >
+                    VLAN構成
+                  </Link>
                   <button
                     onClick={() => download(body)}
                     className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
