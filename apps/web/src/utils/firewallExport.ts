@@ -3,6 +3,7 @@ import {
   firewallCategoryLabel,
   type FirewallRule,
 } from "@config-manager/shared";
+import { csvEscape } from "./csvEscape";
 
 /** Export firewall rules to an .xlsx workbook with multiple sheets:
  *  - "Rules": the flat rule list
@@ -119,10 +120,6 @@ export function exportFirewallCsv(rules: FirewallRule[], filename: string): void
     "Line",
     "Raw",
   ];
-  const esc = (v: unknown) => {
-    const s = String(v ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const lines = [cols.join(",")];
   rules.forEach((r, i) => {
     lines.push(
@@ -145,7 +142,7 @@ export function exportFirewallCsv(rules: FirewallRule[], filename: string): void
         r.line,
         r.raw,
       ]
-        .map(esc)
+        .map(csvEscape)
         .join(","),
     );
   });

@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { useDropzone, type FileRejection } from "react-dropzone";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { apiFetch, ApiError } from "../apiClient";
+import { safeReturnPath } from "../utils/safeReturnPath";
 import { detectDeviceInfo, type DeviceDetection, type Role } from "@config-manager/shared";
 
 interface UploadResult {
@@ -45,7 +46,7 @@ export function UploadPage() {
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
-  const returnKey = params.get("from") || "/";
+  const returnKey = safeReturnPath(params.get("from"));
 
   const onDrop = useCallback(
     (files: File[], rejections: FileRejection[]) => {

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type { MerakiCredential, MerakiProductType, Role } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
+import { safeReturnPath } from "../utils/safeReturnPath";
 
 /** BFF の GET /api/meraki/credentials 応答。apiKey はマスク済み。 */
 interface CredentialListResponse {
@@ -67,7 +68,7 @@ const PRODUCT_LABELS: Record<MerakiProductType, string> = {
 export function MerakiImportPage() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const returnKey = params.get("from") || "/";
+  const returnKey = safeReturnPath(params.get("from"));
 
   // クレデンシャル選択状態。URL パラメータ `credentialId` で事前選択可能
   // （Meraki 接続情報ページの「取得で使用」ボタンから遷移してくる）。

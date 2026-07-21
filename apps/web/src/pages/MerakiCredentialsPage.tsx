@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import type { MerakiCredential } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
+import { safeReturnPath } from "../utils/safeReturnPath";
 
 /** BFF の GET /api/meraki/credentials 応答。apiKey はマスク済み。 */
 interface CredentialListResponse {
@@ -33,7 +34,7 @@ const emptyEdit: EditState = {
 export function MerakiCredentialsPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const returnKey = params.get("from") || "/";
+  const returnKey = safeReturnPath(params.get("from"));
 
   const [enabled, setEnabled] = useState(true);
   const [credentials, setCredentials] = useState<MerakiCredential[]>([]);

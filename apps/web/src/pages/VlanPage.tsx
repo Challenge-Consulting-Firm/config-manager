@@ -7,6 +7,8 @@ import type {
   VlanPort,
 } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
+import { safeReturnPath } from "../utils/safeReturnPath";
+import { csvEscape } from "../utils/csvEscape";
 
 type View = "vlans" | "ports" | "matrix";
 
@@ -16,11 +18,7 @@ type Membership = "access" | "native" | "tagged" | null;
 export function VlanPage() {
   const { id } = useParams<{ id: string }>();
   const [params] = useSearchParams();
-  // `from` はアプリ内の相対パスのみ許可する。`//evil.com`（プロトコル相対）や
-  // `http(s):`/`javascript:`/`data:` などの外部・危険URIを弾き、戻り先が
-  // アプリ内に留まるよう単一スラッシュ始まりだけを受け入れる。
-  const rawFrom = params.get("from") || "/";
-  const returnKey = /^\/(?!\/)/.test(rawFrom) ? rawFrom : "/";
+  const returnKey = safeReturnPath(params.get("from"));
 
   const [version, setVersion] = useState<ConfigVersion | null>(null);
   const [ids, setIds] = useState<DeviceIdentifiers | null>(null);
@@ -347,14 +345,6 @@ function exportVlanCsv(vlans: VlanDefinition[], filename: string): void {
     "Tagged Ports",
     "Native Ports",
   ];
-  const esc = (v: unknown) => {
-    let s = String(v ?? "");
-    // CSVフォーミュラインジェクション対策: 先頭が数式トリガ文字（= + - @ TAB CR）
-    // の場合はシングルクォートを前置し、Excel等が数式として評価しないようにする。
-    // VLAN名は機器コンフィグ由来で任意文字列になり得るため必要。
-    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const lines = [cols.join(",")];
   for (const v of vlans) {
     lines.push(
@@ -365,7 +355,7 @@ function exportVlanCsv(vlans: VlanDefinition[], filename: string): void {
         v.taggedPorts.join(" "),
         v.nativePorts.join(" "),
       ]
-        .map(esc)
+        .map(csvEscape)
         .join(","),
     );
   }

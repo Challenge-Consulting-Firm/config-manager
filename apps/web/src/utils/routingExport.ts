@@ -1,4 +1,5 @@
 import type { RoutingRoute } from "@config-manager/shared";
+import { csvEscape } from "./csvEscape";
 
 /** Export routing routes to an .xlsx workbook with three sheets:
  *  - "Routes": the flat route list
@@ -120,10 +121,6 @@ export function exportRoutingCsv(routes: RoutingRoute[], filename: string): void
     "Line",
     "Raw",
   ];
-  const esc = (v: unknown) => {
-    const s = String(v ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const lines = [cols.join(",")];
   routes.forEach((r, i) => {
     lines.push(
@@ -139,7 +136,7 @@ export function exportRoutingCsv(routes: RoutingRoute[], filename: string): void
         r.line,
         r.raw,
       ]
-        .map(esc)
+        .map(csvEscape)
         .join(","),
     );
   });
