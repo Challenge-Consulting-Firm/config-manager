@@ -3,6 +3,7 @@ import {
   type WirelessAccessPoint,
   type WirelessSsid,
 } from "@config-manager/shared";
+import { csvEscape } from "./csvEscape";
 
 /** Export the wireless snapshot to an .xlsx workbook with two sheets:
  *  - "SSIDs": the SSID configuration list
@@ -97,12 +98,8 @@ function downloadCsv(
   rows: (string | number)[][],
   filename: string,
 ): void {
-  const esc = (v: unknown) => {
-    const s = String(v ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const lines = [cols.join(",")];
-  for (const row of rows) lines.push(row.map(esc).join(","));
+  for (const row of rows) lines.push(row.map(csvEscape).join(","));
   const blob = new Blob(["﻿" + lines.join("\n")], {
     type: "text/csv;charset=utf-8",
   });

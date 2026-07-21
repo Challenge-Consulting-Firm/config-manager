@@ -9,6 +9,7 @@ import {
   type FirewallRuleCategory,
 } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
+import { safeReturnPath } from "../utils/safeReturnPath";
 import {
   exportFirewallCsv,
   exportFirewallExcel,
@@ -20,7 +21,7 @@ type CategoryFilter = "all" | "policy" | "nat" | "dos";
 export function FirewallPage() {
   const { id } = useParams<{ id: string }>();
   const [params] = useSearchParams();
-  const returnKey = params.get("from") || "/";
+  const returnKey = safeReturnPath(params.get("from"));
 
   const [version, setVersion] = useState<ConfigVersion | null>(null);
   const [ids, setIds] = useState<DeviceIdentifiers | null>(null);
