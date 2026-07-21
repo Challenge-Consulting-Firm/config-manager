@@ -55,7 +55,7 @@ export function UploadPage() {
         if (errs.some((e) => e.code === "file-too-large")) {
           setError("ファイルサイズが上限（5MB）を超えています。");
         } else if (errs.some((e) => e.code === "file-invalid-type")) {
-          setError("対応していないファイル形式です（.conf/.cfg/.txt/.log のみ）。");
+          setError("対応していないファイル形式です（.conf/.cfg/.txt/.log/.bin のみ）。");
         } else {
           setError(errs[0]?.message ?? "ファイルを受け付けられませんでした。");
         }
@@ -96,7 +96,11 @@ export function UploadPage() {
     onDrop,
     multiple: false,
     maxSize: 5 * 1024 * 1024,
-    accept: { "text/plain": [".conf", ".cfg", ".txt", ".log"] },
+    // .bin covers Buffalo BS-GS exports (plain-text config with a .bin name).
+    accept: {
+      "text/plain": [".conf", ".cfg", ".txt", ".log", ".bin"],
+      "application/octet-stream": [".bin"],
+    },
   });
 
   async function submit() {
@@ -259,7 +263,7 @@ export function UploadPage() {
           <p className="text-sm text-slate-500">
             ここにファイルをドラッグ&ドロップ、またはクリックして選択
             <br />
-            <span className="text-xs">(.conf / .cfg / .txt / .log)</span>
+            <span className="text-xs">(.conf / .cfg / .txt / .log / .bin)</span>
           </p>
         )}
       </div>

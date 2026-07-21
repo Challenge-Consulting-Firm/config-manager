@@ -10,6 +10,8 @@ import { SearchPage } from "./pages/SearchPage";
 import { AuditPage } from "./pages/AuditPage";
 import { FirewallPage } from "./pages/FirewallPage";
 import { RoutingPage } from "./pages/RoutingPage";
+import { WirelessPage } from "./pages/WirelessPage";
+import { VlanPage } from "./pages/VlanPage";
 import { AppIcon } from "./components/AppIcon";
 
 export default function App() {
@@ -91,6 +93,8 @@ export default function App() {
           <Route path="/search" element={<SearchPage />} />
           <Route path="/versions/:id/firewall" element={<FirewallPage />} />
           <Route path="/versions/:id/routing" element={<RoutingPage />} />
+          <Route path="/versions/:id/wireless" element={<WirelessPage />} />
+          <Route path="/versions/:id/vlan" element={<VlanPage />} />
           <Route path="/audit" element={<AuditPage />} />
         </Routes>
       </main>

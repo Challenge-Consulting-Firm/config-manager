@@ -187,7 +187,7 @@ export function RoutingPage() {
       {!loading && !error && filtered.length === 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800">
           {routes.length === 0
-            ? "このコンフィグからルーティング情報を抽出できませんでした。対応形式（Cisco IOS/IOS-XE/NX-OS/ASA、Juniper Junos、Fortinet FortiOS、YAMAHA）のコンフィグか確認してください。"
+            ? "このコンフィグからルーティング情報を抽出できませんでした。対応形式（Cisco IOS/IOS-XE/NX-OS/ASA、Juniper Junos、Fortinet FortiOS、YAMAHA、ELECOM、Buffalo）のコンフィグか確認してください。"
             : "条件に一致するルートがありません。"}
         </div>
       )}

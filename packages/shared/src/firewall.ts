@@ -32,7 +32,8 @@ export interface FirewallCache {
 // v4: added Meraki (Dashboard JSON) firewall policy extraction. Bumping the
 // version invalidates older caches (notably Meraki records that cached an empty
 // ruleset before this parser existed) so they recompute on next read.
-export const FIREWALL_CACHE_VERSION = 4;
+// v5: Yamaha SWX management-plane ACL extraction (`<svc>-server access`).
+export const FIREWALL_CACHE_VERSION = 5;
 
 /** Serialize rules to a compact JSON string for storage. */
 export function serializeFirewallRules(
@@ -910,6 +911,35 @@ function extractYamaha(lines: string[], vendor: string): FirewallRule[] {
       raw,
     });
   }
+
+  // Management-plane access controls. SWX switches don't use `ip filter`;
+  // instead each management service restricts access with
+  // `<svc>-server access permit|deny <network>`, and the service itself is
+  // bound to SVIs with `<svc>-server interface vlanN`. We surface each
+  // permit/deny as a policy so the FW view shows who may reach the management
+  // plane. protocol carries the service name (http/telnet/ssh), destination is
+  // the switch itself.
+  const MGMT_SVC_RE =
+    /^(http|https|telnet|ssh|snmp)(?:-server|-proxy)?\s+access\s+(permit|deny)\s+(\S+)/i;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    const m = raw.match(MGMT_SVC_RE);
+    if (!m) continue;
+    const [, svc, actKw, network] = m;
+    rules.push({
+      vendor,
+      name: `${svc.toLowerCase()}-server`,
+      action: /permit/i.test(actKw) ? "permit" : "deny",
+      protocol: svc.toLowerCase(),
+      source: network,
+      destination: "self",
+      port: svc.toLowerCase(),
+      attributes: "management-access",
+      line: i + 1,
+      raw,
+    });
+  }
+
   return rules;
 }
 
@@ -1070,6 +1100,14 @@ function guessVendorFromConfig(lines: string[]): string {
     return "Juniper";
   }
   if (has(/^ip\s+filter\s+\S+\s+(pass|reject)\s+/i)) {
+    return "YAMAHA";
+  }
+  // SWX switches: `interface port1.N` + (l2ms | vlan database). Their only
+  // access policies are `<svc>-server access` management ACLs.
+  if (
+    has(/^\s*interface\s+port\d+\.\d+/i) &&
+    (has(/^\s*l2ms\b/i) || has(/^\s*vlan\s+database\s*$/i))
+  ) {
     return "YAMAHA";
   }
   if (has(/^config\s+firewall\s+policy\s*$/i) || has(/^#config-version=/i)) {

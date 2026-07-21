@@ -87,6 +87,38 @@ function extractCiscoIp(lines: string[]): string {
   return pickFirstIp([mgmtIp, firstPhysIp]);
 }
 
+/** Extract a Yamaha SWX management IP from SVI blocks. Walks
+ *  `interface vlanN` blocks and reads the `ip address A.B.C.D/prefix` line,
+ *  preferring vlan1 (the conventional management SVI) and otherwise falling
+ *  back to the lowest-numbered VLAN that carries an address. */
+function extractYamahaSwxIp(lines: string[]): string {
+  let currentVlan = -1;
+  let vlan1Ip = "";
+  let bestVlan = Number.POSITIVE_INFINITY;
+  let bestIp = "";
+  for (const l of lines) {
+    const ifM = l.match(/^\s*interface\s+vlan(\d+)/i);
+    if (ifM) {
+      currentVlan = Number.parseInt(ifM[1], 10);
+      continue;
+    }
+    if (/^\s*interface\s+\S+/i.test(l)) {
+      currentVlan = -1;
+      continue;
+    }
+    const ipM = l.match(/^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)(?:\/\d+)?/i);
+    if (!ipM || currentVlan < 0) continue;
+    const ip = ipM[1];
+    if (RESERVED_IPS.has(ip)) continue;
+    if (currentVlan === 1 && !vlan1Ip) vlan1Ip = ip;
+    if (currentVlan < bestVlan) {
+      bestVlan = currentVlan;
+      bestIp = ip;
+    }
+  }
+  return vlan1Ip || bestIp;
+}
+
 function firstMatch(lines: string[], re: RegExp): string | undefined {
   for (const l of lines) {
     const m = l.match(re);
@@ -351,6 +383,120 @@ const rules: Rule[] = [
           firstMatch(lines, /^\s*ip\s+lan\d+\s+address\s+(\d+\.\d+\.\d+\.\d+)/i) ??
           "",
         confidence: 0.9,
+      };
+    },
+  },
+  // ----- YAMAHA SWX (L2/L3 switch) -----
+  // The SWX series running-config has no "# RTX..." banner. It is identified
+  // structurally by `interface port1.N` ports, `switchport` config, a
+  // `vlan database` block, and the `l2ms` management protocol — none of which
+  // appear on Cisco/other vendors. Management IP is taken from the SVI
+  // (`interface vlanN` / `ip address A.B.C.D/prefix`), preferring vlan1.
+  {
+    name: "yamaha-swx",
+    detect: (lines) => {
+      const hasL2ms = lines.some((l) => /^\s*l2ms\b/i.test(l));
+      const hasPortIf = lines.some((l) =>
+        /^\s*interface\s+port\d+\.\d+/i.test(l),
+      );
+      const hasVlanDb = lines.some((l) => /^\s*vlan\s+database\s*$/i.test(l));
+      const hasSwitchport = lines.some((l) => /^\s*switchport\b/i.test(l));
+      // Require the two most Yamaha-distinctive signals (port interfaces plus
+      // either l2ms or the vlan database block) so IOS switches don't match.
+      if (!hasPortIf || !(hasL2ms || hasVlanDb)) return null;
+
+      const hostname = firstMatch(lines, /^\s*hostname\s+(\S+)/i) ?? "";
+      const score =
+        (hasPortIf ? 0.4 : 0) +
+        (hasL2ms ? 0.3 : 0) +
+        (hasVlanDb ? 0.2 : 0) +
+        (hasSwitchport ? 0.1 : 0);
+      return {
+        vendor: "YAMAHA",
+        os: "SW-OS",
+        osVersion: "",
+        model: "",
+        hostname,
+        ipAddress: extractYamahaSwxIp(lines),
+        confidence: Math.min(score, 1),
+      };
+    },
+  },
+  // ----- Buffalo (BS-GS series L2/L3 switch) -----
+  // The Buffalo config opens with `! -- start of BS-GS2048 config --` and
+  // `! -- Software Version : 1.0.12.05 --` comment headers. Model is the
+  // BS-xxx token in the start banner. Management IP is the global
+  // `ip address A.B.C.D M.M.M.M` (space-separated mask, outside interface
+  // blocks — the same line also appears inside `interface vlan1`).
+  {
+    name: "buffalo-bsgs",
+    detect: (lines) => {
+      const startLine = lines.find((l) =>
+        /^!\s*--\s*start of\s+(BS-\S+)\s+config/i.test(l),
+      );
+      const hasStart = startLine !== undefined;
+      const hasModelHeader = lines.some((l) => /^!\s*--.*\bBS-GS/i.test(l));
+      if (!hasStart && !hasModelHeader) return null;
+
+      const model =
+        startLine?.match(/start of\s+(BS-\S+)\s+config/i)?.[1] ??
+        firstMatch(lines, /\b(BS-GS\S+)/i) ??
+        "";
+      const osVersion =
+        firstMatch(lines, /Software Version\s*:\s*([\d.]+)/i) ?? "";
+      const hostname = firstMatch(lines, /^\s*hostname\s+(\S+)/i) ?? "";
+      const ipAddress = firstNonZeroIp(
+        lines,
+        /^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\.\d+\.\d+\.\d+/i,
+      );
+      return {
+        vendor: "Buffalo",
+        os: "BS-GS",
+        osVersion,
+        model,
+        hostname,
+        ipAddress,
+        confidence: hasStart ? 0.95 : 0.6,
+      };
+    },
+  },
+  // ----- ELECOM (EHB series L2/L2+ switch) -----
+  // The ELECOM startup-config opens with the fixed banner
+  // `SYSTEM CONFIG FILE ::= BEGIN` and carries `! System Description:` /
+  // `! System Version:` / `! System Name:` comment headers. Model is the
+  // token before "Switch" in the description (e.g. "EHB-SX2A08F"). Management
+  // IP comes from the global `ip address A.B.C.D mask M.M.M.M` line (ELECOM
+  // uses the `mask` keyword and places it outside any interface block).
+  {
+    name: "elecom-ehb",
+    detect: (lines) => {
+      const hasBanner = lines.some((l) =>
+        /^SYSTEM\s+CONFIG\s+FILE\s*::=\s*BEGIN/i.test(l),
+      );
+      const descLine = lines.find((l) => /^!\s*System Description:/i.test(l));
+      const hasDesc = descLine !== undefined;
+      if (!hasBanner && !hasDesc) return null;
+
+      const desc = descLine?.replace(/^!\s*System Description:\s*/i, "") ?? "";
+      // "Switch EHB-SX2A08F Switch" -> "EHB-SX2A08F".
+      const model = desc.match(/\b(EHB-\S+)/i)?.[1] ?? "";
+      const osVersion =
+        firstMatch(lines, /^!\s*System Version:\s*v?([\w.]+)/i) ?? "";
+      const hostname =
+        firstMatch(lines, /^!\s*System Name:\s*(\S+)/i) ?? "";
+      const ipAddress = firstNonZeroIp(
+        lines,
+        /^\s*ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+mask\s+/i,
+      );
+      const score = (hasBanner ? 0.6 : 0) + (hasDesc ? 0.4 : 0);
+      return {
+        vendor: "ELECOM",
+        os: "EHB",
+        osVersion,
+        model,
+        hostname,
+        ipAddress,
+        confidence: Math.min(score, 1),
       };
     },
   },

@@ -59,6 +59,11 @@
       "type": "MULTI_LINE_TEXT",
       "label": "ルーティング抽出結果（JSON）"
     },
+    "wireless_json": {
+      "code": "wireless_json",
+      "type": "MULTI_LINE_TEXT",
+      "label": "無線SSID/AP抽出結果（JSON）"
+    },
     "role": {
       "code": "role",
       "type": "SINGLE_LINE_TEXT",

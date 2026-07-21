@@ -4,4 +4,6 @@ export * from "./diff.js";
 export * from "./detect.js";
 export * from "./firewall.js";
 export * from "./routing.js";
+export * from "./wireless.js";
+export * from "./vlan.js";
 export * from "./meraki.js";

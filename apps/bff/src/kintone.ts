@@ -47,6 +47,8 @@ const F = {
     fwRulesJson: "fw_rules_json",
     // Cached routing-routes extraction result (JSON)
     routingRoutesJson: "routing_routes_json",
+    // Cached wireless (SSID + AP) extraction result (JSON)
+    wirelessJson: "wireless_json",
   },
   // Audit app
   audit: {
@@ -320,6 +322,31 @@ export async function setRoutingCache(
   }
 }
 
+/** Read the persisted wireless (SSID + AP) JSON for a record (or empty). */
+export function getWirelessCacheRaw(rec: KintoneRecord): string {
+  return rec[F.config.wirelessJson]?.value ?? "";
+}
+
+/** Update only the wireless_json field of an existing record. */
+export async function setWirelessCache(
+  cfg: AppConfig,
+  recordId: string,
+  wirelessJson: string,
+): Promise<void> {
+  try {
+    await kintoneFetch(cfg, cfg.kintone.configAppToken, "/record.json", {
+      method: "PUT",
+      body: JSON.stringify({
+        app: cfg.kintone.configAppId,
+        id: recordId,
+        record: { [F.config.wirelessJson]: { value: wirelessJson } },
+      }),
+    });
+  } catch (err) {
+    console.error("[wireless-cache] failed to persist:", err);
+  }
+}
+
 /** Create a new config version record. */
 export async function createVersion(
   cfg: AppConfig,
@@ -336,6 +363,7 @@ export async function createVersion(
     detected?: DeviceDetection;
     fwRulesJson?: string;
     routingRoutesJson?: string;
+    wirelessJson?: string;
   },
 ): Promise<ConfigVersion> {
   // Kintone requires each field value wrapped in { value: ... }.
@@ -359,6 +387,7 @@ export async function createVersion(
     [F.config.detectedModel]: { value: args.detected?.model ?? "" },
     [F.config.fwRulesJson]: { value: args.fwRulesJson ?? "" },
     [F.config.routingRoutesJson]: { value: args.routingRoutesJson ?? "" },
+    [F.config.wirelessJson]: { value: args.wirelessJson ?? "" },
   };
   if (args.note) fields[F.config.note] = { value: args.note };
 

@@ -6,11 +6,15 @@ import type {
   FirewallRuleDiff,
   RoutingRoute,
   RoutingRouteDiff,
+  WirelessAccessPoint,
+  WirelessDiff,
+  WirelessSsid,
 } from "@config-manager/shared";
+import { wirelessAuthModeLabel } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
 import { DiffViewer } from "../components/DiffViewer";
 
-type Tab = "config" | "firewall" | "routing";
+type Tab = "config" | "firewall" | "routing" | "wireless";
 
 export function DiffPage() {
   const [params] = useSearchParams();
@@ -21,6 +25,7 @@ export function DiffPage() {
   const [configDiff, setConfigDiff] = useState<ConfigDiff | null>(null);
   const [fwDiff, setFwDiff] = useState<FirewallRuleDiff | null>(null);
   const [routeDiff, setRouteDiff] = useState<RoutingRouteDiff | null>(null);
+  const [wirelessDiff, setWirelessDiff] = useState<WirelessDiff | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -61,6 +66,12 @@ export function DiffPage() {
     void loadRoutingDiff(before, after, setRouteDiff, setError);
   }, [tab, routeDiff, before, after]);
 
+  // Wireless (SSID / AP) diff likewise.
+  useEffect(() => {
+    if (tab !== "wireless" || wirelessDiff || !before || !after) return;
+    void loadWirelessDiff(before, after, setWirelessDiff, setError);
+  }, [tab, wirelessDiff, before, after]);
+
   return (
     <div>
       <div className="mb-4 flex items-center justify-between">
@@ -86,7 +97,7 @@ export function DiffPage() {
       </div>
 
       <div className="mb-3 flex items-center gap-1 rounded-md border border-slate-300 bg-white p-0.5 text-sm w-fit">
-        {(["config", "firewall", "routing"] as const).map((t) => (
+        {(["config", "firewall", "routing", "wireless"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -119,6 +130,10 @@ export function DiffPage() {
 
       {!error && tab === "routing" && (
         <RoutingDiffView diff={routeDiff} loading={!routeDiff} />
+      )}
+
+      {!error && tab === "wireless" && (
+        <WirelessDiffView diff={wirelessDiff} loading={!wirelessDiff} />
       )}
     </div>
   );
@@ -156,6 +171,22 @@ async function loadRoutingDiff(
   }
 }
 
+async function loadWirelessDiff(
+  before: string,
+  after: string,
+  set: (d: WirelessDiff) => void,
+  setError: (e: string | null) => void,
+) {
+  try {
+    const res = await apiFetch<{ diff: WirelessDiff }>(
+      `/api/diff/wireless?before=${encodeURIComponent(before)}&after=${encodeURIComponent(after)}`,
+    );
+    set(res.diff);
+  } catch (e) {
+    setError(e instanceof ApiError ? e.message : String(e));
+  }
+}
+
 function tabLabel(t: Tab): string {
   switch (t) {
     case "config":
@@ -164,6 +195,8 @@ function tabLabel(t: Tab): string {
       return "FW / ACL";
     case "routing":
       return "ルーティング";
+    case "wireless":
+      return "無線 SSID/AP";
   }
 }
 
@@ -318,6 +351,145 @@ function RuleRow({ rule, tone }: { rule: FirewallRule; tone: "added" | "removed"
         <div className="mono mt-1 text-xs text-slate-700">
           {rule.source} → {rule.destination}
           {rule.port && rule.port !== "any" ? ` :${rule.port}` : ""}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function WirelessDiffView({ diff, loading }: { diff: WirelessDiff | null; loading: boolean }) {
+  if (loading) return <p className="text-slate-500">無線 SSID/AP の差分を計算中…</p>;
+  if (!diff) return null;
+  const ssidChanges =
+    diff.ssids.added.length + diff.ssids.removed.length + diff.ssids.changed.length;
+  const apChanges =
+    diff.accessPoints.added.length +
+    diff.accessPoints.removed.length +
+    diff.accessPoints.changed.length;
+  if (ssidChanges + apChanges === 0) {
+    return (
+      <p className="text-slate-500">
+        無線 SSID/AP に差分はありません（SSID {diff.ssids.unchanged} 件 / AP{" "}
+        {diff.accessPoints.unchanged} 台が同一）。
+      </p>
+    );
+  }
+  return (
+    <div>
+      <h2 className="mb-2 text-sm font-semibold text-slate-700">SSID</h2>
+      <StatsHeader
+        added={diff.ssids.added.length}
+        removed={diff.ssids.removed.length}
+        changed={diff.ssids.changed.length}
+        unchanged={diff.ssids.unchanged}
+      />
+      {diff.ssids.removed.length > 0 && (
+        <DiffSection title={`削除 (${diff.ssids.removed.length})`}>
+          {diff.ssids.removed.map((s, i) => (
+            <SsidRow key={`sr-${i}`} ssid={s} tone="removed" />
+          ))}
+        </DiffSection>
+      )}
+      {diff.ssids.added.length > 0 && (
+        <DiffSection title={`追加 (${diff.ssids.added.length})`}>
+          {diff.ssids.added.map((s, i) => (
+            <SsidRow key={`sa-${i}`} ssid={s} tone="added" />
+          ))}
+        </DiffSection>
+      )}
+      {diff.ssids.changed.length > 0 && (
+        <DiffSection title={`変更 (${diff.ssids.changed.length})`}>
+          {diff.ssids.changed.map((c, i) => (
+            <li key={`sc-${i}`}>
+              <SsidRow ssid={c.before} tone="removed" />
+              <SsidRow ssid={c.after} tone="added" />
+            </li>
+          ))}
+        </DiffSection>
+      )}
+
+      <h2 className="mb-2 mt-6 text-sm font-semibold text-slate-700">
+        アクセスポイント
+      </h2>
+      <StatsHeader
+        added={diff.accessPoints.added.length}
+        removed={diff.accessPoints.removed.length}
+        changed={diff.accessPoints.changed.length}
+        unchanged={diff.accessPoints.unchanged}
+      />
+      {diff.accessPoints.removed.length > 0 && (
+        <DiffSection title={`削除 (${diff.accessPoints.removed.length})`}>
+          {diff.accessPoints.removed.map((a, i) => (
+            <ApRow key={`ar-${i}`} ap={a} tone="removed" />
+          ))}
+        </DiffSection>
+      )}
+      {diff.accessPoints.added.length > 0 && (
+        <DiffSection title={`追加 (${diff.accessPoints.added.length})`}>
+          {diff.accessPoints.added.map((a, i) => (
+            <ApRow key={`aa-${i}`} ap={a} tone="added" />
+          ))}
+        </DiffSection>
+      )}
+      {diff.accessPoints.changed.length > 0 && (
+        <DiffSection title={`変更 (${diff.accessPoints.changed.length})`}>
+          {diff.accessPoints.changed.map((c, i) => (
+            <li key={`ac-${i}`}>
+              <ApRow ap={c.before} tone="removed" />
+              <ApRow ap={c.after} tone="added" />
+            </li>
+          ))}
+        </DiffSection>
+      )}
+    </div>
+  );
+}
+
+function SsidRow({ ssid, tone }: { ssid: WirelessSsid; tone: "added" | "removed" }) {
+  const bg = tone === "added" ? "bg-emerald-50" : "bg-red-50";
+  const sign = tone === "added" ? "+" : "−";
+  const signColor = tone === "added" ? "text-emerald-700" : "text-red-700";
+  return (
+    <li className={`flex items-start gap-2 px-3 py-2 text-sm ${bg}`}>
+      <span className={`mono font-bold ${signColor}`}>{sign}</span>
+      <div className="flex-1">
+        <div className="flex flex-wrap items-baseline gap-2">
+          <span className="mono text-xs text-slate-400">#{ssid.number}</span>
+          <span className="font-medium text-slate-900">{ssid.name || "(無名)"}</span>
+          <span className="text-xs text-slate-500">
+            {ssid.enabled ? "有効" : "無効"}
+          </span>
+          <span className="text-xs text-slate-500">
+            {wirelessAuthModeLabel(ssid.authMode)}
+          </span>
+        </div>
+        <div className="mono mt-1 text-xs text-slate-700">
+          {ssid.ipAssignmentMode || "—"}
+          {ssid.useVlanTagging ? ` · VLAN ${ssid.vlanId ?? "tag"}` : ""}
+          {ssid.bandSelection ? ` · ${ssid.bandSelection}` : ""}
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function ApRow({ ap, tone }: { ap: WirelessAccessPoint; tone: "added" | "removed" }) {
+  const bg = tone === "added" ? "bg-emerald-50" : "bg-red-50";
+  const sign = tone === "added" ? "+" : "−";
+  const signColor = tone === "added" ? "text-emerald-700" : "text-red-700";
+  return (
+    <li className={`flex items-start gap-2 px-3 py-2 text-sm ${bg}`}>
+      <span className={`mono font-bold ${signColor}`}>{sign}</span>
+      <div className="flex-1">
+        <div className="flex flex-wrap items-baseline gap-2">
+          <span className="font-medium text-slate-900">{ap.name || "(無名)"}</span>
+          <span className="mono text-xs text-slate-600">{ap.model}</span>
+          <span className="mono text-xs text-slate-400">{ap.serial}</span>
+        </div>
+        <div className="mono mt-1 text-xs text-slate-700">
+          {ap.firmware && `fw ${ap.firmware}`}
+          {ap.lanIp ? ` · LAN ${ap.lanIp}` : ""}
+          {ap.publicIp ? ` · Public ${ap.publicIp}` : ""}
         </div>
       </div>
     </li>
