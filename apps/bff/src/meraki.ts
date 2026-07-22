@@ -38,6 +38,10 @@ export interface MerakiFetchOptions {
   timeoutMs?: number;
   /** 429 受信時の最大リトライ回数。既定 3。 */
   maxRetries?: number;
+  /** セクション取得の最大並列数。既定 5。Meraki は組織単位で概ね毎秒 10
+   *  リクエストのレート制限があり、数十エンドポイントを一斉に叩くと 429 が
+   *  多発してリトライごと雪崩れるため、並列度を絞って抑制する。 */
+  sectionConcurrency?: number;
 }
 
 /** Meraki 全体の取得処理の結果。 */
@@ -168,6 +172,30 @@ async function callMeraki<T>(
   return { status: 0, data: null, error: "exhausted retries" };
 }
 
+/** 配列の各要素に対し非同期処理を最大 `concurrency` 並列で実行する簡易ワーカー
+ *  プール。`Promise.all` で全件を一斉発火させると、Meraki のレート制限
+ *  (組織単位で概ね毎秒 10 リクエスト) に容易に抵触し、429 のリトライが再び
+ *  一斉に走って雪崩れる。並列度を絞ることでこれを防ぐ。返り値は入力配列の
+ *  index に対応した順序を保つ。 */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  const limit = Math.max(1, Math.min(concurrency, items.length || 1));
+  let next = 0;
+  const runners = Array.from({ length: limit }, async () => {
+    for (;;) {
+      const current = next++;
+      if (current >= items.length) return;
+      results[current] = await worker(items[current], current);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 /** `/networks/{id}` と `/networks/{id}/devices` を取得し、{@link MerakiNetworkInfo}
  *  とデバイス一覧を組み立てる。ネットワーク自体が取れない場合は例外。 */
 async function fetchNetworkAndDevices(
@@ -284,11 +312,13 @@ async function fetchNetworkAndDevices(
     }
   }
 
-  // MX (appliance) が含まれる場合、/devices の応答には publicIp が含まれない
-  // ことが多いため、uplinks/statuses から WAN IP を取得して補完する。
+  // MX (appliance) が実際に在籍する場合、/devices の応答には publicIp が含まれ
+  // ないことが多いため、uplinks/statuses から WAN IP を取得して補完する。
   // 複数 uplink (WAN1/WAN2) がある場合は、最初に active なものを優先。
-  // 失敗時 (404 等) は無視して続行。
-  if (network.productTypes.includes("appliance")) {
+  // network.productTypes ではなく実デバイスで判定するのは、Combined ネットワーク
+  // で appliance が productTypes に載っていても実機が居ない場合に不要な呼び出し
+  // (とレート制限消費) を避けるため。失敗時 (404 等) は無視して続行。
+  if (devices.some((d) => d.productType === "appliance")) {
     const uplinksRes = await callMeraki<
       Array<{ serial?: string; uplinks?: Array<{ configured?: boolean; status?: string; ip?: string }> }>
     >(`/networks/${networkId}/appliance/uplinks/statuses`, opts);
@@ -389,43 +419,72 @@ export async function fetchMerakiConfig(
     fullOpts,
   );
 
-  // 製品タイプ毎にエンドポイントを並列取得。各エンドポイントの {id} を
-  // ネットワーク ID へ置換する。
-  const sections: MerakiSection[] = [];
-  const statuses: Record<string, number> = {};
-  const tasks: Promise<MerakiSection>[] = [];
-  for (const pt of network.productTypes) {
-    const defs = MERAKI_ENDPOINTS[pt] ?? [];
-    for (const def of defs) {
-      const path = def.endpoint.replace("{id}", trimmedId);
-      tasks.push(
-        (async (): Promise<MerakiSection> => {
-          const r = await callMeraki<unknown>(path, fullOpts);
-          statuses[path] = r.status;
-          return {
-            label: def.label,
-            endpoint: def.endpoint,
-            productType: pt,
-            data: r.data ?? undefined,
-            error: r.error,
-            // HTTP 400 は「対象ネットワークでその機能が有効ではない」仕様上の
-            // 正常失敗なので skipped 扱いとする。401/403/429/500 等は実エラー。
-            skipped: r.error ? r.status === 400 : undefined,
-          };
-        })(),
-      );
+  // 取得対象の製品タイプを決める。network.productTypes はネットワークの
+  // 「モード」(例: Combined = appliance/switch/wireless) を表すだけで、実際に
+  // その製品のデバイスが在籍しているとは限らない。例えば Combined ネットワーク
+  // に wireless (MR) しか無い場合でも productTypes には 3 種すべてが並ぶ。
+  // 在籍しない製品のエンドポイントまで叩くと、
+  //   1) 全て 400/404/空になるだけで意味が無く、
+  //   2) 最大 50 超の並列リクエストで Meraki のレート制限 (429) を誘発し、
+  //      肝心の在籍製品 (wireless の SSID/PSK 等) の取得まで巻き込んで失敗
+  //      させてしまう（Issue #4: Combined + Wireless のみの構成でエラー）。
+  // そのため、実際にデバイスが在籍する製品タイプのみに絞り込む。
+  const presentTypes = new Set<MerakiProductType>();
+  for (const d of devices) {
+    if (
+      d.productType === "appliance" ||
+      d.productType === "switch" ||
+      d.productType === "wireless"
+    ) {
+      presentTypes.add(d.productType);
     }
   }
-  // 全件待つ（個別失敗はセクションに記録済み）。
-  const results = await Promise.all(tasks);
-  for (const s of results) sections.push(s);
+  // デバイス一覧が取得できなかった (空) 場合のみ全 productTypes へフォールバック
+  // する。デバイスは在籍するが appliance/switch/wireless のいずれにも該当しない
+  // (camera/sensor 等のみ) 場合は targetProductTypes を空にして何も取得しない。
+  // このケースは呼び出し側 (api.ts) が「MR/MX/MS 未検出」として弾くため、
+  // 無駄なエンドポイント取得（＝レート制限消費）を避ける。
+  const targetProductTypes =
+    devices.length === 0
+      ? network.productTypes
+      : network.productTypes.filter((pt) => presentTypes.has(pt));
+
+  // 製品タイプ毎にエンドポイントを (並列度を絞って) 取得。各エンドポイントの
+  // {id} をネットワーク ID へ置換する。
+  const statuses: Record<string, number> = {};
+  const defsToFetch: { pt: MerakiProductType; label: string; endpoint: string }[] =
+    [];
+  for (const pt of targetProductTypes) {
+    for (const def of MERAKI_ENDPOINTS[pt] ?? []) {
+      defsToFetch.push({ pt, label: def.label, endpoint: def.endpoint });
+    }
+  }
+  const sections = await mapWithConcurrency(
+    defsToFetch,
+    fullOpts.sectionConcurrency ?? 5,
+    async (def): Promise<MerakiSection> => {
+      const path = def.endpoint.replace("{id}", trimmedId);
+      const r = await callMeraki<unknown>(path, fullOpts);
+      statuses[path] = r.status;
+      return {
+        label: def.label,
+        endpoint: def.endpoint,
+        productType: def.pt,
+        data: r.data ?? undefined,
+        error: r.error,
+        // HTTP 400 は「対象ネットワークでその機能が有効ではない」仕様上の
+        // 正常失敗なので skipped 扱いとする。401/403/429/500 等は実エラー。
+        skipped: r.error ? r.status === 400 : undefined,
+      };
+    },
+  );
 
   // MX (appliance) の「プライベート IP」は /devices や uplinks では取れず、
   // VLAN / Single LAN 設定の applianceIp（＝MX の LAN 側ゲートウェイ IP）が
   // 実質的な管理プライベート IP になる。ここで appliance デバイスの lanIp を
   // その値で補完し、取り込み時に publicIp ではなくプライベート IP が選ばれる
   // ようにする（デバイス単位ループは lanIp を優先する）。
-  if (network.productTypes.includes("appliance")) {
+  if (devices.some((d) => d.productType === "appliance")) {
     const applianceIp = extractApplianceLanIp(sections);
     if (applianceIp) {
       for (const d of devices) {
