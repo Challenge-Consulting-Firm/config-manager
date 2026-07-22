@@ -73,6 +73,8 @@ export interface AppConfig {
     timeoutMs: number;
     /** 429 受信時の最大リトライ回数。 */
     maxRetries: number;
+    /** セクション取得の最大並列数。レート制限 (429) 抑制のため既定 5。 */
+    sectionConcurrency: number;
   };
 }
 
@@ -137,6 +139,7 @@ export function loadConfig(): AppConfig {
       apiBase: optional("MERAKI_API_BASE", "https://api.meraki.com/api/v1"),
       timeoutMs: int("MERAKI_TIMEOUT_MS", 30_000),
       maxRetries: int("MERAKI_MAX_RETRIES", 3),
+      sectionConcurrency: int("MERAKI_SECTION_CONCURRENCY", 5),
     },
   };
   cached = cfg;

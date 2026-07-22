@@ -201,7 +201,8 @@ curl -L \
 
 ### 本システムが取得する全エンドポイントを試す
 
-本システムはネットワークの `productTypes` に応じて以下のエンドポイントを並列取得します。
+本システムは、対象ネットワークに **実際に在籍している製品タイプ**（appliance / switch / wireless）のエンドポイントだけを取得します。`productTypes` が `Combined`（3 種すべて）でも、例えば MR（wireless）しか設置されていなければ wireless のエンドポイントのみを叩きます。これは無駄な呼び出しを避け、レート制限 (429) で肝心の設定取得（Wireless の SSID/PSK 等）まで巻き込んで失敗するのを防ぐためです。
+また、レート制限抑制のためエンドポイントは並列度を絞って取得します（既定 5 並列・`MERAKI_SECTION_CONCURRENCY` で調整可）。
 事前に curl で叩いて応答を確認できます（エンドポイント一覧は [`packages/shared/src/meraki.ts`](../packages/shared/src/meraki.ts) の `MERAKI_ENDPOINTS` を参照）。
 
 例（MX / appliance の VLAN を取得）:
@@ -289,7 +290,10 @@ fly secrets set --app config-manager MERAKI_API_KEY=あなたのAPIキー
 
 - Meraki API のレート制限（毎秒 10 リクエスト等）に抵触しました
 - 本システムは自動リトライ（既定 3 回・指数バックオフ）しますが、それでも制限に達しました
-- 時間をおいて再実行するか、`MERAKI_MAX_RETRIES` を増やして再デプロイしてください
+- 取得は在籍製品タイプのみに絞り、並列度も抑制（既定 5）していますが、なお頻発する場合は次を試してください:
+  - 時間をおいて再実行する
+  - `MERAKI_SECTION_CONCURRENCY` を下げる（例: `3`）／`MERAKI_MAX_RETRIES` を増やして再デプロイする
+- なお、以前は `Combined` ネットワークで在籍しない製品（例: appliance/switch）のエンドポイントまで叩いてレート制限を誘発し、Wireless の SSID/PSK 取得まで失敗するケースがありましたが、在籍製品のみ取得する挙動に修正済みです
 
 ### `HTTP 404: ...` が特定セクションだけに出る
 

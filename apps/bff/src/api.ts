@@ -625,6 +625,7 @@ api.post("/meraki/import", async (c) => {
       apiBase: cfg.meraki.apiBase,
       timeoutMs: cfg.meraki.timeoutMs,
       maxRetries: cfg.meraki.maxRetries,
+      sectionConcurrency: cfg.meraki.sectionConcurrency,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
