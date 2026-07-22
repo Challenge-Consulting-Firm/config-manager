@@ -257,6 +257,16 @@ export function DeviceDetailPage() {
                 ファイルでアップロード
               </Link>
             )}
+            {/* 本番機からその予備機（差し替え用）を登録する導線。顧客・ホスト名を
+                引き継ぐことで、登録後に本番↔予備の比較（Diff）が自動で有効になる。 */}
+            {identifiers.role === "production" && (
+              <Link
+                to={spareUploadHrefFor(decodedKey, identifiers)}
+                className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 hover:bg-amber-100"
+              >
+                予備機を登録
+              </Link>
+            )}
             {/* 機器自体を全世代まとめて削除する。 */}
             <button
               onClick={() => {
@@ -311,6 +321,12 @@ export function DeviceDetailPage() {
             故障時の差し替えなどで予備機を本番運用に移す際、現在の世代 #{body.generation}{" "}
             のコンフィグを本番機として新世代登録します。シリアル番号は引き継がれます。
           </p>
+          {body.lines === 0 && (
+            <p className="mt-2 text-xs text-amber-700">
+              ※ この予備機はまだコンフィグが登録されていません。「新世代をアップロード」で
+              投入済みコンフィグを登録すると昇格できます。
+            </p>
+          )}
           <div className="mt-2 flex flex-wrap items-end gap-2">
             <label className="block">
               <span className="mb-1 block text-xs font-medium text-blue-800">
@@ -325,7 +341,7 @@ export function DeviceDetailPage() {
             </label>
             <button
               onClick={doPromote}
-              disabled={promoting || !promoteIp.trim()}
+              disabled={promoting || !promoteIp.trim() || body.lines === 0}
               className="rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
             >
               {promoting ? "登録中…" : "本番として登録"}
@@ -636,6 +652,24 @@ function uploadHrefFor(
     purpose: ids.purpose,
     serialNumber: ids.serialNumber,
     role: ids.role,
+    from,
+  });
+  return `/upload?${q.toString()}`;
+}
+
+/** Build the /upload URL for registering a SPARE of this (production) device.
+ *  Carries only customer + hostname so the spare is linked to the target for
+ *  本番↔予備 comparison; IP・シリアル・コンフィグ は予備機側で新規入力するため
+ *  引き継がない。role=spare でアップロード画面を予備機モードにする。 */
+function spareUploadHrefFor(
+  deviceKey: string,
+  ids: DeviceIdentifiers,
+): string {
+  const from = `/devices/${encodeURIComponent(deviceKey)}`;
+  const q = new URLSearchParams({
+    customer: ids.customer,
+    hostname: ids.hostname,
+    role: "spare",
     from,
   });
   return `/upload?${q.toString()}`;
