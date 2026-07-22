@@ -104,16 +104,26 @@ export function UploadPage() {
     },
   });
 
+  const isSpare = role === "spare";
+
   async function submit() {
     setError(null);
     setResult(null);
-    if (!customer || !hostname || !ipAddress) {
-      setError("顧客・ホスト名・IPアドレスは必須です");
-      return;
-    }
-    if (!rawText.trim()) {
-      setError("ファイルをドロップまたは内容を入力してください");
-      return;
+    if (isSpare) {
+      // 予備機はシリアル番号のみ必須。ホスト名・IP・コンフィグは任意。
+      if (!customer || !serialNumber.trim()) {
+        setError("予備機は顧客・シリアル番号が必須です");
+        return;
+      }
+    } else {
+      if (!customer || !hostname || !ipAddress) {
+        setError("顧客・ホスト名・IPアドレスは必須です");
+        return;
+      }
+      if (!rawText.trim()) {
+        setError("ファイルをドロップまたは内容を入力してください");
+        return;
+      }
     }
     setSubmitting(true);
     try {
@@ -157,22 +167,41 @@ export function UploadPage() {
         </button>
       </div>
       <h1 className="mb-4 text-xl font-semibold text-slate-900">
-        コンフィグのアップロード
-        {params.get("hostname") && (
+        {isSpare ? "予備機の登録" : "コンフィグのアップロード"}
+        {!isSpare && params.get("hostname") && (
           <span className="ml-2 text-base font-normal text-slate-600">
             既存機器への新世代追加
           </span>
         )}
       </h1>
-      <p className="mb-4 text-sm text-slate-600">
-        ファイルをドラッグ&ドロップで登録します。コメント行・空白行・末尾空白は
-        サーバー側で除去されたうえで世代管理されます。
-        {params.get("hostname") && (
-          <span className="ml-1 text-blue-700">
-            識別情報は選択中の機器から引き継いでいます。
-          </span>
-        )}
-      </p>
+      {isSpare ? (
+        <p className="mb-4 text-sm text-slate-600">
+          予備機（故障時の差し替え用機材）を登録します。
+          <span className="text-blue-700">シリアル番号のみ必須</span>
+          で、ホスト名・IPアドレス・コンフィグは任意です。コンフィグは後から
+          「新世代アップロード」で追加してもDiffできます。
+        </p>
+      ) : (
+        <p className="mb-4 text-sm text-slate-600">
+          ファイルをドラッグ&ドロップで登録します。コメント行・空白行・末尾空白は
+          サーバー側で除去されたうえで世代管理されます。
+          {params.get("hostname") && (
+            <span className="ml-1 text-blue-700">
+              識別情報は選択中の機器から引き継いでいます。
+            </span>
+          )}
+        </p>
+      )}
+
+      {/* 予備機モード時、対象機器（本番機）の紐付け先を明示する */}
+      {isSpare && params.get("hostname") && (
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span className="font-semibold">対象機器（本番機）:</span>{" "}
+          {customer} / <span className="mono">{params.get("hostname")}</span>
+          {" — "}
+          同じ顧客・ホスト名で紐づき、登録後に本番機とDiffできます。
+        </div>
+      )}
 
       {/* 自動検出結果パネル */}
       {detected && (detected.vendor || detected.os) && (
@@ -189,29 +218,41 @@ export function UploadPage() {
         <Field label="顧客 *">
           <input value={customer} onChange={(e) => setCustomer(e.target.value)} className={inputCls} />
         </Field>
-        <Field label="ホスト名 *" auto={autoHost}>
+        <Field label={isSpare ? "ホスト名" : "ホスト名 *"} auto={autoHost}>
           <input
             value={hostname}
             onChange={(e) => {
               setHostname(e.target.value);
               setAutoHost(false);
             }}
-            placeholder={detected ? "検出できませんでした。入力してください" : "例: RTR-01"}
+            placeholder={
+              isSpare
+                ? "任意（対象機器から引き継ぎ）"
+                : detected
+                  ? "検出できませんでした。入力してください"
+                  : "例: RTR-01"
+            }
             className={inputCls}
           />
         </Field>
-        <Field label="IPアドレス *" auto={autoIp}>
+        <Field label={isSpare ? "IPアドレス" : "IPアドレス *"} auto={autoIp}>
           <input
             value={ipAddress}
             onChange={(e) => {
               setIpAddress(e.target.value);
               setAutoIp(false);
             }}
-            placeholder={detected ? "検出できませんでした。入力してください" : "例: 10.0.0.1"}
+            placeholder={
+              isSpare
+                ? "任意"
+                : detected
+                  ? "検出できませんでした。入力してください"
+                  : "例: 10.0.0.1"
+            }
             className={inputCls}
           />
         </Field>
-        <Field label="シリアル番号">
+        <Field label={isSpare ? "シリアル番号 *" : "シリアル番号"}>
           <input value={serialNumber} onChange={(e) => setSerialNumber(e.target.value)} placeholder="例: FCHXXXXX" className={inputCls} />
         </Field>
         <Field label="用途">
@@ -263,6 +304,7 @@ export function UploadPage() {
         ) : (
           <p className="text-sm text-slate-500">
             ここにファイルをドラッグ&ドロップ、またはクリックして選択
+            {isSpare && <span className="text-blue-600">（任意）</span>}
             <br />
             <span className="text-xs">(.conf / .cfg / .txt / .log / .bin)</span>
           </p>

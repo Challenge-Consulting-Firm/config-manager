@@ -137,7 +137,7 @@ export function DevicesPage() {
                     </Link>
                   </td>
                   <td className="px-4 py-2 mono">{d.identifiers.hostname}</td>
-                  <td className="px-4 py-2 mono">{d.identifiers.ipAddress}</td>
+                  <td className="px-4 py-2 mono">{d.identifiers.ipAddress || "—"}</td>
                   <td className="px-4 py-2 mono text-xs text-slate-600">{d.identifiers.serialNumber || "—"}</td>
                   <td className="px-4 py-2">{d.identifiers.purpose}</td>
                   <td className="px-4 py-2 text-right mono">#{d.latestGeneration}</td>

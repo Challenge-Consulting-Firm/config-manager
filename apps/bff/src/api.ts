@@ -316,8 +316,12 @@ api.post("/upload", async (c) => {
   const note = typeof payload.note === "string" ? payload.note : undefined;
   const role: Role = payload.role === "spare" ? "spare" : "production";
   const serialNumber = textField(payload.serialNumber);
+  const isSpare = role === "spare";
 
-  if (!body || body.trim().length === 0) {
+  // 予備機（故障時の差し替え用機材）は登録時点でホスト名・IP が未割当だったり、
+  // コンフィグを未投入だったりするため、シリアル番号のみ必須にする。本番機は
+  // 従来どおりコンフィグ本文が必須。
+  if (!isSpare && (!body || body.trim().length === 0)) {
     return c.json({ error: "body is empty" }, 400);
   }
 
@@ -328,7 +332,15 @@ api.post("/upload", async (c) => {
   const hostname = inputHostname || detected.hostname || "";
   const ipAddress = inputIpAddress || detected.ipAddress || "";
 
-  if (!customer || !hostname || !ipAddress) {
+  if (isSpare) {
+    // 予備機はシリアル番号で識別する。顧客も紐付け（本番機との比較）に必要。
+    if (!customer || !serialNumber) {
+      return c.json(
+        { error: "customer and serialNumber are required for spare", detected },
+        400,
+      );
+    }
+  } else if (!customer || !hostname || !ipAddress) {
     return c.json(
       {
         error: "customer, hostname, ipAddress are required",
