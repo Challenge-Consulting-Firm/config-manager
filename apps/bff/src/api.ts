@@ -69,6 +69,11 @@ import type {
 import { fetchMerakiConfig } from "./meraki.js";
 import { requireRole } from "./rbac.js";
 import { rateLimit } from "./rateLimit.js";
+import { publicErrorMessage } from "./httpErrors.js";
+import {
+  formatDestructiveDetail,
+  watchDestructiveBurst,
+} from "./auditGuard.js";
 
 interface Env {
   Variables: {
@@ -646,8 +651,16 @@ api.post(
       sectionConcurrency: cfg.meraki.sectionConcurrency,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return c.json({ error: "Meraki API 取得失敗: " + msg }, 502);
+    return c.json(
+      {
+        error: publicErrorMessage(
+          err,
+          cfg.nodeEnv,
+          "Meraki API 取得失敗",
+        ),
+      },
+      502,
+    );
   }
   const { dump } = fetchResult;
   const summary = summarizeMerakiImport(dump);
@@ -935,16 +948,28 @@ api.post("/meraki/credentials", requireRole("admin"), async (c) => {
       defaultHostname: payload.defaultHostname?.trim() || undefined,
       memo: payload.memo?.trim() || undefined,
     });
+    const actor = c.var.user.email || c.var.user.displayName;
+    const burst = watchDestructiveBurst(actor, "credential.create");
     await writeAudit(cfg, {
       operator: c.var.user.displayName,
       operatorEmail: c.var.user.email,
       action: "upload",
-      detail: `Meraki 接続情報を登録: ${created.label} (network=${created.networkId})`,
+      detail: formatDestructiveDetail({
+        kind: "credential.create",
+        summary: `Meraki 接続情報を登録: ${created.label}`,
+        attrs: {
+          network: created.networkId,
+          id: created.id,
+          alert: burst.alerted ? "burst" : undefined,
+        },
+      }),
     });
     return c.json({ credential: { ...created, apiKey: maskApiKey(created.apiKey) } }, 201);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `登録失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "登録失敗") },
+      500,
+    );
   }
 });
 
@@ -978,11 +1003,20 @@ api.put("/meraki/credentials/:id", requireRole("admin"), async (c) => {
       defaultHostname: payload.defaultHostname?.trim(),
       memo: payload.memo?.trim(),
     });
+    const actor = c.var.user.email || c.var.user.displayName;
+    const burst = watchDestructiveBurst(actor, "credential.update");
     await writeAudit(cfg, {
       operator: c.var.user.displayName,
       operatorEmail: c.var.user.email,
       action: "upload",
-      detail: `Meraki 接続情報を更新: id=${id}`,
+      detail: formatDestructiveDetail({
+        kind: "credential.update",
+        summary: `Meraki 接続情報を更新`,
+        attrs: {
+          id,
+          alert: burst.alerted ? "burst" : undefined,
+        },
+      }),
     });
     const refreshed = await getMerakiCredential(cfg, id);
     return c.json({
@@ -991,8 +1025,10 @@ api.put("/meraki/credentials/:id", requireRole("admin"), async (c) => {
         : null,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `更新失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "更新失敗") },
+      500,
+    );
   }
 });
 
@@ -1006,16 +1042,28 @@ api.delete("/meraki/credentials/:id", requireRole("admin"), async (c) => {
   if (!existing) return c.json({ error: "not found" }, 404);
   try {
     await deleteMerakiCredential(cfg, id);
+    const actor = c.var.user.email || c.var.user.displayName;
+    const burst = watchDestructiveBurst(actor, "credential.delete");
     await writeAudit(cfg, {
       operator: c.var.user.displayName,
       operatorEmail: c.var.user.email,
       action: "delete",
-      detail: `Meraki 接続情報を削除: ${existing.label} (network=${existing.networkId})`,
+      detail: formatDestructiveDetail({
+        kind: "credential.delete",
+        summary: `Meraki 接続情報を削除: ${existing.label}`,
+        attrs: {
+          network: existing.networkId,
+          id,
+          alert: burst.alerted ? "burst" : undefined,
+        },
+      }),
     });
     return c.json({ ok: true });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `削除失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "削除失敗") },
+      500,
+    );
   }
 });
 
@@ -1113,8 +1161,10 @@ api.put("/versions/:id", requireRole("operator"), async (c) => {
   try {
     await updateVersionMeta(cfg, id, update);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `更新失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "更新失敗") },
+      500,
+    );
   }
 
   // 変更内容を監査ログへ。どのフィールドが変わったかを detail に記録。
@@ -1147,10 +1197,14 @@ api.delete("/versions/:id", requireRole("admin"), async (c) => {
   try {
     await deleteVersion(cfg, id);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `削除失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "削除失敗") },
+      500,
+    );
   }
 
+  const actor = c.var.user.email || c.var.user.displayName;
+  const burst = watchDestructiveBurst(actor, "version.delete");
   await writeAudit(cfg, {
     operator: c.var.user.displayName,
     operatorEmail: c.var.user.email,
@@ -1158,7 +1212,14 @@ api.delete("/versions/:id", requireRole("admin"), async (c) => {
     customer: ids.customer,
     hostname: ids.hostname,
     generation,
-    detail: `世代 #${generation} を削除 (id=${id})`,
+    detail: formatDestructiveDetail({
+      kind: "version.delete",
+      summary: `世代 #${generation} を削除`,
+      attrs: {
+        id,
+        alert: burst.alerted ? "burst" : undefined,
+      },
+    }),
   });
 
   return c.json({ ok: true });
@@ -1189,10 +1250,14 @@ api.delete("/devices/:key", requireRole("admin"), async (c) => {
   try {
     await deleteVersions(cfg, ids);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `削除失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "削除失敗") },
+      500,
+    );
   }
 
+  const actor = c.var.user.email || c.var.user.displayName;
+  const burst = watchDestructiveBurst(actor, "device.delete");
   await writeAudit(cfg, {
     operator: c.var.user.displayName,
     operatorEmail: c.var.user.email,
@@ -1200,7 +1265,16 @@ api.delete("/devices/:key", requireRole("admin"), async (c) => {
     customer,
     hostname,
     generation: 0,
-    detail: `機器を一括削除: ${hostname} (ip=${ipAddress || "-"}, role=${role || "-"}) — 全 ${ids.length} 世代`,
+    detail: formatDestructiveDetail({
+      kind: "device.delete",
+      summary: `機器を一括削除: ${hostname}`,
+      attrs: {
+        ip: ipAddress || "-",
+        role: role || "-",
+        generations: ids.length,
+        alert: burst.alerted ? "burst" : undefined,
+      },
+    }),
   });
 
   return c.json({ ok: true, deletedCount: ids.length });

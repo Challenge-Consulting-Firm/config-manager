@@ -132,6 +132,8 @@ fly secrets set --app config-manager AUTH_MODE=oidc
 fly secrets set --app config-manager NODE_ENV=production
 fly secrets set --app config-manager PUBLIC_BASE_URL=https://config-manager.fly.dev
 fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
+# Meraki 接続情報アプリを使う場合は API キー暗号化鍵も設定（推奨）
+fly secrets set --app config-manager CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
 # Entra ID
 fly secrets set --app config-manager ENTRA_TENANT_ID=00000000-0000-0000-0000-000000000000
@@ -246,8 +248,9 @@ fly secrets unset --app config-manager OBSOLETE_KEY
 
 - **`.env` はリポジトリに commit しないでください** (`.gitignore` 済み)
 - **シークレット値を Slack・メール・PR 本文に貼らないでください**
-- Meraki 接続情報アプリに保存した API キーは **Kintone 上に平文で保存** されます。fly.io シークレットとは別管理のため、Kintone アプリの閲覧権限設計にご注意ください (README F 参照)
+- Meraki 接続情報アプリの API キーは `CREDENTIALS_ENCRYPTION_KEY` 設定時に AES-256-GCM で暗号化して Kintone へ保存します（詳細は [`SECURITY.md`](./SECURITY.md)）。鍵未設定時のみ平文になるため、本番では必ず設定してください
 - `SESSION_SECRET` を変更すると、全ユーザーのセッションが無効化されます (再ログインが必要)
+- `CREDENTIALS_ENCRYPTION_KEY` を紛失・変更すると、既存の暗号化済み API キーは復号できなくなります（再登録が必要）
 
 ---
 
@@ -340,10 +343,11 @@ curl https://config-manager.fly.dev/healthz
 
 | シークレット | ローテーション頻度 | 備考 |
 | --- | --- | --- |
-| `SESSION_SECRET` | 年 1 回程度 | 変更すると全ユーザーが再ログイン必要 |
+| `SESSION_SECRET` | 年 1 回程度 | 変更すると全ユーザーが再ログイン必要。32 文字以上必須 |
+| `CREDENTIALS_ENCRYPTION_KEY` | 年 1 回程度（計画的に） | 変更前に既存 credential の再登録計画が必要。手順は SECURITY.md |
 | `ENTRA_CLIENT_SECRET` | Entra ID 側の推奨に従う (既定 6 ヶ月または 1 年) | Azure Portal から再生成 |
 | `MERAKI_API_KEY` | Meraki Dashboard 側の推奨に従う | 場合によっては接続情報アプリ側も更新 |
-| Meraki 接続情報アプリ内の API キー | 必要に応じて | **fly secrets ではなく Kintone 側で管理**・接続情報ページから更新 |
+| Meraki 接続情報アプリ内の API キー | 必要に応じて | **fly secrets ではなく Kintone 側で管理**（暗号化済み）・接続情報ページから更新 |
 
 ---
 
