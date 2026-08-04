@@ -1226,7 +1226,24 @@ api.get("/search", async (c) => {
   const q = c.req.query("q")?.trim() ?? "";
   const scopeParam = c.req.query("scope");
   const scope: "latest" | "all" = scopeParam === "all" ? "all" : "latest";
-  const isRegex = c.req.query("regex") === "1";
+  // User-supplied RegExp is a ReDoS vector (catastrophic backtracking on large
+  // config bodies). Regex mode is disabled until a safe engine / timeout is in
+  // place; literal substring search remains the supported path.
+  const requestedRegex = c.req.query("regex") === "1";
+  if (requestedRegex) {
+    return c.json(
+      {
+        error:
+          "regex search is disabled for security reasons; use a literal substring query instead",
+      },
+      400,
+    );
+  }
+  const isRegex = false;
+  // Cap query length so a multi-kilobyte paste cannot blow up escape + scan cost.
+  if (q.length > 200) {
+    return c.json({ error: "query too long (max 200 characters)" }, 400);
+  }
   const maxPerVersion = Math.min(
     Number.parseInt(c.req.query("maxPerVersion") ?? "30", 10) || 30,
     200,
@@ -1247,12 +1264,8 @@ api.get("/search", async (c) => {
     });
   }
 
-  let pattern: RegExp;
-  try {
-    pattern = isRegex ? new RegExp(q, "i") : new RegExp(escapeRegExp(q), "i");
-  } catch {
-    return c.json({ error: "invalid regex pattern" }, 400);
-  }
+  // Always treat the query as a literal substring (case-insensitive).
+  const pattern = new RegExp(escapeRegExp(q), "i");
 
   const records = await listConfigRecords(cfg, recordLimit);
 

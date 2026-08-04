@@ -29,7 +29,11 @@ import {
   toAuthUser,
 } from "./entra.js";
 import { api, type AppEnv } from "./api.js";
-import type { AuthUser } from "@config-manager/shared";
+import {
+  createCsrfOriginGuard,
+  securityHeaders,
+} from "./security.js";
+import { safeReturnPath, type AuthUser } from "@config-manager/shared";
 
 const cfg = loadConfig();
 // Resolve the SPA directory relative to THIS module so it works regardless of
@@ -56,6 +60,17 @@ app.use(logger());
 // Cap request bodies at 6 MB so a 5 MB config upload (plus JSON/headers)
 // is accepted but runaway payloads are rejected early with HTTP 413.
 app.use("*", bodyLimit({ maxSize: 6 * 1024 * 1024 }));
+// Baseline security headers on every response (CSP, XFO, nosniff, …).
+app.use("*", securityHeaders);
+// CSRF defense for state-changing /api/* and /auth/* requests: require a
+// matching Origin/Referer. Complements SameSite cookie attributes.
+app.use(
+  "*",
+  createCsrfOriginGuard({
+    publicBaseUrl: cfg.publicBaseUrl,
+    nodeEnv: cfg.nodeEnv,
+  }),
+);
 
 // 末捕獲例外のフォーマットを統一する。/api/* へのリクエストでは JSON を返し、
 // それ以外 (SPA fallback 等) ではプレーンテキストを返す。これにより、ハンドラ内で
@@ -95,12 +110,9 @@ app.get("/auth/login", async (c) => {
   const state = createPkce().verifier; // reuse as opaque state token
   session.set("pkceVerifier", pkce.verifier);
   session.set("oauthState", state);
-  const returnTo = c.req.query("returnTo") || "/";
-  if (!returnTo.startsWith("/")) {
-    session.set("returnTo", "/");
-  } else {
-    session.set("returnTo", returnTo);
-  }
+  // Reject protocol-relative (//evil) and absolute URLs. Same rule as the SPA
+  // (`safeReturnPath` in @config-manager/shared).
+  session.set("returnTo", safeReturnPath(c.req.query("returnTo")));
   await session.save();
   const url = await buildAuthUrl(cfg, pkce, state);
   return c.redirect(url);
@@ -143,6 +155,9 @@ app.get("/auth/callback", async (c) => {
     }
 
     session.set("user", user);
+    // Capture returnTo BEFORE clearTransient(), which deletes it. Re-sanitize
+    // defensively in case an older cookie still holds a pre-hardening value.
+    const returnTo = safeReturnPath(session.get("returnTo"));
     // We intentionally do NOT store the access/refresh tokens in the cookie
     // session: they are only needed for the optional group-membership check
     // above, and storing them bloats the encrypted cookie past the 4 KiB
@@ -151,7 +166,6 @@ app.get("/auth/callback", async (c) => {
     // session store instead of expanding the cookie.
     session.clearTransient();
     await session.save();
-    const returnTo = session.get("returnTo") || "/";
     // IMPORTANT: return an HTML interstitial that does a same-origin client-side
     // redirect, instead of a 302. When the OIDC callback arrives via a
     // cross-site redirect from login.microsoftonline.com, browsers (Chrome on
@@ -161,11 +175,12 @@ app.get("/auth/callback", async (c) => {
     // 200 HTML page first lets the Set-Cookie land in a same-origin response,
     // and the subsequent navigation is a normal same-origin request that
     // carries the cookie.
+    // No inline <script>: Content-Security-Policy is script-src 'self' only.
+    // meta refresh + a plain link are enough for the same-origin handoff.
     return c.html(
       `<!doctype html><html><head><meta charset="utf-8">` +
         `<title>Logging in…</title>` +
-        `<meta http-equiv="refresh" content="0; url=${escapeHtml(returnTo)}">` +
-        `<script>location.replace(${JSON.stringify(returnTo)});</script>` +
+        `<meta http-equiv="refresh" content="0;url=${escapeHtml(returnTo)}">` +
         `</head><body>` +
         `<p>ログインしました。続行中…</p>` +
         `<p><a href="${escapeHtml(returnTo)}">進む</a></p>` +
@@ -269,8 +284,8 @@ serve(
 );
 
 /** Minimal HTML escaper for interpolating user-controllable paths into the
- *  OIDC callback interstitial page. `returnTo` is constrained to start with
- *  `/` by /auth/login, but we still escape defensively. */
+ *  OIDC callback interstitial page. `returnTo` is sanitized by safeReturnPath
+ *  (single-slash app-relative only), but we still escape defensively. */
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
