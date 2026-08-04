@@ -212,7 +212,7 @@ cp .env.example .env
 
 | 変数 | 説明 |
 | --- | --- |
-| `AUTH_MODE` | `disabled` で Entra ID をバイパス（ローカル検証用）。本番は `oidc` |
+| `AUTH_MODE` | `disabled` で Entra ID をバイパス（**ローカル検証専用**）。`NODE_ENV=production` では起動失敗する。本番は必ず `oidc` |
 | `LOCAL_DEV_USER_NAME` / `LOCAL_DEV_USER_EMAIL` | `AUTH_MODE=disabled` 時に記録されるダミー作業者 |
 | `KINTONE_DOMAIN` | `xxx.cybozu.com` |
 | `KINTONE_CONFIG_APP_ID` / `KINTONE_CONFIG_APP_TOKEN` | コンフィグ管理アプリ |
@@ -234,7 +234,7 @@ docker build -t cm-local .
 docker run --rm -p 3000:3000 --env-file .env cm-local
 ```
 
-ブラウザで http://localhost:3000 を開きます。`AUTH_MODE=disabled` ならログイン不要で、ダミーユーザーとして操作できます。コンフィグのアップロード・Diff 表示を試せます。
+ブラウザで http://localhost:3000 を開きます。`AUTH_MODE=disabled` ならログイン不要で、ダミーユーザーとして操作できます（**本番では使用禁止**。`NODE_ENV=production` と同時指定すると BFF は起動しません）。コンフィグのアップロード・Diff 表示を試せます。
 
 #### C-2. 開発サーバで検証（HMR を使う場合）
 

@@ -84,13 +84,23 @@ export function loadConfig(): AppConfig {
   if (cached) return cached;
   const publicBaseUrl = optional("PUBLIC_BASE_URL", "http://localhost:3000");
   const domain = required("KINTONE_DOMAIN");
+  const nodeEnv = optional("NODE_ENV", "development");
   const authMode: AuthMode =
     optional("AUTH_MODE", "oidc") === "disabled" ? "disabled" : "oidc";
+  // AUTH_MODE=disabled bypasses Entra ID entirely. That is convenient for local
+  // validation but catastrophic if it ever reaches production, so refuse to
+  // boot when NODE_ENV=production.
+  if (authMode === "disabled" && nodeEnv === "production") {
+    throw new Error(
+      "AUTH_MODE=disabled is not allowed when NODE_ENV=production. " +
+        "Set AUTH_MODE=oidc (and configure ENTRA_* / SESSION_SECRET) for production.",
+    );
+  }
   // Entra ID + session secret are only required for the OIDC flow.
   const entraRequired = authMode !== "disabled";
   const cfg: AppConfig = {
     port: int("PORT", 3000),
-    nodeEnv: optional("NODE_ENV", "development"),
+    nodeEnv,
     publicBaseUrl,
     authMode,
     localDevUser: {

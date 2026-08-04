@@ -9,7 +9,6 @@ type Scope = "latest" | "all";
 export function SearchPage() {
   const [q, setQ] = useState("");
   const [scope, setScope] = useState<Scope>("latest");
-  const [isRegex, setIsRegex] = useState(false);
   const [result, setResult] = useState<ConfigSearchResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,10 +20,11 @@ export function SearchPage() {
     setLoading(true);
     setError(null);
     try {
+      // regex=1 is rejected by the BFF (ReDoS). Always send literal mode.
       const params = new URLSearchParams({
         q: query,
         scope,
-        regex: isRegex ? "1" : "0",
+        regex: "0",
       });
       const res = await apiFetch<ConfigSearchResult>(`/api/search?${params}`);
       setResult(res);
@@ -42,15 +42,17 @@ export function SearchPage() {
         コンフィグ全文検索
       </h1>
       <p className="mb-4 text-sm text-slate-600">
-        全機器のコンフィグ本文を対象に、指定した文字列／正規表現を含む行を検索します。
+        全機器のコンフィグ本文を対象に、指定した文字列を含む行を検索します（部分一致・大文字小文字無視）。
         スコープ「最新のみ」は各機器の最新世代のみ、「全世代」は履歴含めて全世代を走査します。
+        正規表現検索はセキュリティ上の理由で無効化しています。
       </p>
 
       <form onSubmit={runSearch} className="mb-4 flex flex-wrap items-center gap-2">
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder={isRegex ? "正規表現（例: access-list\\s+101）" : "検索文字列（例: access-list 101）"}
+          placeholder="検索文字列（例: access-list 101）"
+          maxLength={200}
           className="flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm"
           autoFocus
         />
@@ -70,14 +72,6 @@ export function SearchPage() {
             </button>
           ))}
         </div>
-        <label className="flex items-center gap-1 text-sm text-slate-700">
-          <input
-            type="checkbox"
-            checked={isRegex}
-            onChange={(e) => setIsRegex(e.target.checked)}
-          />
-          正規表現
-        </label>
         <button
           type="submit"
           disabled={loading || !q.trim()}
