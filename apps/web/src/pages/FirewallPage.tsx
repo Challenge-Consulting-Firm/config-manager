@@ -200,7 +200,7 @@ export function FirewallPage() {
       {!loading && !error && filtered.length === 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800">
           {rules.length === 0
-            ? "このコンフィグからFWポリシー/ACLを抽出できませんでした。対応形式（Cisco ACL/ASA、Juniperフィルタ、Fortinetポリシー、YAMAHA ip filter）のコンフィグか確認してください。"
+            ? "このコンフィグからFWポリシー/ACLを抽出できませんでした。対応形式（Cisco ACL/ASA、Juniperフィルタ、Fortinetポリシー、YAMAHA ip filter / SWX access-list）のコンフィグか確認してください。"
             : categoryFiltered.length === 0
               ? `${categoryLabel(category)} はありません。`
               : "条件に一致するルールがありません。"}

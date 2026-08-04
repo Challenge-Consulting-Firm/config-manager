@@ -27,7 +27,7 @@ Kintone の API トークンをブラウザに晒さないため、fly.io 上の
 - ドラッグ & ドロップでアップロード（`.conf` / `.cfg` / `.txt` / `.log`）。
 - アップロード時に **コメント行・空白行・末尾空白** を除去して SHA-256 を計算し、実質的な変更だけを世代として残す。
 - Web 上で任意の 2 世代を Diff 表示（サイドバイサイド、`+/-` 表示、パッチ形式でダウンロード可）。
-- **FWポリシー / ACL マトリクス**：コンフィグからFWルール・ACLを抽出し、一覧表示・送信元×継承先マトリクス表示・Excel/CSV出力が可能（Cisco IOS/IOS-XE/NX-OS/ASA、Juniper、Fortinet、YAMAHA に対応）。
+- **FWポリシー / ACL マトリクス**：コンフィグからFWルール・ACLを抽出し、一覧表示・送信元×宛先マトリクス表示・Excel/CSV出力が可能（Cisco IOS/IOS-XE/NX-OS/ASA、Juniper、Fortinet、YAMAHA RT `ip filter` / SWX `access-list` に対応）。
 - **ルーティングテーブル可視化**：コンフィグからスタティックルート・接続インターフェース・OSPF/BGP サマリを抽出し、ルート一覧・プロトコル别マトリクス表示・Excel/CSV出力が可能。Excel出力には「Routes」「Matrix」「Protocol Summary」の 3 シートが含まれます。
 - **Meraki 設定の取得（MR/MX/MS）**：Meraki Dashboard API からネットワーク単位で設定を取得し、既存の世代管理に保存します。ネットワーク ID と API キーを入力するだけで、MX（appliance）/ MS（switch）/ MR（wireless）の VLAN・FW・ポート・SSID・ルーティング等を一括取得してテキスト化し、手動アップロードと同じく世代比較・FW抽出・履歴管理が利用できます。**接続情報（ネットワーク ID + API キー）は複数登録して再利用可能**。
 - 識別子として **顧客・IPアドレス・ホスト名・用途・シリアル番号・稼働区分（本番/予備）** を持つ。

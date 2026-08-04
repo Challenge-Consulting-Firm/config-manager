@@ -2,8 +2,8 @@
  * Firewall / ACL rule extraction.
  *
  * Vendor-specific syntaxes (Cisco IOS/IOS-XE/NX-OS ACLs, Cisco ASA access-lists,
- * Juniper Junos firewall filters, Fortinet FortiOS policies, YAMAHA ip filter)
- * are parsed into a common {@link FirewallRule} shape.
+ * Juniper Junos firewall filters, Fortinet FortiOS policies, YAMAHA ip filter /
+ * SWX access-list) are parsed into a common {@link FirewallRule} shape.
  *
  * Extraction is best-effort: complex constructs (object-groups, address books,
  * nested policies) are kept as-is (the group name appears literally in the
@@ -33,7 +33,9 @@ export interface FirewallCache {
 // version invalidates older caches (notably Meraki records that cached an empty
 // ruleset before this parser existed) so they recompute on next read.
 // v5: Yamaha SWX management-plane ACL extraction (`<svc>-server access`).
-export const FIREWALL_CACHE_VERSION = 5;
+// v6: Yamaha SWX data-plane ACL extraction (`access-list` IPv4/IPv6/MAC +
+//     access-group / vlan filter bindings).
+export const FIREWALL_CACHE_VERSION = 6;
 
 /** Serialize rules to a compact JSON string for storage. */
 export function serializeFirewallRules(
@@ -858,7 +860,255 @@ function extractFortinetDosPolicies(lines: string[], vendor: string): FirewallRu
   return rules;
 }
 
-// ----- YAMAHA ip filter -----
+// ----- YAMAHA ip filter / SWX access-list -----
+
+/** Classify a Yamaha SWX numeric ACL id by the reserved ranges:
+ *    1-2000    IPv4
+ *    2001-3000 MAC
+ *    3001-4000 IPv6
+ *  Returns empty for anything outside those ranges. */
+function yamahaSwxAclKind(id: number): "ipv4" | "ipv6" | "mac" | "" {
+  if (id >= 1 && id <= 2000) return "ipv4";
+  if (id >= 2001 && id <= 3000) return "mac";
+  if (id >= 3001 && id <= 4000) return "ipv6";
+  return "";
+}
+
+/** Parse a Yamaha SWX MAC address token set starting at tokens[i]. Forms:
+ *    any | host HHHH.HHHH.HHHH | HHHH.HHHH.HHHH WWWW.WWWW.WWWW */
+function parseYamahaMacAddr(
+  tokens: string[],
+  i: number,
+): AddressSpec {
+  const t = tokens[i] ?? "";
+  if (/^any$/i.test(t)) return { text: "any", consumed: 1 };
+  if (/^host$/i.test(t)) {
+    return { text: tokens[i + 1] ?? "", consumed: 2 };
+  }
+  // MAC + wildcard (e.g. 00A0.DE12.3456 0000.0000.0000).
+  const next = tokens[i + 1] ?? "";
+  if (
+    /^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$/i.test(t) &&
+    /^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$/i.test(next)
+  ) {
+    // Exact host (all-zero wildcard) collapses to bare MAC.
+    if (/^0000\.0000\.0000$/i.test(next)) return { text: t, consumed: 2 };
+    return { text: `${t} ${next}`, consumed: 2 };
+  }
+  if (/^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$/i.test(t)) {
+    return { text: t, consumed: 1 };
+  }
+  return { text: t, consumed: 1 };
+}
+
+/** Collect interface / VLAN bindings for SWX ACLs so the matrix can show
+ *  where each list is applied.
+ *
+ *  Interface form (inside `interface X` blocks):
+ *    access-group <acl-id> in|out
+ *  VLAN form (global):
+ *    vlan access-map NAME
+ *      match access-list <acl-id>
+ *    vlan filter NAME <vlan-id> [in|out]
+ */
+function collectYamahaSwxAclBindings(
+  lines: string[],
+): Map<string, string[]> {
+  const bindings = new Map<string, string[]>();
+  const push = (aclId: string, label: string) => {
+    const list = bindings.get(aclId) ?? [];
+    if (!list.includes(label)) list.push(label);
+    bindings.set(aclId, list);
+  };
+
+  // access-group inside interface blocks. A new top-level directive (or exit)
+  // leaves the interface context; blank / `!` lines keep it so indented
+  // access-group still binds to the last interface.
+  let currentIf = "";
+  for (const raw of lines) {
+    const l = raw.trim();
+    if (!l || l === "!") continue;
+    const ifM = l.match(/^interface\s+(\S+)/i);
+    if (ifM) {
+      currentIf = ifM[1];
+      continue;
+    }
+    if (/^exit\b/i.test(l)) {
+      currentIf = "";
+      continue;
+    }
+    const agM = l.match(/^access-group\s+(\d+)\s+(in|out)\b/i);
+    if (agM && currentIf) {
+      push(agM[1], `${currentIf} ${agM[2].toLowerCase()}`);
+      continue;
+    }
+    // Any other non-indented top-level command ends the interface block.
+    if (currentIf && !/^\s/.test(raw) && !/^access-group\b/i.test(l)) {
+      currentIf = "";
+    }
+  }
+
+  // vlan access-map NAME { match access-list ID } + vlan filter NAME VID [dir]
+  const mapToAcl = new Map<string, string>();
+  let currentMap = "";
+  for (const raw of lines) {
+    const l = raw.trim();
+    const mapM = l.match(/^vlan\s+access-map\s+(\S+)/i);
+    if (mapM) {
+      currentMap = mapM[1];
+      continue;
+    }
+    if (currentMap) {
+      const matchM = l.match(/^match\s+access-list\s+(\d+)\b/i);
+      if (matchM) {
+        mapToAcl.set(currentMap, matchM[1]);
+        continue;
+      }
+      if (/^(exit|end|vlan\s|access-list|interface|hostname)/i.test(l)) {
+        currentMap = "";
+      }
+    }
+  }
+  for (const raw of lines) {
+    const l = raw.trim();
+    const filtM = l.match(
+      /^vlan\s+filter\s+(\S+)\s+(\d+)(?:\s+(in|out))?\b/i,
+    );
+    if (!filtM) continue;
+    const [, mapName, vlanId, dir = "in"] = filtM;
+    const aclId = mapToAcl.get(mapName);
+    if (!aclId) continue;
+    push(aclId, `vlan${vlanId}/${mapName} ${dir.toLowerCase()}`);
+  }
+
+  return bindings;
+}
+
+/** Extract Yamaha SWX data-plane ACLs.
+ *
+ *  Syntax (command reference for SWX3100 / SWX3200 / SWX23xx):
+ *    access-list <1-2000>    [seq] permit|deny PROTO SRC [SPORT] DST [DPORT] [flags]
+ *    access-list <2001-3000> [seq] permit|deny SRC-MAC DST-MAC
+ *    access-list <3001-4000> [seq] permit|deny SRC-IPv6
+ *    access-list <id> description <text>
+ *
+ *  The optional sequence number is the key difference from Cisco numbered
+ *  ACLs; without it, a Cisco-style line body can be reused via
+ *  {@link parseCiscoRuleBody}. */
+function extractYamahaSwxAccessLists(
+  lines: string[],
+  vendor: string,
+): FirewallRule[] {
+  const descriptions = new Map<string, string>();
+  const pending: {
+    name: string;
+    kind: "ipv4" | "ipv6" | "mac";
+    action: "permit" | "deny";
+    protocol: string;
+    source: string;
+    destination: string;
+    port: string;
+    line: number;
+    raw: string;
+  }[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw || /^no\s+/i.test(raw)) continue;
+
+    const descM = raw.match(/^access-list\s+(\d+)\s+description\s+(.+)$/i);
+    if (descM) {
+      descriptions.set(descM[1], descM[2].trim());
+      continue;
+    }
+
+    // Optional seq number between id and action. Reject non-numeric ids so we
+    // never steal Cisco named ACLs if this parser is ever invoked on them.
+    const m = raw.match(
+      /^access-list\s+(\d+)\s+(?:(\d+)\s+)?(permit|deny)\s+(.+)$/i,
+    );
+    if (!m) continue;
+    const [, idStr, _seq, actKw, rest] = m;
+    const id = Number.parseInt(idStr, 10);
+    const kind = yamahaSwxAclKind(id);
+    if (!kind) continue;
+    const action: "permit" | "deny" =
+      actKw.toLowerCase() === "permit" ? "permit" : "deny";
+    const tokens = rest.trim().split(/\s+/).filter(Boolean);
+
+    if (kind === "ipv4") {
+      const body = parseCiscoRuleBody(tokens);
+      if (!body) continue;
+      pending.push({
+        name: idStr,
+        kind,
+        action,
+        ...body,
+        line: i + 1,
+        raw,
+      });
+      continue;
+    }
+
+    if (kind === "ipv6") {
+      // IPv6 ACLs match source only: `deny 3ffe:506::/32` / `permit any`.
+      const src = tokens[0] ?? "any";
+      pending.push({
+        name: idStr,
+        kind,
+        action,
+        protocol: "ipv6",
+        source: src,
+        destination: "any",
+        port: "any",
+        line: i + 1,
+        raw,
+      });
+      continue;
+    }
+
+    // MAC ACL: src-mac dst-mac.
+    const srcMac = parseYamahaMacAddr(tokens, 0);
+    const dstMac = parseYamahaMacAddr(tokens, srcMac.consumed);
+    pending.push({
+      name: idStr,
+      kind,
+      action,
+      protocol: "mac",
+      source: srcMac.text || "any",
+      destination: dstMac.text || "any",
+      port: "any",
+      line: i + 1,
+      raw,
+    });
+  }
+
+  if (pending.length === 0) return [];
+
+  const bindings = collectYamahaSwxAclBindings(lines);
+  return pending.map((p) => {
+    const desc = descriptions.get(p.name);
+    const applied = bindings.get(p.name);
+    const attrParts: string[] = [p.kind];
+    if (applied && applied.length > 0) {
+      attrParts.push(`applied: ${applied.join(", ")}`);
+    }
+    return {
+      vendor,
+      name: p.name,
+      displayName: desc,
+      action: p.action,
+      protocol: p.protocol,
+      source: p.source,
+      destination: p.destination,
+      port: p.port,
+      comments: desc,
+      attributes: attrParts.join("; "),
+      line: p.line,
+      raw: p.raw,
+    };
+  });
+}
 
 function extractYamaha(lines: string[], vendor: string): FirewallRule[] {
   const rules: FirewallRule[] = [];
@@ -912,13 +1162,12 @@ function extractYamaha(lines: string[], vendor: string): FirewallRule[] {
     });
   }
 
-  // Management-plane access controls. SWX switches don't use `ip filter`;
-  // instead each management service restricts access with
-  // `<svc>-server access permit|deny <network>`, and the service itself is
-  // bound to SVIs with `<svc>-server interface vlanN`. We surface each
-  // permit/deny as a policy so the FW view shows who may reach the management
-  // plane. protocol carries the service name (http/telnet/ssh), destination is
-  // the switch itself.
+  // Management-plane access controls. SWX switches restrict management
+  // services with `<svc>-server access permit|deny <network>`, and the
+  // service itself is bound to SVIs with `<svc>-server interface vlanN`.
+  // Surface each permit/deny so the FW view shows who may reach the
+  // management plane. protocol carries the service name (http/telnet/ssh),
+  // destination is the switch itself.
   const MGMT_SVC_RE =
     /^(http|https|telnet|ssh|snmp)(?:-server|-proxy)?\s+access\s+(permit|deny)\s+(\S+)/i;
   for (let i = 0; i < lines.length; i++) {
@@ -939,6 +1188,10 @@ function extractYamaha(lines: string[], vendor: string): FirewallRule[] {
       raw,
     });
   }
+
+  // Data-plane ACLs used by SWX series switches (SWX3100 / SWX3200 / SWX23xx).
+  // Distinct from RT-series `ip filter` and from management-plane access.
+  rules.push(...extractYamahaSwxAccessLists(lines, vendor));
 
   return rules;
 }
@@ -1102,12 +1355,19 @@ function guessVendorFromConfig(lines: string[]): string {
   if (has(/^ip\s+filter\s+\S+\s+(pass|reject)\s+/i)) {
     return "YAMAHA";
   }
-  // SWX switches: `interface port1.N` + (l2ms | vlan database). Their only
-  // access policies are `<svc>-server access` management ACLs.
+  // SWX switches: `interface port1.N` + (l2ms | vlan database). Data-plane
+  // ACLs are numeric `access-list` entries (optionally with a sequence
+  // number) and management services use `<svc>-server access`.
   if (
     has(/^\s*interface\s+port\d+\.\d+/i) &&
     (has(/^\s*l2ms\b/i) || has(/^\s*vlan\s+database\s*$/i))
   ) {
+    return "YAMAHA";
+  }
+  // Bare SWX ACL fragment (change-only uploads without interface/l2ms context).
+  // Require the optional sequence number so we don't steal Cisco numbered
+  // ACLs (`access-list 101 permit ...`) which lack a seq between id and action.
+  if (has(/^access-list\s+\d+\s+\d+\s+(permit|deny)\s+/i)) {
     return "YAMAHA";
   }
   if (has(/^config\s+firewall\s+policy\s*$/i) || has(/^#config-version=/i)) {
