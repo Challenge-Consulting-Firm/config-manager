@@ -43,5 +43,9 @@ RUN pnpm install --prod --frozen-lockfile
 COPY --from=build /app/apps/bff/dist apps/bff/dist
 COPY --from=build /app/apps/bff/public apps/bff/public
 
+# Run as the unprivileged `node` user shipped with the official image so a
+# container breakout does not start with uid 0.
+USER node
+
 EXPOSE 3000
 CMD ["node", "apps/bff/dist/index.js"]

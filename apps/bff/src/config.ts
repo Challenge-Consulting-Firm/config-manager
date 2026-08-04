@@ -3,6 +3,8 @@
  * Throws on missing required values so the process fails fast on boot.
  */
 
+import type { AppRole } from "@config-manager/shared";
+
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
   if (!value || value.length === 0) {
@@ -43,8 +45,15 @@ export interface AppConfig {
     clientId: string;
     clientSecret: string;
     redirectUri: string;
+    /** Admission gate: any of these group IDs is enough to log in. */
     requiredGroupIds: string[];
+    /** RBAC mapping (highest match wins). Empty = every user is admin. */
+    adminGroupIds: string[];
+    operatorGroupIds: string[];
+    viewerGroupIds: string[];
   };
+  /** App role injected for AUTH_MODE=disabled local user. */
+  localDevRole: AppRole;
   sessionSecret: string;
   kintone: {
     domain: string;
@@ -122,7 +131,20 @@ export function loadConfig(): AppConfig {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean),
+      adminGroupIds: optional("ENTRA_GROUP_ADMIN_IDS")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      operatorGroupIds: optional("ENTRA_GROUP_OPERATOR_IDS")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      viewerGroupIds: optional("ENTRA_GROUP_VIEWER_IDS")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     },
+    localDevRole: parseAppRole(optional("LOCAL_DEV_USER_ROLE", "admin")),
     sessionSecret: entraRequired
       ? required("SESSION_SECRET")
       : optional("SESSION_SECRET", "insecure-local-dev-secret-do-not-use-in-prod"),
@@ -154,4 +176,11 @@ export function loadConfig(): AppConfig {
   };
   cached = cfg;
   return cfg;
+}
+
+function parseAppRole(raw: string): AppRole {
+  if (raw === "viewer" || raw === "operator" || raw === "admin") return raw;
+  throw new Error(
+    `LOCAL_DEV_USER_ROLE must be one of viewer|operator|admin (got "${raw}")`,
+  );
 }

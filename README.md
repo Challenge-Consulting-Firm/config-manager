@@ -223,6 +223,8 @@ cp .env.example .env
 | `MERAKI_API_BASE` | Meraki API のベース URL。既定 `https://api.meraki.com/api/v1`。中国リージョン等では要変更 |
 | `MERAKI_TIMEOUT_MS` / `MERAKI_MAX_RETRIES` | Meraki API 呼び出しのタイムアウトと 429 時のリトライ回数 |
 | `ENTRA_*` / `SESSION_SECRET` | `AUTH_MODE=oidc` の時のみ必須 |
+| `ENTRA_GROUP_ADMIN_IDS` / `ENTRA_GROUP_OPERATOR_IDS` / `ENTRA_GROUP_VIEWER_IDS` | 任意。Entra グループ ID による RBAC（admin/operator/viewer）。未設定時は認証ユーザー全員を admin 扱い |
+| `LOCAL_DEV_USER_ROLE` | `AUTH_MODE=disabled` 時のダミーユーザー権限。`viewer` / `operator` / `admin`（既定 `admin`） |
 
 #### C-1. ローカルコンテナで検証（推奨）
 

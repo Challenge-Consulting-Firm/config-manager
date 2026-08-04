@@ -67,6 +67,8 @@ import type {
   WirelessExtraction,
 } from "@config-manager/shared";
 import { fetchMerakiConfig } from "./meraki.js";
+import { requireRole } from "./rbac.js";
+import { rateLimit } from "./rateLimit.js";
 
 interface Env {
   Variables: {
@@ -80,7 +82,7 @@ export type AppEnv = Env;
 
 export const api = new Hono<Env>();
 
-/** GET /api/me — current authenticated user. */
+/** GET /api/me — current authenticated user (includes role). */
 api.get("/me", (c) => c.json(c.var.user));
 
 /** GET /api/devices — list logical devices (grouped from all versions).
@@ -304,7 +306,7 @@ const textField = (value: unknown): string =>
   typeof value === "string" ? value.trim() : "";
 
 /** POST /api/upload — normalize + persist a new config generation. */
-api.post("/upload", async (c) => {
+api.post("/upload", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<UploadBody>().catch(() => null);
   if (!payload) return c.json({ error: "invalid JSON body" }, 400);
@@ -417,7 +419,7 @@ interface PromoteBody {
  *  generation. Used when a spare device is swapped in to replace a failed
  *  production device. The serial number and config body are carried over from
  *  the source (spare) version; the caller supplies the production IP. */
-api.post("/promote", async (c) => {
+api.post("/promote", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<PromoteBody>().catch(() => null);
   if (!payload || !payload.sourceVersionId || !payload.ipAddress) {
@@ -564,7 +566,11 @@ interface MerakiImportDeviceResult {
  *
  *  トランザクション性は持たない：一部デバイスの取り込みに失敗しても、成功
  *  したデバイスは保存し、results 配列で個別結果を返す。 */
-api.post("/meraki/import", async (c) => {
+api.post(
+  "/meraki/import",
+  requireRole("operator"),
+  rateLimit({ name: "meraki-import", limit: 5, windowMs: 60_000 }),
+  async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<MerakiImportBody>().catch(() => null);
   if (!payload) return c.json({ error: "invalid JSON body" }, 400);
@@ -910,7 +916,7 @@ api.get("/meraki/credentials", async (c) => {
   return c.json({ enabled: true, credentials: masked });
 });
 
-api.post("/meraki/credentials", async (c) => {
+api.post("/meraki/credentials", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   if (!isEnabledMerakiCredentials(cfg)) {
     return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
@@ -942,7 +948,7 @@ api.post("/meraki/credentials", async (c) => {
   }
 });
 
-api.put("/meraki/credentials/:id", async (c) => {
+api.put("/meraki/credentials/:id", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   if (!isEnabledMerakiCredentials(cfg)) {
     return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
@@ -990,7 +996,7 @@ api.put("/meraki/credentials/:id", async (c) => {
   }
 });
 
-api.delete("/meraki/credentials/:id", async (c) => {
+api.delete("/meraki/credentials/:id", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   if (!isEnabledMerakiCredentials(cfg)) {
     return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
@@ -1070,7 +1076,7 @@ interface VersionMetaBody {
  *  編集可能なのは purpose / note / serialNumber / customer / hostname /
  *  ipAddress のみ。body・hash・generation・detected は変更不可 (一意性保証)。
  *  誤登録のメタ情報修正や、後からの用途・メモ追加に使う。 */
-api.put("/versions/:id", async (c) => {
+api.put("/versions/:id", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
   const id = c.req.param("id");
   const payload = await c.req.json<VersionMetaBody>().catch(() => null);
@@ -1130,7 +1136,7 @@ api.put("/versions/:id", async (c) => {
  *  誤登録の取り消し用。世代の歯抜けが生じるが、latestGenerationFor は
  *  最大値を追うため重複は発生しない。コンフィグ本文は復元できないため、
  *  UI 側で確認ダイアログを必ず出すこと。 */
-api.delete("/versions/:id", async (c) => {
+api.delete("/versions/:id", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   const id = c.req.param("id");
   const rec = await getVersionRecord(cfg, id);
@@ -1162,7 +1168,7 @@ api.delete("/versions/:id", async (c) => {
  *  する。key は customer|hostname|ipAddress|role（GET /api/devices の id と同形式）。
  *  その識別子に紐づく全世代のコンフィグレコードを削除する。コンフィグ本文は
  *  復元できないため、UI 側で確認ダイアログを必ず出すこと。 */
-api.delete("/devices/:key", async (c) => {
+api.delete("/devices/:key", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   const key = c.req.param("key");
   const [customer, hostname, ipAddress, role] = key.split("|");
@@ -1221,7 +1227,10 @@ function escapeRegExp(input: string): string {
  *  substring query for multi-line text) and returns line-level matches with
  *  one line of context. `scope=latest` restricts to each device's latest
  *  generation so typical impact surveys don't drown in historical noise. */
-api.get("/search", async (c) => {
+api.get(
+  "/search",
+  rateLimit({ name: "search", limit: 10, windowMs: 60_000 }),
+  async (c) => {
   const cfg = c.var.cfg;
   const q = c.req.query("q")?.trim() ?? "";
   const scopeParam = c.req.query("scope");
