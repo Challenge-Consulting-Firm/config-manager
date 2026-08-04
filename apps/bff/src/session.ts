@@ -14,6 +14,8 @@ const COOKIE_NAME = "cm_session";
 
 export interface SessionData {
   user?: AuthUser;
+  /** Opaque id used by the process-local revocation registry (see sessionRegistry). */
+  sid?: string;
   pkceVerifier?: string;
   oauthState?: string;
   returnTo?: string;

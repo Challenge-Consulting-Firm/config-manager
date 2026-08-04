@@ -35,6 +35,11 @@ import {
   securityHeaders,
 } from "./security.js";
 import { resolveRoleFromGroups } from "./rbac.js";
+import {
+  isSessionRevoked,
+  newSessionId,
+  revokeSession,
+} from "./sessionRegistry.js";
 import { safeReturnPath, type AuthUser } from "@config-manager/shared";
 
 const cfg = loadConfig();
@@ -187,6 +192,8 @@ app.get("/auth/callback", async (c) => {
 
     const user = toAuthUser(claims, "Unknown operator", role);
     session.set("user", user);
+    // Opaque sid enables logout revocation without a shared session store.
+    session.set("sid", newSessionId());
     // Capture returnTo BEFORE clearTransient(), which deletes it. Re-sanitize
     // defensively in case an older cookie still holds a pre-hardening value.
     const returnTo = safeReturnPath(session.get("returnTo"));
@@ -194,8 +201,8 @@ app.get("/auth/callback", async (c) => {
     // session: they are only needed for the optional group-membership check
     // above, and storing them bloats the encrypted cookie past the 4 KiB
     // browser limit — the browser then silently drops it, causing a 401 loop.
-    // If a refresh / Graph call becomes necessary later, move to a server-side
-    // session store instead of expanding the cookie.
+    // If a refresh / Graph call becomes necessary later, move to a shared
+    // server-side session store (see docs/SECURITY.md).
     session.clearTransient();
     // Re-seal with SameSite=Lax for the established session (CSRF reduction).
     // The interstitial HTML response is same-origin, so Lax is accepted here.
@@ -230,6 +237,10 @@ app.get("/auth/callback", async (c) => {
 app.get("/auth/logout", async (c) => {
   if (cfg.authMode === "disabled") return c.redirect("/");
   const session = await getSession(c, establishedSessionOpts);
+  // Revoke before destroy so a stolen copy of the cookie cannot outlive logout
+  // for the rest of this process lifetime.
+  const user = session.get("user");
+  revokeSession(session.get("sid"), { email: user?.email });
   session.destroy();
   const postLogoutUri = `${cfg.publicBaseUrl}/`;
   const url =
@@ -243,6 +254,10 @@ app.get("/auth/me", async (c) => {
     return c.json({ authenticated: true, user: localUser });
   }
   const session = await getSession(c, establishedSessionOpts);
+  if (isSessionRevoked(session.get("sid"))) {
+    session.destroy();
+    return c.json({ authenticated: false }, 401);
+  }
   const user = session.get("user");
   if (!user) return c.json({ authenticated: false }, 401);
   // Backfill role for sessions created before RBAC shipped.
@@ -261,6 +276,10 @@ app.use("/api/*", async (c, next) => {
   if (cfg.authMode === "disabled") {
     user = localUser;
   } else {
+    if (isSessionRevoked(session.get("sid"))) {
+      session.destroy();
+      return c.json({ error: "unauthenticated", login: "/auth/login" }, 401);
+    }
     const u = session.get("user");
     if (!u) {
       return c.json({ error: "unauthenticated", login: "/auth/login" }, 401);
@@ -318,6 +337,16 @@ serve(
       console.warn(
         "[startup] ENTRA_GROUP_*_IDS are unset — every authenticated user is treated as admin. " +
           "Set ENTRA_GROUP_ADMIN_IDS / OPERATOR / VIEWER to enable RBAC.",
+      );
+    }
+    if (
+      !cfg.credentialsEncryptionKey &&
+      cfg.kintone.merakiAppId &&
+      cfg.nodeEnv === "production"
+    ) {
+      console.warn(
+        "[startup] CREDENTIALS_ENCRYPTION_KEY is unset while Meraki credentials app is configured. " +
+          "API keys will be stored in plaintext in Kintone. Set the key (openssl rand -base64 32).",
       );
     }
     if (!existsSync(SPA_DIR)) {

@@ -4,6 +4,7 @@
  */
 
 import type { AppRole } from "@config-manager/shared";
+import { parseEncryptionKey } from "./secretCrypto.js";
 
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
@@ -55,6 +56,12 @@ export interface AppConfig {
   /** App role injected for AUTH_MODE=disabled local user. */
   localDevRole: AppRole;
   sessionSecret: string;
+  /**
+   * AES-256 key for encrypting Meraki API keys at rest in Kintone.
+   * null = pass-through (local dev without the secret). Production with the
+   * Meraki credentials app enabled should always set CREDENTIALS_ENCRYPTION_KEY.
+   */
+  credentialsEncryptionKey: Buffer | null;
   kintone: {
     domain: string;
     configAppId: string;
@@ -145,9 +152,10 @@ export function loadConfig(): AppConfig {
         .filter(Boolean),
     },
     localDevRole: parseAppRole(optional("LOCAL_DEV_USER_ROLE", "admin")),
-    sessionSecret: entraRequired
-      ? required("SESSION_SECRET")
-      : optional("SESSION_SECRET", "insecure-local-dev-secret-do-not-use-in-prod"),
+    sessionSecret: loadSessionSecret(entraRequired, nodeEnv),
+    credentialsEncryptionKey: parseEncryptionKey(
+      optional("CREDENTIALS_ENCRYPTION_KEY", ""),
+    ),
     kintone: {
       domain,
       configAppId: required("KINTONE_CONFIG_APP_ID"),
@@ -183,4 +191,34 @@ function parseAppRole(raw: string): AppRole {
   throw new Error(
     `LOCAL_DEV_USER_ROLE must be one of viewer|operator|admin (got "${raw}")`,
   );
+}
+
+/**
+ * SESSION_SECRET must be long enough for iron-session (min 32 chars).
+ * Production / OIDC refuses short or placeholder values so weak seals never ship.
+ */
+function loadSessionSecret(entraRequired: boolean, nodeEnv: string): string {
+  const MIN_LEN = 32;
+  const PLACEHOLDERS = new Set([
+    "change-me-to-a-long-random-string",
+    "insecure-local-dev-secret-do-not-use-in-prod",
+  ]);
+  if (!entraRequired) {
+    return optional(
+      "SESSION_SECRET",
+      "insecure-local-dev-secret-do-not-use-in-prod",
+    );
+  }
+  const secret = required("SESSION_SECRET");
+  if (secret.length < MIN_LEN || PLACEHOLDERS.has(secret)) {
+    throw new Error(
+      `SESSION_SECRET must be a high-entropy secret of at least ${MIN_LEN} characters ` +
+        `(got length=${secret.length}). Generate with: openssl rand -base64 32`,
+    );
+  }
+  // Extra hard fail in production even if someone forces AUTH_MODE=disabled path off.
+  if (nodeEnv === "production" && secret.length < MIN_LEN) {
+    throw new Error("SESSION_SECRET is too short for production");
+  }
+  return secret;
 }
