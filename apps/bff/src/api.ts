@@ -67,6 +67,13 @@ import type {
   WirelessExtraction,
 } from "@config-manager/shared";
 import { fetchMerakiConfig } from "./meraki.js";
+import { requireRole } from "./rbac.js";
+import { rateLimit } from "./rateLimit.js";
+import { publicErrorMessage } from "./httpErrors.js";
+import {
+  formatDestructiveDetail,
+  watchDestructiveBurst,
+} from "./auditGuard.js";
 
 interface Env {
   Variables: {
@@ -80,7 +87,7 @@ export type AppEnv = Env;
 
 export const api = new Hono<Env>();
 
-/** GET /api/me — current authenticated user. */
+/** GET /api/me — current authenticated user (includes role). */
 api.get("/me", (c) => c.json(c.var.user));
 
 /** GET /api/devices — list logical devices (grouped from all versions).
@@ -304,7 +311,7 @@ const textField = (value: unknown): string =>
   typeof value === "string" ? value.trim() : "";
 
 /** POST /api/upload — normalize + persist a new config generation. */
-api.post("/upload", async (c) => {
+api.post("/upload", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<UploadBody>().catch(() => null);
   if (!payload) return c.json({ error: "invalid JSON body" }, 400);
@@ -417,7 +424,7 @@ interface PromoteBody {
  *  generation. Used when a spare device is swapped in to replace a failed
  *  production device. The serial number and config body are carried over from
  *  the source (spare) version; the caller supplies the production IP. */
-api.post("/promote", async (c) => {
+api.post("/promote", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<PromoteBody>().catch(() => null);
   if (!payload || !payload.sourceVersionId || !payload.ipAddress) {
@@ -564,7 +571,11 @@ interface MerakiImportDeviceResult {
  *
  *  トランザクション性は持たない：一部デバイスの取り込みに失敗しても、成功
  *  したデバイスは保存し、results 配列で個別結果を返す。 */
-api.post("/meraki/import", async (c) => {
+api.post(
+  "/meraki/import",
+  requireRole("operator"),
+  rateLimit({ name: "meraki-import", limit: 5, windowMs: 60_000 }),
+  async (c) => {
   const cfg = c.var.cfg;
   const payload = await c.req.json<MerakiImportBody>().catch(() => null);
   if (!payload) return c.json({ error: "invalid JSON body" }, 400);
@@ -640,8 +651,16 @@ api.post("/meraki/import", async (c) => {
       sectionConcurrency: cfg.meraki.sectionConcurrency,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return c.json({ error: "Meraki API 取得失敗: " + msg }, 502);
+    return c.json(
+      {
+        error: publicErrorMessage(
+          err,
+          cfg.nodeEnv,
+          "Meraki API 取得失敗",
+        ),
+      },
+      502,
+    );
   }
   const { dump } = fetchResult;
   const summary = summarizeMerakiImport(dump);
@@ -910,7 +929,7 @@ api.get("/meraki/credentials", async (c) => {
   return c.json({ enabled: true, credentials: masked });
 });
 
-api.post("/meraki/credentials", async (c) => {
+api.post("/meraki/credentials", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   if (!isEnabledMerakiCredentials(cfg)) {
     return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
@@ -929,20 +948,32 @@ api.post("/meraki/credentials", async (c) => {
       defaultHostname: payload.defaultHostname?.trim() || undefined,
       memo: payload.memo?.trim() || undefined,
     });
+    const actor = c.var.user.email || c.var.user.displayName;
+    const burst = watchDestructiveBurst(actor, "credential.create");
     await writeAudit(cfg, {
       operator: c.var.user.displayName,
       operatorEmail: c.var.user.email,
       action: "upload",
-      detail: `Meraki 接続情報を登録: ${created.label} (network=${created.networkId})`,
+      detail: formatDestructiveDetail({
+        kind: "credential.create",
+        summary: `Meraki 接続情報を登録: ${created.label}`,
+        attrs: {
+          network: created.networkId,
+          id: created.id,
+          alert: burst.alerted ? "burst" : undefined,
+        },
+      }),
     });
     return c.json({ credential: { ...created, apiKey: maskApiKey(created.apiKey) } }, 201);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `登録失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "登録失敗") },
+      500,
+    );
   }
 });
 
-api.put("/meraki/credentials/:id", async (c) => {
+api.put("/meraki/credentials/:id", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   if (!isEnabledMerakiCredentials(cfg)) {
     return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
@@ -972,11 +1003,20 @@ api.put("/meraki/credentials/:id", async (c) => {
       defaultHostname: payload.defaultHostname?.trim(),
       memo: payload.memo?.trim(),
     });
+    const actor = c.var.user.email || c.var.user.displayName;
+    const burst = watchDestructiveBurst(actor, "credential.update");
     await writeAudit(cfg, {
       operator: c.var.user.displayName,
       operatorEmail: c.var.user.email,
       action: "upload",
-      detail: `Meraki 接続情報を更新: id=${id}`,
+      detail: formatDestructiveDetail({
+        kind: "credential.update",
+        summary: `Meraki 接続情報を更新`,
+        attrs: {
+          id,
+          alert: burst.alerted ? "burst" : undefined,
+        },
+      }),
     });
     const refreshed = await getMerakiCredential(cfg, id);
     return c.json({
@@ -985,12 +1025,14 @@ api.put("/meraki/credentials/:id", async (c) => {
         : null,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `更新失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "更新失敗") },
+      500,
+    );
   }
 });
 
-api.delete("/meraki/credentials/:id", async (c) => {
+api.delete("/meraki/credentials/:id", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   if (!isEnabledMerakiCredentials(cfg)) {
     return c.json({ error: "Meraki 接続情報アプリが未設定です" }, 503);
@@ -1000,16 +1042,28 @@ api.delete("/meraki/credentials/:id", async (c) => {
   if (!existing) return c.json({ error: "not found" }, 404);
   try {
     await deleteMerakiCredential(cfg, id);
+    const actor = c.var.user.email || c.var.user.displayName;
+    const burst = watchDestructiveBurst(actor, "credential.delete");
     await writeAudit(cfg, {
       operator: c.var.user.displayName,
       operatorEmail: c.var.user.email,
       action: "delete",
-      detail: `Meraki 接続情報を削除: ${existing.label} (network=${existing.networkId})`,
+      detail: formatDestructiveDetail({
+        kind: "credential.delete",
+        summary: `Meraki 接続情報を削除: ${existing.label}`,
+        attrs: {
+          network: existing.networkId,
+          id,
+          alert: burst.alerted ? "burst" : undefined,
+        },
+      }),
     });
     return c.json({ ok: true });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `削除失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "削除失敗") },
+      500,
+    );
   }
 });
 
@@ -1070,7 +1124,7 @@ interface VersionMetaBody {
  *  編集可能なのは purpose / note / serialNumber / customer / hostname /
  *  ipAddress のみ。body・hash・generation・detected は変更不可 (一意性保証)。
  *  誤登録のメタ情報修正や、後からの用途・メモ追加に使う。 */
-api.put("/versions/:id", async (c) => {
+api.put("/versions/:id", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
   const id = c.req.param("id");
   const payload = await c.req.json<VersionMetaBody>().catch(() => null);
@@ -1107,8 +1161,10 @@ api.put("/versions/:id", async (c) => {
   try {
     await updateVersionMeta(cfg, id, update);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `更新失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "更新失敗") },
+      500,
+    );
   }
 
   // 変更内容を監査ログへ。どのフィールドが変わったかを detail に記録。
@@ -1130,7 +1186,7 @@ api.put("/versions/:id", async (c) => {
  *  誤登録の取り消し用。世代の歯抜けが生じるが、latestGenerationFor は
  *  最大値を追うため重複は発生しない。コンフィグ本文は復元できないため、
  *  UI 側で確認ダイアログを必ず出すこと。 */
-api.delete("/versions/:id", async (c) => {
+api.delete("/versions/:id", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   const id = c.req.param("id");
   const rec = await getVersionRecord(cfg, id);
@@ -1141,10 +1197,14 @@ api.delete("/versions/:id", async (c) => {
   try {
     await deleteVersion(cfg, id);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `削除失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "削除失敗") },
+      500,
+    );
   }
 
+  const actor = c.var.user.email || c.var.user.displayName;
+  const burst = watchDestructiveBurst(actor, "version.delete");
   await writeAudit(cfg, {
     operator: c.var.user.displayName,
     operatorEmail: c.var.user.email,
@@ -1152,7 +1212,14 @@ api.delete("/versions/:id", async (c) => {
     customer: ids.customer,
     hostname: ids.hostname,
     generation,
-    detail: `世代 #${generation} を削除 (id=${id})`,
+    detail: formatDestructiveDetail({
+      kind: "version.delete",
+      summary: `世代 #${generation} を削除`,
+      attrs: {
+        id,
+        alert: burst.alerted ? "burst" : undefined,
+      },
+    }),
   });
 
   return c.json({ ok: true });
@@ -1162,7 +1229,7 @@ api.delete("/versions/:id", async (c) => {
  *  する。key は customer|hostname|ipAddress|role（GET /api/devices の id と同形式）。
  *  その識別子に紐づく全世代のコンフィグレコードを削除する。コンフィグ本文は
  *  復元できないため、UI 側で確認ダイアログを必ず出すこと。 */
-api.delete("/devices/:key", async (c) => {
+api.delete("/devices/:key", requireRole("admin"), async (c) => {
   const cfg = c.var.cfg;
   const key = c.req.param("key");
   const [customer, hostname, ipAddress, role] = key.split("|");
@@ -1183,10 +1250,14 @@ api.delete("/devices/:key", async (c) => {
   try {
     await deleteVersions(cfg, ids);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return c.json({ error: `削除失敗: ${msg}` }, 500);
+    return c.json(
+      { error: publicErrorMessage(e, cfg.nodeEnv, "削除失敗") },
+      500,
+    );
   }
 
+  const actor = c.var.user.email || c.var.user.displayName;
+  const burst = watchDestructiveBurst(actor, "device.delete");
   await writeAudit(cfg, {
     operator: c.var.user.displayName,
     operatorEmail: c.var.user.email,
@@ -1194,7 +1265,16 @@ api.delete("/devices/:key", async (c) => {
     customer,
     hostname,
     generation: 0,
-    detail: `機器を一括削除: ${hostname} (ip=${ipAddress || "-"}, role=${role || "-"}) — 全 ${ids.length} 世代`,
+    detail: formatDestructiveDetail({
+      kind: "device.delete",
+      summary: `機器を一括削除: ${hostname}`,
+      attrs: {
+        ip: ipAddress || "-",
+        role: role || "-",
+        generations: ids.length,
+        alert: burst.alerted ? "burst" : undefined,
+      },
+    }),
   });
 
   return c.json({ ok: true, deletedCount: ids.length });
@@ -1221,7 +1301,10 @@ function escapeRegExp(input: string): string {
  *  substring query for multi-line text) and returns line-level matches with
  *  one line of context. `scope=latest` restricts to each device's latest
  *  generation so typical impact surveys don't drown in historical noise. */
-api.get("/search", async (c) => {
+api.get(
+  "/search",
+  rateLimit({ name: "search", limit: 10, windowMs: 60_000 }),
+  async (c) => {
   const cfg = c.var.cfg;
   const q = c.req.query("q")?.trim() ?? "";
   const scopeParam = c.req.query("scope");

@@ -5,8 +5,13 @@ import type {
   Device,
   DeviceIdentifiers,
 } from "@config-manager/shared";
-import { MERAKI_DUMP_HEADER, ROLE_LABELS } from "@config-manager/shared";
+import {
+  hasMinRole,
+  MERAKI_DUMP_HEADER,
+  ROLE_LABELS,
+} from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
+import { useAuth } from "../auth";
 import { RoleBadge } from "../components/RoleBadge";
 
 interface PromoteResult {
@@ -32,6 +37,9 @@ interface DeleteTarget {
 export function DeviceDetailPage() {
   const { key } = useParams<{ key: string }>();
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const canOperate = hasMinRole(user?.role ?? "viewer", "operator");
+  const canAdmin = hasMinRole(user?.role ?? "viewer", "admin");
   const decodedKey = key ? decodeURIComponent(key) : "";
   const [versions, setVersions] = useState<ConfigVersion[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
@@ -267,16 +275,18 @@ export function DeviceDetailPage() {
                 予備機を登録
               </Link>
             )}
-            {/* 機器自体を全世代まとめて削除する。 */}
-            <button
-              onClick={() => {
-                setDeleteDeviceOpen(true);
-                setMetaMsg(null);
-              }}
-              className="rounded-md border border-red-300 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50"
-            >
-              機器を削除
-            </button>
+            {/* 機器自体を全世代まとめて削除する（admin のみ）。 */}
+            {canAdmin && (
+              <button
+                onClick={() => {
+                  setDeleteDeviceOpen(true);
+                  setMetaMsg(null);
+                }}
+                className="rounded-md border border-red-300 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50"
+              >
+                機器を削除
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -311,8 +321,8 @@ export function DeviceDetailPage() {
         </div>
       )}
 
-      {/* 予備→本番 昇格パネル（予備機のときのみ表示） */}
-      {identifiers?.role === "spare" && body && (
+      {/* 予備→本番 昇格パネル（予備機 + operator 以上） */}
+      {canOperate && identifiers?.role === "spare" && body && (
         <div className="mb-4 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm">
           <div className="font-medium text-blue-900">
             本番機へ昇格（この予備機の最新コンフィグを本番として登録）
@@ -408,34 +418,38 @@ export function DeviceDetailPage() {
                   </button>
                   {/* ホバー時に右上にアクションボタンを表示 */}
                   <div className="pointer-events-none absolute right-2 top-1.5 flex gap-1 opacity-0 transition group-hover:opacity-100">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setEditTarget({
-                          id: v.id,
-                          generation: v.generation,
-                          ids: versionIds,
-                        });
-                        setMetaMsg(null);
-                      }}
-                      className="pointer-events-auto rounded border border-slate-300 bg-white px-1.5 py-0.5 text-xs text-slate-700 hover:bg-slate-100"
-                    >
-                      編集
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteTarget({
-                          id: v.id,
-                          generation: v.generation,
-                          ids: versionIds,
-                        });
-                        setMetaMsg(null);
-                      }}
-                      className="pointer-events-auto rounded border border-red-300 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
-                    >
-                      削除
-                    </button>
+                    {canOperate && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditTarget({
+                            id: v.id,
+                            generation: v.generation,
+                            ids: versionIds,
+                          });
+                          setMetaMsg(null);
+                        }}
+                        className="pointer-events-auto rounded border border-slate-300 bg-white px-1.5 py-0.5 text-xs text-slate-700 hover:bg-slate-100"
+                      >
+                        編集
+                      </button>
+                    )}
+                    {canAdmin && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeleteTarget({
+                            id: v.id,
+                            generation: v.generation,
+                            ids: versionIds,
+                          });
+                          setMetaMsg(null);
+                        }}
+                        className="pointer-events-auto rounded border border-red-300 bg-white px-1.5 py-0.5 text-xs text-red-700 hover:bg-red-50"
+                      >
+                        削除
+                      </button>
+                    )}
                   </div>
                 </li>
               );

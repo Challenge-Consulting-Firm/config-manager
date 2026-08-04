@@ -137,34 +137,86 @@ interface IdTokenPayload {
 
 /** Decode (but not signature-verify) an id_token. Signature verification is
  * performed by Entra ID's own token endpoint; for the BFF's session we trust
- * the HTTPS response from the token endpoint. */
+ * the HTTPS response from the token endpoint. Claims (aud/iss/exp/tid) are
+ * still validated via {@link assertIdTokenClaims}. */
 export function decodeIdToken(idToken: string): IdTokenPayload {
   const [, payload] = idToken.split(".");
   if (!payload) throw new Error("Malformed id_token");
   return JSON.parse(base64UrlToBuffer(payload).toString("utf8")) as IdTokenPayload;
 }
 
+/** Clock skew tolerance when checking `exp` (seconds). */
+const CLOCK_SKEW_SEC = 60;
+
+/**
+ * Defence-in-depth checks on id_token claims after a successful token exchange.
+ * Throws on any mismatch so the callback can surface a generic auth failure.
+ */
+export function assertIdTokenClaims(
+  claims: IdTokenPayload,
+  cfg: AppConfig,
+): void {
+  if (claims.aud !== cfg.entra.clientId) {
+    throw new Error(
+      `id_token aud mismatch: got "${claims.aud}", expected "${cfg.entra.clientId}"`,
+    );
+  }
+  const expectedIss = `https://login.microsoftonline.com/${cfg.entra.tenantId}/v2.0`;
+  if (claims.iss !== expectedIss) {
+    throw new Error(
+      `id_token iss mismatch: got "${claims.iss}", expected "${expectedIss}"`,
+    );
+  }
+  if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
+    throw new Error("id_token missing exp claim");
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (claims.exp + CLOCK_SKEW_SEC < nowSec) {
+    throw new Error(
+      `id_token expired: exp=${claims.exp}, now=${nowSec}`,
+    );
+  }
+  if (claims.tid && claims.tid !== cfg.entra.tenantId) {
+    throw new Error(
+      `id_token tid mismatch: got "${claims.tid}", expected "${cfg.entra.tenantId}"`,
+    );
+  }
+}
+
 /** Map an id_token to the AuthUser shape consumed by the frontend. */
-export function toAuthUser(token: IdTokenPayload, displayNameFallback: string): AuthUser {
+export function toAuthUser(
+  token: IdTokenPayload,
+  displayNameFallback: string,
+  role: AuthUser["role"] = "viewer",
+): AuthUser {
   return {
     displayName: token.name ?? token.preferred_username ?? displayNameFallback,
     email: token.email ?? token.preferred_username ?? "",
     tenantId: token.tid,
     objectId: token.oid,
+    role,
   };
 }
 
 /** Look up which group object IDs the user is a member of (transitively).
- *  Used when ENTRA_REQUIRED_GROUP_IDS is configured. */
+ *  Follows @odata.nextLink so tenants with many groups are fully covered. */
 export async function getUserGroups(accessToken: string): Promise<string[]> {
-  // Use the Microsoft Graph /me/transitiveMemberOf endpoint.
-  const res = await fetch(
-    "https://graph.microsoft.com/v1.0/me/transitiveMemberOf?$select=id",
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-  );
-  if (!res.ok) {
-    throw new Error(`Graph /me/transitiveMemberOf failed: ${res.status}`);
+  const ids: string[] = [];
+  let url: string | null =
+    "https://graph.microsoft.com/v1.0/me/transitiveMemberOf?$select=id&$top=999";
+  while (url) {
+    const res: Response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      throw new Error(`Graph /me/transitiveMemberOf failed: ${res.status}`);
+    }
+    const doc = (await res.json()) as {
+      value: Array<{ id: string }>;
+      "@odata.nextLink"?: string;
+    };
+    for (const v of doc.value) ids.push(v.id);
+    url = doc["@odata.nextLink"] ?? null;
   }
-  const doc = (await res.json()) as { value: Array<{ id: string }> };
-  return doc.value.map((v) => v.id);
+  return ids;
 }

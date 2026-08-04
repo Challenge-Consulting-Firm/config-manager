@@ -19,6 +19,39 @@ import type {
   Role,
 } from "@config-manager/shared";
 import { ROLE_LABELS } from "@config-manager/shared";
+import {
+  decryptSecret,
+  encryptSecret,
+  isEncryptedSecret,
+} from "./secretCrypto.js";
+
+/**
+ * Best-effort: when a legacy plaintext api_key is loaded and encryption is
+ * configured, rewrite the Kintone row as ciphertext so the next operator who
+ * merely *reads* a credential also migrates it. Failures are logged only.
+ */
+async function maybeReencryptMerakiApiKey(
+  cfg: AppConfig,
+  id: string,
+  storedRaw: string,
+): Promise<void> {
+  if (!cfg.credentialsEncryptionKey) return;
+  if (!storedRaw || isEncryptedSecret(storedRaw)) return;
+  try {
+    const cipher = encryptSecret(storedRaw, cfg.credentialsEncryptionKey);
+    await kintoneFetch(cfg, cfg.kintone.merakiAppToken, "/record.json", {
+      method: "PUT",
+      body: JSON.stringify({
+        app: cfg.kintone.merakiAppId,
+        id,
+        record: { [F.meraki.apiKey]: { value: cipher } },
+      }),
+    });
+    console.info(`[meraki-cred] re-encrypted plaintext api_key for id=${id}`);
+  } catch (err) {
+    console.error(`[meraki-cred] failed to re-encrypt id=${id}:`, err);
+  }
+}
 
 // ----- Kintone field-code maps (must match the Kintone app definitions) -----
 const F = {
@@ -653,13 +686,22 @@ function merakiAppGuard(cfg: AppConfig): void {
   }
 }
 
-function toMerakiCredential(rec: KintoneRecord): MerakiCredential {
+function toMerakiCredential(
+  rec: KintoneRecord,
+  cfg: AppConfig,
+): MerakiCredential {
   const val = (k: string) => rec[k]?.value ?? "";
+  const storedKey = val(F.meraki.apiKey);
+  // Decrypt at the boundary so callers always see the usable plaintext key.
+  // Legacy plaintext rows pass through and are rewritten asynchronously.
+  const apiKey = decryptSecret(storedKey, cfg.credentialsEncryptionKey);
+  // Fire-and-forget migration; do not await inside the mapper.
+  void maybeReencryptMerakiApiKey(cfg, rec.$id.value, storedKey);
   return {
     id: rec.$id.value,
     label: val(F.meraki.label),
     networkId: val(F.meraki.networkId),
-    apiKey: val(F.meraki.apiKey),
+    apiKey,
     defaultCustomer: val(F.meraki.defaultCustomer) || undefined,
     defaultHostname: val(F.meraki.defaultHostname) || undefined,
     memo: val(F.meraki.memo) || undefined,
@@ -685,7 +727,7 @@ export async function listMerakiCredentials(
       }),
     },
   );
-  return res.records.map(toMerakiCredential);
+  return res.records.map((r) => toMerakiCredential(r, cfg));
 }
 
 /** Meraki 接続情報を 1 件取得する。 */
@@ -705,7 +747,7 @@ export async function getMerakiCredential(
         body: JSON.stringify({ app: cfg.kintone.merakiAppId, id }),
       },
     );
-    return toMerakiCredential(res.record);
+    return toMerakiCredential(res.record, cfg);
   } catch {
     return null;
   }
@@ -724,10 +766,11 @@ export async function createMerakiCredential(
   },
 ): Promise<MerakiCredential> {
   merakiAppGuard(cfg);
+  const storedKey = encryptSecret(args.apiKey, cfg.credentialsEncryptionKey);
   const fields: Record<string, { value: string }> = {
     [F.meraki.label]: { value: args.label },
     [F.meraki.networkId]: { value: args.networkId },
-    [F.meraki.apiKey]: { value: args.apiKey },
+    [F.meraki.apiKey]: { value: storedKey },
   };
   if (args.defaultCustomer)
     fields[F.meraki.defaultCustomer] = { value: args.defaultCustomer };
@@ -748,6 +791,7 @@ export async function createMerakiCredential(
     id: res.id,
     label: args.label,
     networkId: args.networkId,
+    // Return the plaintext key to the caller; the Kintone row holds ciphertext.
     apiKey: args.apiKey,
     defaultCustomer: args.defaultCustomer,
     defaultHostname: args.defaultHostname,
@@ -774,7 +818,11 @@ export async function updateMerakiCredential(
   if (args.label !== undefined) fields[F.meraki.label] = { value: args.label };
   if (args.networkId !== undefined)
     fields[F.meraki.networkId] = { value: args.networkId };
-  if (args.apiKey !== undefined) fields[F.meraki.apiKey] = { value: args.apiKey };
+  if (args.apiKey !== undefined) {
+    fields[F.meraki.apiKey] = {
+      value: encryptSecret(args.apiKey, cfg.credentialsEncryptionKey),
+    };
+  }
   if (args.defaultCustomer !== undefined)
     fields[F.meraki.defaultCustomer] = { value: args.defaultCustomer };
   if (args.defaultHostname !== undefined)

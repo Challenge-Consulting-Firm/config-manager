@@ -3,6 +3,9 @@
  * Throws on missing required values so the process fails fast on boot.
  */
 
+import type { AppRole } from "@config-manager/shared";
+import { parseEncryptionKey } from "./secretCrypto.js";
+
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
   if (!value || value.length === 0) {
@@ -43,9 +46,22 @@ export interface AppConfig {
     clientId: string;
     clientSecret: string;
     redirectUri: string;
+    /** Admission gate: any of these group IDs is enough to log in. */
     requiredGroupIds: string[];
+    /** RBAC mapping (highest match wins). Empty = every user is admin. */
+    adminGroupIds: string[];
+    operatorGroupIds: string[];
+    viewerGroupIds: string[];
   };
+  /** App role injected for AUTH_MODE=disabled local user. */
+  localDevRole: AppRole;
   sessionSecret: string;
+  /**
+   * AES-256 key for encrypting Meraki API keys at rest in Kintone.
+   * null = pass-through (local dev without the secret). Production with the
+   * Meraki credentials app enabled should always set CREDENTIALS_ENCRYPTION_KEY.
+   */
+  credentialsEncryptionKey: Buffer | null;
   kintone: {
     domain: string;
     configAppId: string;
@@ -122,10 +138,24 @@ export function loadConfig(): AppConfig {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean),
+      adminGroupIds: optional("ENTRA_GROUP_ADMIN_IDS")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      operatorGroupIds: optional("ENTRA_GROUP_OPERATOR_IDS")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      viewerGroupIds: optional("ENTRA_GROUP_VIEWER_IDS")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     },
-    sessionSecret: entraRequired
-      ? required("SESSION_SECRET")
-      : optional("SESSION_SECRET", "insecure-local-dev-secret-do-not-use-in-prod"),
+    localDevRole: parseAppRole(optional("LOCAL_DEV_USER_ROLE", "admin")),
+    sessionSecret: loadSessionSecret(entraRequired, nodeEnv),
+    credentialsEncryptionKey: parseEncryptionKey(
+      optional("CREDENTIALS_ENCRYPTION_KEY", ""),
+    ),
     kintone: {
       domain,
       configAppId: required("KINTONE_CONFIG_APP_ID"),
@@ -154,4 +184,41 @@ export function loadConfig(): AppConfig {
   };
   cached = cfg;
   return cfg;
+}
+
+function parseAppRole(raw: string): AppRole {
+  if (raw === "viewer" || raw === "operator" || raw === "admin") return raw;
+  throw new Error(
+    `LOCAL_DEV_USER_ROLE must be one of viewer|operator|admin (got "${raw}")`,
+  );
+}
+
+/**
+ * SESSION_SECRET must be long enough for iron-session (min 32 chars).
+ * Production / OIDC refuses short or placeholder values so weak seals never ship.
+ */
+function loadSessionSecret(entraRequired: boolean, nodeEnv: string): string {
+  const MIN_LEN = 32;
+  const PLACEHOLDERS = new Set([
+    "change-me-to-a-long-random-string",
+    "insecure-local-dev-secret-do-not-use-in-prod",
+  ]);
+  if (!entraRequired) {
+    return optional(
+      "SESSION_SECRET",
+      "insecure-local-dev-secret-do-not-use-in-prod",
+    );
+  }
+  const secret = required("SESSION_SECRET");
+  if (secret.length < MIN_LEN || PLACEHOLDERS.has(secret)) {
+    throw new Error(
+      `SESSION_SECRET must be a high-entropy secret of at least ${MIN_LEN} characters ` +
+        `(got length=${secret.length}). Generate with: openssl rand -base64 32`,
+    );
+  }
+  // Extra hard fail in production even if someone forces AUTH_MODE=disabled path off.
+  if (nodeEnv === "production" && secret.length < MIN_LEN) {
+    throw new Error("SESSION_SECRET is too short for production");
+  }
+  return secret;
 }

@@ -41,7 +41,7 @@ Meraki Dashboard API を使うには、対象 Organization で API アクセス�
 > **注意**:
 > - API キーはユーザーアカウントに紐づき、Organization 単位ではありません。同じキーでアクセス権のある全 Organization にアクセスできます。
 > - API キーは再表示できません。紛失した場合は再生成が必要です（古いキーは無効化されます）。
-> - 本システムでは API キーを **fly.io シークレット (`MERAKI_API_KEY`) または「Meraki 接続情報」アプリ (Kintone)** のいずれかで保持します。詳細は [本システムへの登録](#本システムへの登録) を参照。
+> - 本システムでは API キーを **fly.io シークレット (`MERAKI_API_KEY`) または「Meraki 接続情報」アプリ (Kintone)** のいずれかで保持します。接続情報アプリ保存時は `CREDENTIALS_ENCRYPTION_KEY` による AES-256-GCM 暗号化を推奨（[`SECURITY.md`](./SECURITY.md)）。詳細は [本システムへの登録](#本システムへの登録) を参照。
 
 ---
 

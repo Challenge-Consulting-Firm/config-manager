@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { getSession } from "./session.js";
 import {
+  assertIdTokenClaims,
   buildAuthUrl,
   createPkce,
   decodeIdToken,
@@ -33,6 +34,12 @@ import {
   createCsrfOriginGuard,
   securityHeaders,
 } from "./security.js";
+import { resolveRoleFromGroups } from "./rbac.js";
+import {
+  isSessionRevoked,
+  newSessionId,
+  revokeSession,
+} from "./sessionRegistry.js";
 import { safeReturnPath, type AuthUser } from "@config-manager/shared";
 
 const cfg = loadConfig();
@@ -53,6 +60,21 @@ const INDEX_HTML = resolve(SPA_DIR, "index.html");
 const localUser: AuthUser = {
   displayName: cfg.localDevUser.name,
   email: cfg.localDevUser.email,
+  role: cfg.localDevRole,
+};
+
+const sessionSecure = cfg.nodeEnv === "production";
+/** OIDC login/callback must use None so the cookie survives the Entra redirect. */
+const oidcSessionOpts = {
+  password: cfg.sessionSecret,
+  secure: sessionSecure,
+  sameSite: (sessionSecure ? "None" : "Lax") as "None" | "Lax",
+};
+/** Established sessions use Lax to shrink CSRF exposure. */
+const establishedSessionOpts = {
+  password: cfg.sessionSecret,
+  secure: sessionSecure,
+  sameSite: "Lax" as const,
 };
 
 const app = new Hono<AppEnv>();
@@ -102,10 +124,7 @@ app.get("/healthz", (c) => c.text("ok"));
 // ---- Auth routes ----
 app.get("/auth/login", async (c) => {
   if (cfg.authMode === "disabled") return c.redirect("/");
-  const session = await getSession(c, {
-    password: cfg.sessionSecret,
-    secure: cfg.nodeEnv === "production",
-  });
+  const session = await getSession(c, oidcSessionOpts);
   const pkce = createPkce();
   const state = createPkce().verifier; // reuse as opaque state token
   session.set("pkceVerifier", pkce.verifier);
@@ -130,10 +149,9 @@ app.get("/auth/callback", async (c) => {
   if (!code || !state) {
     return c.text("Missing code or state in callback", 400);
   }
-  const session = await getSession(c, {
-    password: cfg.sessionSecret,
-    secure: cfg.nodeEnv === "production",
-  });
+  // Read PKCE state with None so the cookie set during /auth/login is visible
+  // after the Entra cross-site redirect.
+  const session = await getSession(c, oidcSessionOpts);
   if (state !== session.get("oauthState")) {
     return c.text("OAuth state mismatch", 400);
   }
@@ -143,18 +161,39 @@ app.get("/auth/callback", async (c) => {
   try {
     const tokens = await exchangeCode(cfg, code, verifier);
     const claims = decodeIdToken(tokens.id_token);
-    const user = toAuthUser(claims, "Unknown operator");
+    assertIdTokenClaims(claims, cfg);
 
-    // Group-based access control, if configured.
+    // Fetch groups once; used for both the admission gate and RBAC mapping.
+    const roleGroupsConfigured =
+      cfg.entra.adminGroupIds.length +
+        cfg.entra.operatorGroupIds.length +
+        cfg.entra.viewerGroupIds.length >
+      0;
+    const needGroups =
+      cfg.entra.requiredGroupIds.length > 0 || roleGroupsConfigured;
+    const groups = needGroups
+      ? await getUserGroups(tokens.access_token)
+      : [];
+
     if (cfg.entra.requiredGroupIds.length > 0) {
-      const groups = await getUserGroups(tokens.access_token);
       const ok = cfg.entra.requiredGroupIds.some((g) => groups.includes(g));
       if (!ok) {
         return c.text("Access denied: user is not in a required group.", 403);
       }
     }
 
+    const role = resolveRoleFromGroups(groups, cfg);
+    if (!role) {
+      return c.text(
+        "Access denied: user is not in any configured application role group.",
+        403,
+      );
+    }
+
+    const user = toAuthUser(claims, "Unknown operator", role);
     session.set("user", user);
+    // Opaque sid enables logout revocation without a shared session store.
+    session.set("sid", newSessionId());
     // Capture returnTo BEFORE clearTransient(), which deletes it. Re-sanitize
     // defensively in case an older cookie still holds a pre-hardening value.
     const returnTo = safeReturnPath(session.get("returnTo"));
@@ -162,9 +201,12 @@ app.get("/auth/callback", async (c) => {
     // session: they are only needed for the optional group-membership check
     // above, and storing them bloats the encrypted cookie past the 4 KiB
     // browser limit — the browser then silently drops it, causing a 401 loop.
-    // If a refresh / Graph call becomes necessary later, move to a server-side
-    // session store instead of expanding the cookie.
+    // If a refresh / Graph call becomes necessary later, move to a shared
+    // server-side session store (see docs/SECURITY.md).
     session.clearTransient();
+    // Re-seal with SameSite=Lax for the established session (CSRF reduction).
+    // The interstitial HTML response is same-origin, so Lax is accepted here.
+    session.setSameSite("Lax");
     await session.save();
     // IMPORTANT: return an HTML interstitial that does a same-origin client-side
     // redirect, instead of a 302. When the OIDC callback arrives via a
@@ -194,10 +236,11 @@ app.get("/auth/callback", async (c) => {
 
 app.get("/auth/logout", async (c) => {
   if (cfg.authMode === "disabled") return c.redirect("/");
-  const session = await getSession(c, {
-    password: cfg.sessionSecret,
-    secure: cfg.nodeEnv === "production",
-  });
+  const session = await getSession(c, establishedSessionOpts);
+  // Revoke before destroy so a stolen copy of the cookie cannot outlive logout
+  // for the rest of this process lifetime.
+  const user = session.get("user");
+  revokeSession(session.get("sid"), { email: user?.email });
   session.destroy();
   const postLogoutUri = `${cfg.publicBaseUrl}/`;
   const url =
@@ -210,29 +253,40 @@ app.get("/auth/me", async (c) => {
   if (cfg.authMode === "disabled") {
     return c.json({ authenticated: true, user: localUser });
   }
-  const session = await getSession(c, {
-    password: cfg.sessionSecret,
-    secure: cfg.nodeEnv === "production",
-  });
+  const session = await getSession(c, establishedSessionOpts);
+  if (isSessionRevoked(session.get("sid"))) {
+    session.destroy();
+    return c.json({ authenticated: false }, 401);
+  }
   const user = session.get("user");
   if (!user) return c.json({ authenticated: false }, 401);
+  // Backfill role for sessions created before RBAC shipped.
+  if (!user.role) {
+    user.role = "admin";
+    session.set("user", user);
+    await session.save();
+  }
   return c.json({ authenticated: true, user });
 });
 
 // ---- Auth guard for /api/* ----
 app.use("/api/*", async (c, next) => {
-  const session = await getSession(c, {
-    password: cfg.sessionSecret,
-    secure: cfg.nodeEnv === "production",
-  });
+  const session = await getSession(c, establishedSessionOpts);
   let user: AuthUser;
   if (cfg.authMode === "disabled") {
     user = localUser;
   } else {
+    if (isSessionRevoked(session.get("sid"))) {
+      session.destroy();
+      return c.json({ error: "unauthenticated", login: "/auth/login" }, 401);
+    }
     const u = session.get("user");
     if (!u) {
       return c.json({ error: "unauthenticated", login: "/auth/login" }, 401);
     }
+    // Sessions sealed before RBAC may lack role; treat as admin so we do not
+    // lock existing operators out mid-deploy. Next login resolves the real role.
+    if (!u.role) u.role = "admin";
     user = u;
   }
   c.set("cfg", cfg);
@@ -271,7 +325,28 @@ serve(
     if (cfg.authMode === "disabled") {
       console.warn(
         `[startup] AUTH_MODE=disabled — Entra ID auth is BYPASSED and a local ` +
-          `dummy user (${localUser.email}) is used. NEVER use this in production.`,
+          `dummy user (${localUser.email}, role=${localUser.role}) is used. NEVER use this in production.`,
+      );
+    }
+    const rbacConfigured =
+      cfg.entra.adminGroupIds.length +
+        cfg.entra.operatorGroupIds.length +
+        cfg.entra.viewerGroupIds.length >
+      0;
+    if (!rbacConfigured && cfg.authMode === "oidc") {
+      console.warn(
+        "[startup] ENTRA_GROUP_*_IDS are unset — every authenticated user is treated as admin. " +
+          "Set ENTRA_GROUP_ADMIN_IDS / OPERATOR / VIEWER to enable RBAC.",
+      );
+    }
+    if (
+      !cfg.credentialsEncryptionKey &&
+      cfg.kintone.merakiAppId &&
+      cfg.nodeEnv === "production"
+    ) {
+      console.warn(
+        "[startup] CREDENTIALS_ENCRYPTION_KEY is unset while Meraki credentials app is configured. " +
+          "API keys will be stored in plaintext in Kintone. Set the key (openssl rand -base64 32).",
       );
     }
     if (!existsSync(SPA_DIR)) {

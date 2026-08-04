@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import type { MerakiCredential } from "@config-manager/shared";
+import { hasMinRole, type MerakiCredential } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
+import { useAuth } from "../auth";
 import { safeReturnPath } from "../utils/safeReturnPath";
 
 /** BFF の GET /api/meraki/credentials 応答。apiKey はマスク済み。 */
@@ -33,6 +34,8 @@ const emptyEdit: EditState = {
 
 export function MerakiCredentialsPage() {
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const canAdmin = hasMinRole(user?.role ?? "viewer", "admin");
   const [params] = useSearchParams();
   const returnKey = safeReturnPath(params.get("from"));
 
@@ -197,7 +200,7 @@ export function MerakiCredentialsPage() {
             「Meraki 取得」画面で選択できます。
           </p>
         </div>
-        {!isEditing && enabled && (
+        {!isEditing && enabled && canAdmin && (
           <button
             onClick={startNew}
             className="rounded-md bg-blue-600 px-3 py-2 text-sm text-white hover:bg-blue-700"
@@ -366,18 +369,22 @@ export function MerakiCredentialsPage() {
                       >
                         取得で使用
                       </button>
-                      <button
-                        onClick={() => startEdit(c)}
-                        className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100"
-                      >
-                        編集
-                      </button>
-                      <button
-                        onClick={() => remove(c)}
-                        className="rounded border border-red-300 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
-                      >
-                        削除
-                      </button>
+                      {canAdmin && (
+                        <button
+                          onClick={() => startEdit(c)}
+                          className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100"
+                        >
+                          編集
+                        </button>
+                      )}
+                      {canAdmin && (
+                        <button
+                          onClick={() => remove(c)}
+                          className="rounded border border-red-300 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
+                        >
+                          削除
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>

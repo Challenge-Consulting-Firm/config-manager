@@ -1,4 +1,9 @@
 import { Link, NavLink, Route, Routes } from "react-router-dom";
+import {
+  APP_ROLE_LABELS,
+  hasMinRole,
+  type AppRole,
+} from "@config-manager/shared";
 import { useAuth } from "./auth";
 import { DevicesPage } from "./pages/DevicesPage";
 import { DeviceDetailPage } from "./pages/DeviceDetailPage";
@@ -16,6 +21,8 @@ import { AppIcon } from "./components/AppIcon";
 
 export default function App() {
   const { user, loading, logout } = useAuth();
+  const role: AppRole = user?.role ?? "viewer";
+  const canOperate = hasMinRole(role, "operator");
 
   if (loading) {
     return (
@@ -61,8 +68,9 @@ export default function App() {
           </Link>
           <nav className="flex items-center gap-1 text-sm">
             <NavItem to="/">機器一覧</NavItem>
-            <NavItem to="/upload">アップロード</NavItem>
-            <NavItem to="/meraki">Meraki 取得</NavItem>
+            {canOperate && <NavItem to="/upload">アップロード</NavItem>}
+            {canOperate && <NavItem to="/meraki">Meraki 取得</NavItem>}
+            {/* 閲覧は operator 以上も可。CRUD はページ内で admin 制限。 */}
             <NavItem to="/meraki/credentials">接続情報</NavItem>
             <NavItem to="/search">検索</NavItem>
             <NavItem to="/audit">作業履歴</NavItem>
@@ -70,7 +78,12 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="text-right text-sm leading-tight">
               <div className="font-medium text-slate-800">{user.displayName}</div>
-              <div className="text-xs text-slate-500">{user.email}</div>
+              <div className="text-xs text-slate-500">
+                {user.email}
+                <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-600">
+                  {APP_ROLE_LABELS[role]}
+                </span>
+              </div>
             </div>
             <button
               onClick={logout}

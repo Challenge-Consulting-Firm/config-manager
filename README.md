@@ -149,7 +149,7 @@ node scripts/setup-kintone.mjs --app meraki
 | デフォルトホスト名 | 文字列(1行) | `default_hostname` |
 | メモ | 文字列(複数行) | `memo` |
 
-> **APIキーは平文で保存されます。** Kintone アプリの閲覧権限・API トークンの取扱に十分注意してください。
+> **APIキーは `CREDENTIALS_ENCRYPTION_KEY` 設定時に AES-256-GCM で暗号化して保存されます**（未設定時のみ平文）。詳細は [`docs/SECURITY.md`](docs/SECURITY.md#meraki-api-キーの暗号化)。
 
 #### B-4. API トークンの権限設計
 
@@ -222,7 +222,10 @@ cp .env.example .env
 | `MERAKI_API_KEY` | Meraki Dashboard API キー（省略可）。未設定時は取得画面で都度入力 |
 | `MERAKI_API_BASE` | Meraki API のベース URL。既定 `https://api.meraki.com/api/v1`。中国リージョン等では要変更 |
 | `MERAKI_TIMEOUT_MS` / `MERAKI_MAX_RETRIES` | Meraki API 呼び出しのタイムアウトと 429 時のリトライ回数 |
-| `ENTRA_*` / `SESSION_SECRET` | `AUTH_MODE=oidc` の時のみ必須 |
+| `ENTRA_*` / `SESSION_SECRET` | `AUTH_MODE=oidc` の時のみ必須。`SESSION_SECRET` は 32 文字以上の高エントロピー値 |
+| `ENTRA_GROUP_ADMIN_IDS` / `ENTRA_GROUP_OPERATOR_IDS` / `ENTRA_GROUP_VIEWER_IDS` | 任意。Entra グループ ID による RBAC（admin/operator/viewer）。未設定時は認証ユーザー全員を admin 扱い |
+| `LOCAL_DEV_USER_ROLE` | `AUTH_MODE=disabled` 時のダミーユーザー権限。`viewer` / `operator` / `admin`（既定 `admin`） |
+| `CREDENTIALS_ENCRYPTION_KEY` | 任意（本番 + Meraki 接続情報アプリ利用時は推奨）。Meraki API キーを Kintone 保存時に AES-256-GCM 暗号化。`openssl rand -base64 32` |
 
 #### C-1. ローカルコンテナで検証（推奨）
 
@@ -266,6 +269,7 @@ fly secrets set --app config-manager AUTH_MODE=oidc
 fly secrets set --app config-manager NODE_ENV=production
 fly secrets set --app config-manager PUBLIC_BASE_URL=https://config-manager.fly.dev
 fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
+fly secrets set --app config-manager CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)  # Meraki 接続情報利用時
 fly secrets set --app config-manager ENTRA_TENANT_ID=...
 fly secrets set --app config-manager ENTRA_CLIENT_ID=...
 fly secrets set --app config-manager ENTRA_CLIENT_SECRET=...
@@ -309,7 +313,7 @@ Meraki Dashboard API 経由で MR/MX/MS の設定を取得して世代管理に�
    - 「接続情報」ページからネットワーク ID・API キー・デフォルト顧客・ホスト名をセットで登録しておくと、取得時に再利用できます。
 4. **API キーの場所**は以下のいずれかを選択:
    - **環境変数**: `.env` に `MERAKI_API_KEY=...`、本番は `fly secrets set MERAKI_API_KEY=...`。全ネットワーク共通で使う場合に便利。
-   - **接続情報アプリ**: ネットワーク毎に異なる API キーを使う場合はこちら。API キーは Kintone 上に平文で保存されます。
+   - **接続情報アプリ**: ネットワーク毎に異なる API キーを使う場合はこちら。`CREDENTIALS_ENCRYPTION_KEY` 設定時は AES-256-GCM で暗号化保存（[`docs/SECURITY.md`](docs/SECURITY.md)）。
    - **都度入力**: 「Meraki 取得」画面で每回入力（環境変数未設定時のみ）。
 5. 機器一覧の「Meraki 取得」ボタン、またはサイドメニューの「Meraki 取得」から取得を実行。
 
@@ -317,7 +321,7 @@ Meraki Dashboard API 経由で MR/MX/MS の設定を取得して世代管理に�
 
 > **セキュリティ注意**:
 > - 都度入力・環境変数の API キーは Meraki Dashboard への読み取り要求にのみ使われ、Kintone やログには保存されません。
-> - **接続情報アプリに保存した API キーは Kintone 上に平文で保存されます**。一覧画面では末尾 4 文字のみ表示されますが、レコード自体には平文で入っているため、Kintone アプリの閲覧権限・API トークンの取扱にご注意ください。
+> - **接続情報アプリに保存した API キー**は、`CREDENTIALS_ENCRYPTION_KEY` 設定時に `enc:v1:...` 形式で暗号化されます。一覧画面では末尾 4 文字のみ表示。鍵未設定時は平文のため本番では必ず鍵を設定してください。
 
 ## コンフィグ正規化ルール
 
@@ -351,7 +355,8 @@ config-manager/
 │   └── kintone/                   # フィールド定義 JSON（config / audit / meraki）
 ├── docs/
 │   ├── DEPLOY.md                  # fly.io デプロイ手順書・シークレット・ローテーション
-│   └── MERAKI.md                  # Meraki API キー・組織 ID・ネットワーク ID の取得手順
+│   ├── MERAKI.md                  # Meraki API キー・組織 ID・ネットワーク ID の取得手順
+│   └── SECURITY.md                # RBAC・暗号化・監査・依存脆弱性の運用ガイド
 ├── Dockerfile
 ├── fly.toml
 └── .env.example

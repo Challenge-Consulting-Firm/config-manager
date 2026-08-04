@@ -207,12 +207,36 @@ export interface AuditLogEntry {
   createdAt: number;
 }
 
+/** Application RBAC role. Higher privilege includes lower ones. */
+export type AppRole = "viewer" | "operator" | "admin";
+
+/** Japanese labels for AppRole (UI / docs). */
+export const APP_ROLE_LABELS: Record<AppRole, string> = {
+  viewer: "閲覧者",
+  operator: "作業者",
+  admin: "管理者",
+};
+
+/** Numeric rank for comparing roles (admin > operator > viewer). */
+export const APP_ROLE_RANK: Record<AppRole, number> = {
+  viewer: 1,
+  operator: 2,
+  admin: 3,
+};
+
+/** True when `actual` is at least as privileged as `required`. */
+export function hasMinRole(actual: AppRole, required: AppRole): boolean {
+  return APP_ROLE_RANK[actual] >= APP_ROLE_RANK[required];
+}
+
 /** Shape of the authenticated user surfaced to the frontend. */
 export interface AuthUser {
   displayName: string;
   email: string;
   tenantId?: string;
   objectId?: string;
+  /** App-level RBAC role resolved at login (default admin when role groups unset). */
+  role: AppRole;
 }
 
 // ===== Full-text search =====
