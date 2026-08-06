@@ -34,6 +34,30 @@ export function allowedOrigins(publicBaseUrl: string, nodeEnv: string): Set<stri
   return origins;
 }
 
+/**
+ * Derive the origin the request was actually delivered to, from the Host header
+ * and the (proxy-forwarded) scheme. Behind fly.io's TLS-terminating proxy the
+ * app speaks plain HTTP internally, so trust X-Forwarded-Proto for the scheme.
+ *
+ * A same-origin browser request always carries an Origin/Referer whose origin
+ * equals this self-origin, so accepting it makes the CSRF guard robust to a
+ * misconfigured PUBLIC_BASE_URL (or an extra hostname / custom domain) while
+ * still rejecting genuine cross-site requests, whose Origin differs from the
+ * host they are hitting.
+ */
+function selfOrigin(c: Context): string | null {
+  const host = c.req.header("x-forwarded-host") ?? c.req.header("host");
+  if (!host) return null;
+  const proto =
+    c.req.header("x-forwarded-proto") ??
+    (c.req.url.startsWith("https:") ? "https" : "http");
+  try {
+    return new URL(`${proto}://${host}`).origin;
+  } catch {
+    return null;
+  }
+}
+
 /** Extract an origin from either the Origin header or the Referer header. */
 function requestOrigin(c: Context): string | null {
   const origin = c.req.header("origin");
@@ -86,10 +110,15 @@ export function createCsrfOriginGuard(opts: {
     }
 
     const origin = requestOrigin(c);
-    if (!origin || !allowed.has(origin)) {
+    // Accept when the request origin matches either the configured allow-list
+    // or the origin the request was actually delivered to (its own host). The
+    // latter keeps a same-origin request working even if PUBLIC_BASE_URL is
+    // stale or the app is reached via an additional hostname / custom domain.
+    const self = selfOrigin(c);
+    if (!origin || (!allowed.has(origin) && origin !== self)) {
       console.warn(
         `[csrf] rejected ${c.req.method} ${path} origin=${origin ?? "(missing)"} ` +
-          `allowed=${[...allowed].join(",")}`,
+          `allowed=${[...allowed].join(",")} self=${self ?? "(unknown)"}`,
       );
       return c.json(
         {
