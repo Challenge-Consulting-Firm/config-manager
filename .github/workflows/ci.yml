@@ -41,3 +41,65 @@ jobs:
         # known exceptions are cleared or ignored via pnpm.auditConfig.
         run: pnpm audit --audit-level=high
         continue-on-error: true
+
+  # ローカル取得ヘルパー（Go）のビルド・テスト。apps/helper のみを扱い、
+  # pnpm workspace 外（package.json 無し）のため Node ジョブから独立させる。
+  # Issue #43 最終コメントの確定設計に基づく。
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      helper: ${{ steps.filter.outputs.helper }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # helper 関連ファイルの変更がない PR では後続の helper ジョブをスキップ。
+          # push (main) では常に実行される（paths-filter は pull_request でのみ絞り込む）。
+          filters: |
+            helper:
+              - "apps/helper/**"
+              - "scripts/build-helper.sh"
+              - ".github/workflows/ci.yml"
+
+  helper:
+    needs: changes
+    if: ${{ github.event_name == 'push' || needs.changes.outputs.helper == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.21"
+          cache-dependency-path: apps/helper/go.sum
+
+      - name: Download dependencies
+        working-directory: apps/helper
+        run: go mod download
+
+      - name: Build
+        working-directory: apps/helper
+        run: go build ./...
+
+      - name: Vet
+        working-directory: apps/helper
+        run: go vet ./...
+
+      - name: Test
+        working-directory: apps/helper
+        run: go test ./...
+
+      - name: Cross-build smoke (Windows / macOS)
+        # クロスコンパイル可能かを軽く確認（成果物は保存しない）。
+        working-directory: apps/helper
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /tmp/helper-win.exe ./cmd/helper
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64  go build -o /tmp/helper-mac-arm ./cmd/helper
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64  go build -o /tmp/helper-mac-amd ./cmd/helper
+
+      - name: Build script smoke
+        # scripts/build-helper.sh が最新の Go コードで成功するか確認
+        # （成果物は BFF 配布ディレクトリへ生成される）。
+        run: ./scripts/build-helper.sh 0.0.0-ci

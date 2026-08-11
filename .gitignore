@@ -12,3 +12,11 @@ coverage
 !.vscode/extensions.json
 .claude/
 tmp/
+
+# ローカル取得ヘルパーのビルド成果物（バイナリ本体 + checksum）。
+# latest.json は配布メタデータのプレースホルダとしてコミットするが、
+# scripts/build-helper.sh が生成したバイナリ本体と checksums.sha256 は
+# リポジトリに含めない（GitHub Releases または BFF 同梱で配布）。
+apps/bff/public/downloads/helper/windows-x64/
+apps/bff/public/downloads/helper/darwin-universal/
+apps/bff/public/downloads/helper/checksums.sha256

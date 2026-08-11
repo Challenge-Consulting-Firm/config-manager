@@ -1,0 +1,362 @@
+# config-manager ヘルパー（ローカル Telnet 取得アプリ）
+
+NW 機器から Telnet でコンフィグを自動取得する **Go 製ローカルヘルパーアプリ** です。
+ユーザー PC 上で動作し、SPA（fly.io 上）からの要求を受けてコンフィグ本文を取得します。
+
+> 設計の経緯は Issue #43 の最終確定コメントを参照してください。
+> Chrome 拡張機能 + Native Messaging 方式は廃止され、「拡張機能なしの単体ローカルアプリ
+> （ポータブル型）」に確定しました。
+
+---
+
+## アーキテクチャ
+
+```
+┌─────────────┐   ①fetch要求    ┌──────────────────┐
+│   SPA       │ ───────────────▶│  ヘルパー        │
+│ (fly.io/HTTPS)│                │ (127.0.0.1/HTTP) │
+└─────────────┘                 └────────┬─────────┘
+      │ ②コンフィグ本文                   │ ③Telnet (port 23)
+      ▼                                   ▼
+┌─────────────┐                 ┌──────────────────┐
+│   BFF       │                 │  NW 機器         │
+│ (fly.io)    │                 │ (Cisco/YAMAHA等) │
+│ /api/upload │                 └──────────────────┘
+└─────────────┘
+   ④same-origin + cookie セッション
+```
+
+- ヘルパーはユーザー PC 上の `127.0.0.1` に HTTP サーバを開きます（外部公開なし）
+- SPA がヘルパーを直接呼び出し、コンフィグ本文を受け取ります
+- SPA は受け取った本文を既存 `POST /api/upload`（same-origin + cookie セッション）で BFF に送ります
+- **ヘルパーは BFF に直接 POST しません**（拡張トークン・CSRF バイパスは一切不要）
+- ヘルパーはインストーラ不要・レジストリ等への書き込みなしのポータブル型です
+
+---
+
+## ビルド方法
+
+### 前提
+
+- Go 1.21 以上
+- 外部依存は `golang.org/x/text`（SJIS 変換用）のみ
+
+### 初回セットアップ
+
+`go.sum` はリポジトリに含まれていますが、依存を更新した場合は `go mod tidy` で
+再生成してください。
+
+```bash
+cd apps/helper
+go mod tidy
+```
+
+### ビルド
+
+```bash
+CGO_ENABLED=0 go build -o config-manager-helper ./cmd/helper
+```
+
+`CGO_ENABLED=0` を指定することで、純粋 Go の静的バイナリが生成されます。
+
+### 本番配布向けビルド（ldflags 注入）
+
+本番 SPA からヘルパーを呼ぶには、**ビルド時に本番 SPA の origin を埋め込む** 必要があります。
+配布バイナリを起動するユーザー PC で環境変数が設定されている保証がないためです。
+同時にバージョンも注入します。
+
+```bash
+# HELPER_VERSION と HELPER_ALLOWED_ORIGIN を ldflags で注入
+CGO_ENABLED=0 go build -ldflags "-s -w \
+  -X github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server.Version=1.2.3 \
+  -X github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server.BuildTimeAllowedOrigin=https://config-manager.fly.dev" \
+  -o config-manager-helper ./cmd/helper
+```
+
+注入する変数:
+
+| 変数 | 役割 | 未注入時 |
+| --- | --- | --- |
+| `server.Version` | 表示バージョン | `0.0.0-dev` |
+| `server.BuildTimeAllowedOrigin` | 本番 SPA の origin | 空（開発用 localhost のみ許可） |
+
+`scripts/build-helper.sh` を使う場合は、環境変数で制御できます:
+
+```bash
+# build-helper.sh は VERSION を引数または git tag から取得し、
+# HELPER_ALLOWED_ORIGIN 環境変数があれば BuildTimeAllowedOrigin へ注入します。
+HELPER_ALLOWED_ORIGIN=https://config-manager.fly.dev ./scripts/build-helper.sh 1.2.3
+```
+
+> **注意**: `scripts/build-helper.sh` は `apps/helper/` 配下ではなく `scripts/` 配下にあるため、
+> 本ディレクトリの管轄外です。スクリプトの詳細は同ファイルを参照してください。
+
+### クロスコンパイル例
+
+配布先 OS 向けにクロスコンパイルできます。
+
+```bash
+# Windows (64-bit)
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o config-manager-helper.exe ./cmd/helper
+
+# Linux (64-bit)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o config-manager-helper ./cmd/helper
+
+# macOS (Apple Silicon)
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o config-manager-helper-darwin-arm64 ./cmd/helper
+
+# macOS (Intel)
+CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o config-manager-helper-darwin-amd64 ./cmd/helper
+```
+
+#### macOS universal binary
+
+Apple Silicon と Intel の両方で動く universal binary を作る場合は `lipo` を使います。
+
+```bash
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o config-manager-helper-arm64 ./cmd/helper
+CGO_ENABLED=0 GOOS=darwin GOARCH=amd64  go build -o config-manager-helper-amd64  ./cmd/helper
+lipo -create -output config-manager-helper config-manager-helper-arm64 config-manager-helper-amd64
+```
+
+---
+
+## 実行方法
+
+### サーバモード（通常利用）
+
+ダブルクリック、または端末から起動します。
+
+```bash
+./config-manager-helper
+```
+
+起動時に許可 Origin を追加指定できます（staging 確認等）:
+
+```bash
+# --allow-origin で許可 Origin を追加（複数指定可）
+./config-manager-helper --allow-origin https://staging.fly.dev
+```
+
+起動時のコンソール出力例:
+
+```
+========================================================
+  config-manager ヘルパー を起動しました
+========================================================
+  待ち受けポート: 53712 (127.0.0.1)
+  バージョン    : 1.2.3
+  停止方法      : Ctrl+C または SPA の「停止」ボタン
+--------------------------------------------------------
+  許可 Origin:
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+    - https://config-manager.fly.dev
+--------------------------------------------------------
+  【セキュリティ注意】
+  ・本ヘルパーは 127.0.0.1 のみで待ち受けます（外部公開なし）
+  ・許可された Origin 以外からの要求は拒否します
+  ・Telnet は平文プロトコルです。機器との通信は暗号化されません
+========================================================
+
+SPA 側でこのヘルパーを検出したら、取得ボタンが有効になります。
+終了する場合は Ctrl+C を押すか、SPA の停止ボタンを押してください。
+```
+
+許可 Origin は以下の優先順位でマージされます:
+
+1. ビルド時注入（`BuildTimeAllowedOrigin`）
+2. `PUBLIC_BASE_URL` 環境変数
+3. `--allow-origin` 起動引数
+4. 開発用 localhost（`localhost:3000` / `127.0.0.1:3000` / `localhost:5173` / `127.0.0.1:5173`）
+
+### CLI デバッグモード（SPA なしで E2E 検証）
+
+`fetch` サブコマンドを使うと、HTTP サーバを起動せずに Telnet 取得を直接実行できます。
+**パスワードはコマンドライン引数には乗せません**（プロセス一覧で漏洩するため）。
+環境変数または標準入力から読み込みます。
+
+```bash
+# 環境変数でパスワードを指定
+export HELPER_PASSWORD='***'
+export HELPER_ENABLE_PASSWORD='***'   # 任意（Cisco enable 昇格用）
+./config-manager-helper fetch --host 192.168.1.1 --os cisco-ios --username admin
+
+# 未設定時は標準入力からプロンプトで読み込み
+./config-manager-helper fetch --host 192.168.1.1 --os cisco-ios --username admin
+# Password: （ここで入力）
+
+# 取得コマンドを上書き
+./config-manager-helper fetch --host 192.168.1.1 --os generic --username admin --command "show startup-config"
+```
+
+フラグ:
+
+| フラグ        | 既定値       | 説明                                              |
+| ------------- | ------------ | ------------------------------------------------- |
+| `--host`      | （必須）     | 接続先ホスト（IP またはホスト名）                 |
+| `--port`      | 23           | Telnet ポート                                     |
+| `--os`        | `cisco-ios`  | 機種ヒント（`cisco-ios` / `yamaha-rt` / `generic`）|
+| `--username`  | （必須）     | ログインユーザー名                                |
+| `--command`   | （os 別既定）| コンフィグ取得コマンドの上書き                    |
+
+---
+
+## セットアップ（初回利用）
+
+詳細な手順は SPA 側のセットアップ画面に記載されています。概要:
+
+1. SPA のセットアップ画面から、お使いの OS 向けバイナリをダウンロードする
+2. ダウンロードしたファイルをダブルクリックで起動する（インストール不要）
+3. SPA 側で「ヘルパー検出」が成功したら、取得ボタンが有効になる
+4. 利用後は SPA の停止ボタン、または Ctrl+C / ウィンドウクローズで終了する
+5. 不要になればファイルを削除してよい（レジストリ等への書き込みはない）
+
+---
+
+## 停止方法
+
+- **Ctrl+C** を押す（サーバモード）
+- **ウィンドウを閉じる**（ダブルクリック起動時）
+- **SPA の「停止」ボタン**を押す（`POST /api/shutdown` でプロセス終了）
+
+いずれの場合もプロセスは即座に終了し、`127.0.0.1` の待ち受けを解放します。
+
+---
+
+## 配布について
+
+- **第一候補: GitHub Releases** — バイナリ本体（`.exe` / macOS universal / Linux）と
+  `latest.json`（URL + sha256）を配置する。SPA のセットアップ画面が OS 判定で該当リンクを提示する。
+- **フォールバック: BFF 同梱** — 社内 PC から `github.com` へ到達不可の場合のみ、
+  BFF の `public/downloads/helper/` に同梱して配信する。
+
+---
+
+## HTTP API 仕様
+
+バインドは `127.0.0.1` のみ。既定ポート **53712**（使用中なら 53713〜53716 を順に試行）。
+
+### `GET /api/status`
+
+死活・バージョン応答。
+
+```json
+{ "ok": true, "version": "0.1.0" }
+```
+
+### `POST /api/fetch`
+
+Telnet 取得の実行。リクエストボディ（JSON）:
+
+```json
+{
+  "host": "192.168.1.1",
+  "port": 23,
+  "protocol": "telnet",
+  "username": "admin",
+  "password": "***",
+  "enablePassword": "",
+  "osHint": "cisco-ios",
+  "commandOverride": null,
+  "timeouts": { "connectMs": 10000, "loginMs": 15000, "commandMs": 120000, "totalMs": 180000 }
+}
+```
+
+成功レスポンス:
+
+```json
+{
+  "ok": true,
+  "body": "! config ...\n",
+  "meta": {
+    "elapsedMs": 8420,
+    "prompt": "router#",
+    "command": "show running-config",
+    "sourceEncoding": "utf-8"
+  }
+}
+```
+
+失敗レスポンス:
+
+```json
+{ "ok": false, "code": "auth_failed", "message": "login prompt timeout" }
+```
+
+エラーコード: `connect_failed` / `auth_failed` / `prompt_not_found` / `timeout` /
+`pager_detected` / `empty_body`
+
+### `POST /api/shutdown`
+
+200 を返してからプロセスを終了する。
+
+```json
+{ "ok": true }
+```
+
+### CORS / Private Network Access
+
+- HTTPS の SPA（パブリックオリジン）→ `http://127.0.0.1` は Private Network Access 対象
+- プリフライト（`OPTIONS`）に `Access-Control-Allow-Private-Network: true` 等で応答
+- 許可 Origin はハードコードの allowlist（`PUBLIC_BASE_URL` 環境変数 + 開発用 localhost）
+- 許可外 Origin、または Origin ヘッダ無しの状態変更リクエストは 403
+
+---
+
+## OS 別コマンドマップ（フェーズ 1）
+
+| osHint      | ページング抑制      | コンフィグ取得        |
+| ----------- | ------------------- | --------------------- |
+| `cisco-ios` | `terminal length 0` | `show running-config` |
+| `yamaha-rt` | （不要）            | `show config`         |
+| `generic`   | `terminal length 0` を試行 | `commandOverride` 必須 |
+
+---
+
+## セキュリティ注意
+
+- **127.0.0.1 バインド**: 外部ネットワークには一切公開しません。`0.0.0.0` にはバインドしません。
+- **Origin allowlist**: 許可された Origin 以外からの要求は拒否します。
+- **パスワード取り扱い**: パスワード・enablePassword はログ・ファイルに書き出しません。
+  メモリ上で取得後に参照を破棄します。CLI でもコマンドライン引数には乗せません。
+- **Telnet は平文プロトコルです**: 本ヘルパーと機器間の通信は暗号化されません。
+  同一セグメント上のパケットキャプチャで認証情報が漏洩する可能性があります。
+  機密性の高い環境では SSH 等の暗号化プロトコルの利用を検討してください。
+
+---
+
+## 開発者向け情報
+
+### ディレクトリ構成
+
+```
+apps/helper/
+├── go.mod
+├── go.sum
+├── README.md
+├── cmd/helper/main.go          # エントリポイント（サーバ + CLI デバッグモード）
+├── internal/server/server.go   # 127.0.0.1 HTTP・CORS/PNA・Origin allowlist
+├── internal/telnet/telnet.go   # Telnet プロトコル（IAC・ログイン・プロンプト学習・ページング）
+├── internal/commands/commands.go # osHint 別コマンドマップ
+└── internal/encoding/encoding.go # SJIS→UTF-8 変換
+```
+
+> **注意**: このディレクトリには `package.json` を置きません。
+> pnpm workspace（`apps/*`）から自動除外することで、Go モジュールを
+> TypeScript のビルド対象から切り離すためです。
+
+### 検証
+
+```bash
+cd apps/helper
+go build ./...
+go vet ./...
+```
+
+### 外部依存
+
+- `golang.org/x/text v0.16.0`（SJIS 変換用 `encoding/japanese`）のみ。
+- それ以外は Go 標準ライブラリで実装しています。

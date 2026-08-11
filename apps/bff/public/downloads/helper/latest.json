@@ -1,0 +1,6 @@
+{
+  "version": "0.0.0",
+  "releasedAt": "",
+  "note": "このファイルは scripts/build-helper.sh によって生成・上書きされます。配布物（バイナリ + sha256）を生成するまで assets は空です。",
+  "assets": {}
+}

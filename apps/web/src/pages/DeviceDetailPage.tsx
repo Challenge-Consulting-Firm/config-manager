@@ -13,6 +13,7 @@ import {
 import { apiFetch, ApiError } from "../apiClient";
 import { useAuth } from "../auth";
 import { RoleBadge } from "../components/RoleBadge";
+import { TelnetFetchDialog } from "../components/TelnetFetchDialog";
 
 interface PromoteResult {
   created?: { id: string; generation: number };
@@ -63,6 +64,8 @@ export function DeviceDetailPage() {
     text: string;
   } | null>(null);
   const [metaSubmitting, setMetaSubmitting] = useState(false);
+  // Telnet 取得ダイアログの表示状態。
+  const [telnetOpen, setTelnetOpen] = useState(false);
 
   useEffect(() => {
     if (!decodedKey) return;
@@ -237,6 +240,19 @@ export function DeviceDetailPage() {
         )}
         {identifiers && (
           <div className="flex flex-wrap gap-2">
+            {/* ローカルヘルパー経由の Telnet 取得（Issue #43）。ヘルパー起動中のみ
+                有効。ダイアログ内で未検出時はセットアップ画面へ誘導する。 */}
+            {canOperate && (
+              <button
+                onClick={() => {
+                  setTelnetOpen(true);
+                  setMetaMsg(null);
+                }}
+                className="rounded-md bg-indigo-600 px-3 py-2 text-sm text-white hover:bg-indigo-700"
+              >
+                Telnet で取得
+              </button>
+            )}
             {isMerakiDevice ? (
               <Link
                 to={merakiRefetchHrefFor(
@@ -634,6 +650,18 @@ export function DeviceDetailPage() {
             } finally {
               setDeletingDevice(false);
             }
+          }}
+        />
+      )}
+
+      {/* Telnet 取得ダイアログ（ローカルヘルパー経由・Issue #43） */}
+      {telnetOpen && identifiers && (
+        <TelnetFetchDialog
+          identifiers={identifiers}
+          onClose={() => setTelnetOpen(false)}
+          onCompleted={() => {
+            // 世代登録（またはスキップ）後に一覧を再読込。
+            void reloadVersions();
           }}
         />
       )}

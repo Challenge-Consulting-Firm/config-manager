@@ -10,6 +10,7 @@ import { DeviceDetailPage } from "./pages/DeviceDetailPage";
 import { UploadPage } from "./pages/UploadPage";
 import { MerakiImportPage } from "./pages/MerakiImportPage";
 import { MerakiCredentialsPage } from "./pages/MerakiCredentialsPage";
+import { HelperSetupPage } from "./pages/HelperSetupPage";
 import { DiffPage } from "./pages/DiffPage";
 import { SearchPage } from "./pages/SearchPage";
 import { AuditPage } from "./pages/AuditPage";
@@ -72,6 +73,7 @@ export default function App() {
             {canOperate && <NavItem to="/meraki">Meraki 取得</NavItem>}
             {/* 閲覧は operator 以上も可。CRUD はページ内で admin 制限。 */}
             <NavItem to="/meraki/credentials">接続情報</NavItem>
+            {canOperate && <NavItem to="/helper">ローカル取得</NavItem>}
             <NavItem to="/search">検索</NavItem>
             <NavItem to="/audit">作業履歴</NavItem>
           </nav>
@@ -102,6 +104,7 @@ export default function App() {
           <Route path="/upload" element={<UploadPage />} />
           <Route path="/meraki" element={<MerakiImportPage />} />
           <Route path="/meraki/credentials" element={<MerakiCredentialsPage />} />
+          <Route path="/helper" element={<HelperSetupPage />} />
           <Route path="/diff" element={<DiffPage />} />
           <Route path="/search" element={<SearchPage />} />
           <Route path="/versions/:id/firewall" element={<FirewallPage />} />
