@@ -17,7 +17,7 @@ import { bodyLimit } from "hono/body-limit";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { getSession } from "./session.js";
 import {
@@ -120,6 +120,54 @@ app.onError((err, c) => {
 
 // ---- Health check (no auth) ----
 app.get("/healthz", (c) => c.text("ok"));
+
+// ---- ローカル取得ヘルパーの配布物（認証不要）----
+// chrome.sockets.tcp 前提を廃止し「拡張機能なしの単体ローカルアプリ」方式
+// に確定した（Issue #43 最終コメント）。バイナリ本体は GitHub Releases を
+// 第一候補とし、社内 PC から github.com へ到達不可の場合のみ BFF 同梱
+// （public/downloads/helper/）にフォールバックする。latest.json は URL と
+// sha256 のみを持ち、SPA のセットアップ画面が OS 判定で該当リンクを提示する。
+// 専用ルートを切り、未存在は明示 404（SPA fallback で 200+HTML にならないよう）。
+const HELPER_DL_DIR = resolve(moduleDir, isBundled ? "../public/downloads/helper" : "./public/downloads/helper");
+const HELPER_CONTENT_TYPES: Record<string, string> = {
+  ".json": "application/json; charset=utf-8",
+  ".exe": "application/vnd.microsoft.portable-executable",
+  ".pkg": "application/octet-stream",
+  ".sha256": "text/plain; charset=utf-8",
+  ".zip": "application/zip",
+};
+app.get("/downloads/helper/*", (c) => {
+  // パストラバーサル対策: ワイルドカード以降を取り出し、`..` や絶対パスを拒否。
+  const rest = c.req.path.slice("/downloads/helper/".length);
+  if (!rest || rest.includes("..") || rest.includes("\0") || rest.startsWith("/")) {
+    return c.text("Not Found", 404);
+  }
+  const filePath = resolve(HELPER_DL_DIR, rest);
+  // resolve 結果が配布ディレクトリ配下であることを再確認。
+  if (!filePath.startsWith(HELPER_DL_DIR)) {
+    return c.text("Not Found", 404);
+  }
+  if (!existsSync(filePath)) {
+    return c.text("Not Found", 404);
+  }
+  // ディレクトリやシンボリックリンクを弾く。readFileSync にディレクトリを渡すと
+  // 例外で 500 になるため、通常ファイルのみ許容する。realpathSync でシンボリック
+  // リンクを解決した上で配布ディレクトリ配下であることを再確認するとより安全だが、
+  // 配布ディレクトリはリリース時のみ更新される静的資産のため、ここでは通常ファイル
+  // チェックで十分とする。
+  const st = statSync(filePath);
+  if (!st.isFile()) {
+    return c.text("Not Found", 404);
+  }
+  const ext = filePath.slice(filePath.lastIndexOf("."));
+  const ct = HELPER_CONTENT_TYPES[ext] ?? "application/octet-stream";
+  const data = readFileSync(filePath);
+  // ファイル名を維持したダウンロード用 Content-Disposition。
+  const filename = filePath.slice(filePath.lastIndexOf("/") + 1);
+  c.header("Content-Type", ct);
+  c.header("Content-Disposition", `attachment; filename="${filename}"`);
+  return c.body(data);
+});
 
 // ---- Auth routes ----
 app.get("/auth/login", async (c) => {

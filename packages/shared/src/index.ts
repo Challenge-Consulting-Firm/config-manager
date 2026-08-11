@@ -7,4 +7,5 @@ export * from "./routing.js";
 export * from "./wireless.js";
 export * from "./vlan.js";
 export * from "./meraki.js";
+export * from "./helper.js";
 export * from "./safeReturnPath.js";
