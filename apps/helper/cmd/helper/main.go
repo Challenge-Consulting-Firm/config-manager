@@ -114,7 +114,7 @@ func runCLIFetch(args []string) {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	host := fs.String("host", "", "接続先ホスト（IP またはホスト名）")
 	port := fs.Int("port", 23, "Telnet ポート")
-	osHint := fs.String("os", "cisco-ios", "機種ヒント (cisco-ios | yamaha-rt | generic)")
+	osHint := fs.String("os", "cisco-ios", "機種ヒント (cisco-ios | yamaha-rt | yamaha-swx | generic)")
 	username := fs.String("username", "", "ログインユーザー名")
 	commandOverride := fs.String("command", "", "コンフィグ取得コマンドの上書き（任意）")
 	_ = fs.Parse(args)
@@ -128,7 +128,7 @@ func runCLIFetch(args []string) {
 		os.Exit(2)
 	}
 	if !commands.Valid(*osHint) {
-		fmt.Fprintf(os.Stderr, "--os は cisco-ios | yamaha-rt | generic のいずれかです\n")
+		fmt.Fprintf(os.Stderr, "--os は cisco-ios | yamaha-rt | yamaha-swx | generic のいずれかです\n")
 		os.Exit(2)
 	}
 

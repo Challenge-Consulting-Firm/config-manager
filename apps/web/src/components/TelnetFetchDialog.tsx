@@ -14,6 +14,7 @@ import { apiFetch, ApiError } from "../apiClient";
 import {
   detectHelper,
   fetchConfigViaHelper,
+  HELPER_DETECT_TIMEOUT_INTERACTIVE_MS,
   type HelperPort,
 } from "../utils/helperClient";
 
@@ -66,10 +67,14 @@ export function TelnetFetchDialog({
   } | null>(null);
 
   // 初回マウントでヘルパー検出。
+  //
+  // ダイアログを開く操作が起点なので長めのタイムアウトを使う。Local Network
+  // Access の権限が未応答の場合、ここで権限プロンプトが出る。短く abort すると
+  // プロンプトが閉じてしまい、いつまでも未検出のままになる。
   const probe = useCallback(async () => {
     setProbing(true);
     try {
-      const found = await detectHelper(800);
+      const found = await detectHelper(HELPER_DETECT_TIMEOUT_INTERACTIVE_MS);
       setHelperPort(found?.port ?? null);
     } finally {
       setProbing(false);
@@ -120,10 +125,18 @@ export function TelnetFetchDialog({
         setPhase("idle");
       } else {
         // 失敗コードに応じた既定メッセージ。message があればそちらを優先表示。
+        //
+        // command_rejected だけは機器が返した生の文言（"% Invalid input
+        // detected…" 等）だけでは何を直せばよいか分からないため、日本語の
+        // ラベルと併記する。
         const label = HELPER_ERROR_LABELS[res.code];
+        const detail = res.message?.trim();
         setUploadMsg({
           type: "err",
-          text: res.message?.trim() ? res.message : label,
+          text:
+            res.code === "command_rejected" && detail
+              ? `${label} / 機器の応答: ${detail}`
+              : detail || label,
         });
         setPhase("idle");
       }
@@ -326,11 +339,22 @@ export function TelnetFetchDialog({
               className={inputCls}
             >
               <option value="cisco-ios">Cisco IOS / IOS-XE</option>
-              <option value="yamaha-rt">YAMAHA RT</option>
+              <option value="yamaha-rt">YAMAHA RT（ルーター・show config）</option>
+              {/* SWX は RT と CLI 体系が違う。RT を選ぶと機器が
+                  "% Invalid input detected" を返して取得に失敗する。 */}
+              <option value="yamaha-swx">
+                YAMAHA SWX（スイッチ・show running-config）
+              </option>
               {/* generic は Issue #43 のコマンド上書き（決定事項）のために残すが、
                   フェーズ 1 の正式サポート対象外。コマンド上書き必須。 */}
               <option value="generic">その他（フェーズ1対象外・コマンド指定必須）</option>
             </select>
+            {osHint === "yamaha-rt" && (
+              <span className="mt-1 block text-[11px] text-slate-500">
+                SWX2100/2200/2300/3100/3200 などのスイッチは「YAMAHA SWX」を
+                選んでください。
+              </span>
+            )}
           </label>
           <label className="block sm:col-span-2">
             <span className="mb-1 block text-xs font-medium uppercase text-slate-500">
