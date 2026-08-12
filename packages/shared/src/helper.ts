@@ -24,11 +24,19 @@ export type HelperProtocol = "telnet" | "ssh";
  * ヘルパーはこの値に基づきページング抑制コマンドとコンフィグ取得コマンドを
  * 選ぶ（`commandOverride` があればそちらが優先）。
  *
- * 動作確認済みの機種は Cisco IOS/IOS-XE と YAMAHA RT のみ。IOS-XE は
- * IOS とコマンド体系が同じため `cisco-ios` に含める。`generic` は取得コマンド
- * をユーザーが `commandOverride` で指定する前提。
+ * IOS-XE は IOS とコマンド体系が同じため `cisco-ios` に含める。`generic` は
+ * 取得コマンドをユーザーが `commandOverride` で指定する前提。
+ *
+ * YAMAHA は 2 系統ある点に注意。ルーター（RTX 等）は独自 CLI の `show config`
+ * だが、スイッチ（SWX2100/2200/2300/3100/3200 等）は Cisco 風 CLI で
+ * `show running-config` を使う。`yamaha-rt` を SWX に対して使うと機器が
+ * `% Invalid input detected at '^' marker.` を返すため、別値に分けている。
  */
-export type HelperOsHint = "cisco-ios" | "yamaha-rt" | "generic";
+export type HelperOsHint =
+  | "cisco-ios"
+  | "yamaha-rt"
+  | "yamaha-swx"
+  | "generic";
 
 /**
  * 取得処理の段階別タイムアウト（ミリ秒）。全項目省略可能で、省略時は
@@ -108,6 +116,8 @@ export type HelperFetchErrorCode =
   | "timeout"
   | "pager_detected"
   | "empty_body"
+  /** 機器が取得コマンドを拒否した（コマンド体系の不一致・権限不足など）。 */
+  | "command_rejected"
   | "handshake_failed"
   | "host_key_mismatch";
 
@@ -171,6 +181,8 @@ export const HELPER_ERROR_LABELS: Record<HelperFetchErrorCode, string> = {
   timeout: "タイムアウトしました（機器の応答が遅いか、コマンドが長時間かかる可能性があります）",
   pager_detected: "ページャ（--More--）が残留しています（ページング抑制が効いていない可能性があります）",
   empty_body: "コンフィグ本文を取得できませんでした（空または極端に短い応答です）",
+  command_rejected:
+    "機器が取得コマンドを受け付けませんでした（機種の選択、または特権モードへの昇格を確認してください）",
   handshake_failed:
     "SSH の暗号方式が一致しませんでした（機器が対応する鍵交換方式・暗号を確認してください）",
   host_key_mismatch:

@@ -161,7 +161,8 @@ func (d *fakeTelnetDevice) respond(conn net.Conn, line string) {
 	case line == d.fetchCommand:
 		_, _ = conn.Write([]byte(line + "\r\n" + d.body + "\r\n" + d.prompt))
 	default:
-		_, _ = conn.Write([]byte("\r\n% Invalid input\r\n" + d.prompt))
+		// 実機は受け取ったコマンドをエコーしてからエラー行を返す。
+		_, _ = conn.Write([]byte(line + "\r\n% Invalid input detected at '^' marker.\r\n" + d.prompt))
 	}
 }
 

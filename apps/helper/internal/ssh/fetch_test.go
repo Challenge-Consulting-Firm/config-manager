@@ -176,7 +176,8 @@ func (d *fakeSSHDevice) respond(ch ssh.Channel, line string) {
 	case line == d.fetchCommand:
 		_, _ = ch.Write([]byte(line + "\r\n" + d.body + "\r\n" + d.prompt))
 	default:
-		_, _ = ch.Write([]byte("\r\n% Invalid input\r\n" + d.prompt))
+		// 実機は受け取ったコマンドをエコーしてからエラー行を返す。
+		_, _ = ch.Write([]byte(line + "\r\n% Invalid input detected at '^' marker.\r\n" + d.prompt))
 	}
 }
 
@@ -306,5 +307,44 @@ func TestFetch_HostKeyMismatch(t *testing.T) {
 	}
 	if se.Code != session.CodeHostKeyMismatch {
 		t.Errorf("Code = %q, want %q", se.Code, session.CodeHostKeyMismatch)
+	}
+}
+
+// TestFetch_CommandRejected は機器がコマンドを拒否した場合に
+// command_rejected になることを検証する（SSH 経路でも session 側の
+// 拒否検出が効くこと）。osHint と実機のコマンド体系が食い違うケース。
+func TestFetch_CommandRejected(t *testing.T) {
+	dev := newFakeSSHDevice(t, &fakeSSHDevice{
+		prompt:       "swx3100#",
+		fetchCommand: "show running-config",
+		body:         "hostname swx3100",
+	})
+	host, port := dev.addr()
+
+	// 機器が知らないコマンド（RT 用 "show config"）を送る。
+	cfg := &session.Config{
+		Host:           host,
+		Port:           port,
+		Username:       "admin",
+		Password:       "secret",
+		OSHint:         "yamaha-rt",
+		FetchCommand:   "show config",
+		ConnectTimeout: 3 * time.Second,
+		LoginTimeout:   5 * time.Second,
+		CommandTimeout: 5 * time.Second,
+		TotalTimeout:   15 * time.Second,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := Fetch(ctx, cfg, &Options{
+		KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts"),
+	})
+	se, ok := err.(*session.Error)
+	if !ok {
+		t.Fatalf("*session.Error を返すべき: %T (%v)", err, err)
+	}
+	if se.Code != session.CodeCommandRejected {
+		t.Errorf("Code = %q, want %q (message=%q)", se.Code, session.CodeCommandRejected, se.Message)
 	}
 }

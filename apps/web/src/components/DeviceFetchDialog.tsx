@@ -16,6 +16,7 @@ import { apiFetch, ApiError } from "../apiClient";
 import {
   detectHelper,
   fetchConfigViaHelper,
+  HELPER_DETECT_TIMEOUT_INTERACTIVE_MS,
   type HelperPort,
 } from "../utils/helperClient";
 
@@ -73,10 +74,14 @@ export function DeviceFetchDialog({
   } | null>(null);
 
   // 初回マウントでヘルパー検出。
+  //
+  // ダイアログを開く操作が起点なので長めのタイムアウトを使う。Local Network
+  // Access の権限が未応答の場合、ここで権限プロンプトが出る。短く abort すると
+  // プロンプトが閉じてしまい、いつまでも未検出のままになる。
   const probe = useCallback(async () => {
     setProbing(true);
     try {
-      const found = await detectHelper(800);
+      const found = await detectHelper(HELPER_DETECT_TIMEOUT_INTERACTIVE_MS);
       setHelperPort(found?.port ?? null);
     } finally {
       setProbing(false);
@@ -137,8 +142,10 @@ export function DeviceFetchDialog({
         setDetected(d.confidence > 0 ? d : null);
         setPhase("idle");
       } else {
-        // 失敗コードに応じた日本語メッセージを主に表示し、ヘルパーが返す
-        // 英語の詳細（ホスト鍵の指紋や known_hosts のパスなど）を併記する。
+        // 失敗コードに応じた日本語メッセージを主に表示し、機器やヘルパーが
+        // 返した生の文言（"% Invalid input detected…"、ホスト鍵の指紋、
+        // known_hosts のパスなど）は詳細として併記する。生の文言だけでは
+        // 何を直せばよいか分からないため、ラベルを主にする。
         const label =
           HELPER_ERROR_LABELS[res.code] ?? "コンフィグの取得に失敗しました";
         setUploadMsg({
@@ -363,11 +370,22 @@ export function DeviceFetchDialog({
               className={inputCls}
             >
               <option value="cisco-ios">Cisco IOS / IOS-XE</option>
-              <option value="yamaha-rt">YAMAHA RT</option>
+              <option value="yamaha-rt">YAMAHA RT（ルーター・show config）</option>
+              {/* SWX は RT と CLI 体系が違う。RT を選ぶと機器が
+                  "% Invalid input detected" を返して取得に失敗する。 */}
+              <option value="yamaha-swx">
+                YAMAHA SWX（スイッチ・show running-config）
+              </option>
               {/* generic は Issue #43 のコマンド上書き（決定事項）のために残すが、
                   フェーズ 1 の正式サポート対象外。コマンド上書き必須。 */}
               <option value="generic">その他（フェーズ1対象外・コマンド指定必須）</option>
             </select>
+            {osHint === "yamaha-rt" && (
+              <span className="mt-1 block text-[11px] text-slate-500">
+                SWX2100/2200/2300/3100/3200 などのスイッチは「YAMAHA SWX」を
+                選んでください。
+              </span>
+            )}
           </label>
           <label className="block sm:col-span-2">
             <span className="mb-1 block text-xs font-medium uppercase text-slate-500">

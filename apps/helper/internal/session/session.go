@@ -6,7 +6,7 @@
 //  2. enable 昇格（EnablePassword があれば）
 //  3. 改行を送ってプロンプト文字列を学習
 //  4. ページング抑制コマンド + コンフィグ取得コマンドを送り、本文を回収
-//  5. エコー・プロンプト行を除去し、ページャ残留を検出
+//  5. エコー・プロンプト行を除去し、ページャ残留とコマンド拒否を検出
 //  6. SJIS→UTF-8 変換
 //
 // プロトコル固有の処理（TCP 接続と IAC ネゴシエーション、SSH ハンドシェイクと
@@ -97,6 +97,10 @@ const (
 	CodeEmptyBody       ErrorCode = "empty_body"
 	CodeHandshakeFailed ErrorCode = "handshake_failed"  // SSH: 暗号方式のネゴシエーション失敗
 	CodeHostKeyMismatch ErrorCode = "host_key_mismatch" // SSH: 記録済みホスト鍵と不一致
+	// CodeCommandRejected は機器が取得コマンド自体を受け付けなかった場合。
+	// osHint と実機のコマンド体系が食い違っているか、特権モードに昇格できて
+	// いないケースが典型。
+	CodeCommandRejected ErrorCode = "command_rejected"
 )
 
 // Error は取得失敗時のエラー。Code で機械可読な原因を区別する。
@@ -202,6 +206,15 @@ func Run(ctx context.Context, s Stream, cfg *Config, mode Mode) (*Result, error)
 		return nil, NewError(CodePagerDetected, "pager marker (--More--) remains in body", nil)
 	}
 
+	// 7. コマンド拒否検出
+	//
+	// 機器が取得コマンドを受け付けなかった場合、本文はエラーメッセージだけに
+	// なる。ここで弾かないと "% Invalid input detected at '^' marker." の 2 行が
+	// 正常なコンフィグとして世代登録されてしまう。
+	if msg, rejected := commandRejected(cleaned); rejected {
+		return nil, NewError(CodeCommandRejected, msg, nil)
+	}
+
 	return &Result{
 		Body:           cleaned,
 		Prompt:         prompt,
@@ -226,14 +239,22 @@ func doLogin(ctx context.Context, s Stream, cfg *Config, timeout time.Duration) 
 	// 現れずに > または # プロンプトが出る」こと。簡易のため、一定時間以内に
 	// バッファを読み込みながら状態機械的に進める。
 
-	// まずログインプロンプトを待つ。
-	if err := waitFor(ctx, s, timeout, true, loginPromptRe, passwordRe, promptLineRe); err != nil {
-		// ログインプロンプト前にプロンプトが出た場合はログイン不要の可能性
-		// （パスワード認証なし）。その場合はそのままプロンプトを学習する。
-		if !errors.Is(err, errPromptEarly) {
-			return "", classifyLoginErr(ctx, err)
-		}
-		// プロンプトが先に出た → ユーザー名/パスワード送信せず学習へ。
+	// 最初に何が来るかは機器によって異なる。
+	//   0: "Username:" 等 → ユーザー名 → パスワードの順に送る
+	//   1: "Password:"     → ユーザー名は求められていない。パスワードのみ送る
+	//   2: プロンプト      → 認証なしでログイン済み。何も送らない
+	const (
+		gotLoginPrompt = iota
+		gotPasswordPrompt
+		gotShellPrompt
+	)
+	idx, err := waitForAny(ctx, s, timeout, loginPromptRe, passwordRe, promptLineRe)
+	if err != nil {
+		return "", classifyLoginErr(ctx, err)
+	}
+
+	if idx == gotShellPrompt {
+		// 認証なしでプロンプトが出た → ユーザー名/パスワード送信せず学習へ。
 		p, lerr := learnPrompt(ctx, s, timeout)
 		if lerr != nil {
 			return "", classifyLoginErr(ctx, lerr)
@@ -241,14 +262,24 @@ func doLogin(ctx context.Context, s Stream, cfg *Config, timeout time.Duration) 
 		return p, nil
 	}
 
-	// ユーザー名送信。
-	if err := sendLine(s, cfg.Username); err != nil {
-		return "", NewError(CodeConnectFailed, "failed to send username", err)
-	}
-
-	// Password プロンプトを待つ。
-	if err := waitFor(ctx, s, timeout, false, passwordRe); err != nil {
-		return "", classifyLoginErr(ctx, err)
+	if idx == gotLoginPrompt {
+		// ユーザー名送信。
+		if err := sendLine(s, cfg.Username); err != nil {
+			return "", NewError(CodeConnectFailed, "failed to send username", err)
+		}
+		// Password プロンプトを待つ。ユーザー名だけでログインできる機器も
+		// あるため、プロンプトが出たらそのまま成功として扱う。
+		pidx, err := waitForAny(ctx, s, timeout, passwordRe, promptLineRe)
+		if err != nil {
+			return "", classifyLoginErr(ctx, err)
+		}
+		if pidx == 1 {
+			p, lerr := learnPrompt(ctx, s, timeout)
+			if lerr != nil {
+				return "", classifyLoginErr(ctx, lerr)
+			}
+			return p, nil
+		}
 	}
 
 	// パスワード送信（エコーを避けるため CR のみ）。
@@ -284,21 +315,20 @@ func doEnable(ctx context.Context, s Stream, cfg *Config, timeout time.Duration)
 	if err := sendLine(s, "enable"); err != nil {
 		return NewError(CodeConnectFailed, "failed to send enable command", err)
 	}
-	// enable の Password プロンプトを待つ。既に特権モードの機器では Password を
-	// 求められずプロンプトが返るため、promptIsEarly=true でその分岐を拾う。
-	if err := waitFor(ctx, s, timeout, true, passwordRe, promptLineRe); err != nil {
-		// 既に特権モード（# プロンプト）なら Password プロンプトは来ない。
-		// その場合は成功とみなす。
-		if !errors.Is(err, errPromptEarly) {
-			return classifyLoginErr(ctx, err)
-		}
+	// Password を求められるか、既に特権モードでプロンプトが返るかのどちらか。
+	idx, err := waitForAny(ctx, s, timeout, passwordRe, promptLineRe)
+	if err != nil {
+		return classifyLoginErr(ctx, err)
+	}
+	if idx == 1 {
+		// 既に特権モード（# プロンプト）。パスワード入力は不要。
 		return nil
 	}
 	if err := sendLine(s, cfg.EnablePassword); err != nil {
 		return NewError(CodeConnectFailed, "failed to send enable password", err)
 	}
-	// 昇格後のプロンプト（#）を待つ。ここではプロンプト復帰が成功条件。
-	if err := waitFor(ctx, s, timeout, false, promptLineRe); err != nil {
+	// 昇格後のプロンプト（#）を待つ。
+	if _, err := waitForAny(ctx, s, timeout, promptLineRe); err != nil {
 		return classifyLoginErr(ctx, err)
 	}
 	return nil
@@ -311,8 +341,8 @@ func doFetch(ctx context.Context, s Stream, cfg *Config, prompt string, timeout 
 		if err := sendLine(s, cfg.PagerSuppress); err != nil {
 			return nil, NewError(CodeConnectFailed, "failed to send pager suppress", err)
 		}
-		// 抑制コマンドの応答（プロンプトに戻る）を待つ。プロンプト復帰が成功条件。
-		if err := waitFor(ctx, s, timeout, false, promptLineRe); err != nil {
+		// 抑制コマンドの応答（プロンプトに戻る）を待つ。
+		if _, err := waitForAny(ctx, s, timeout, promptLineRe); err != nil {
 			return nil, classifyLoginErr(ctx, err)
 		}
 	}
@@ -370,37 +400,33 @@ func readLoop(ctx context.Context, s Stream, acc *bytes.Buffer, timeout time.Dur
 	}
 }
 
-// errPromptEarly は「待機中にプロンプトが先に現れた」ことを示すセンチネル。
-var errPromptEarly = errors.New("prompt appeared before expected login prompt")
-
-// waitFor はいずれかの正規表現にマッチするまで読み続ける。res は優先順で評価され、
-// 同時にマッチした場合は先に指定したものが採用される。
+// waitForAny はいずれかの正規表現にマッチするまで読み続け、マッチした
+// パターンの添字を返す。
 //
-// promptIsEarly が true の場合、promptLineRe のマッチは errPromptEarly として返す。
-// これは「認証プロンプトを待っていたのに機器のプロンプトが出た（＝その認証段階が
-// 不要だった）」ケースを呼び出し側で分岐させるためのもので、プロンプト復帰そのものを
-// 待つ場面（ページング抑制コマンドの応答待ちなど）では false を渡すこと。
-func waitFor(ctx context.Context, s Stream, timeout time.Duration, promptIsEarly bool, res ...*regexp.Regexp) error {
+// 「どれにマッチしたか」を呼び出し側へ返すのが要点。機器によってログイン
+// シーケンスは異なり（Username を求める / いきなり Password を出す /
+// 認証なしでプロンプトが出る）、どれが来たかで次に送るものが変わるため。
+//
+// res の順序がそのまま優先順位になる。同時に複数マッチしうる場合は、
+// より具体的なパターンを先に並べること。
+func waitForAny(ctx context.Context, s Stream, timeout time.Duration, res ...*regexp.Regexp) (int, error) {
 	acc := new(bytes.Buffer)
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
 			if isContextTimeout(ctx, nil) {
-				return NewError(CodeTimeout, "login timeout (context deadline)", nil)
+				return -1, NewError(CodeTimeout, "login timeout (context deadline)", nil)
 			}
-			return NewError(CodeAuthFailed, "login prompt timeout", nil)
+			return -1, NewError(CodeAuthFailed, "login prompt timeout", nil)
 		}
 		timedOut, err := readLoop(ctx, s, acc, 300*time.Millisecond)
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			return NewError(CodeConnectFailed, "read error during wait", err)
+			return -1, NewError(CodeConnectFailed, "read error during wait", err)
 		}
 		text := acc.String()
-		for _, re := range res {
+		for i, re := range res {
 			if re.MatchString(text) {
-				if promptIsEarly && re == promptLineRe {
-					return errPromptEarly
-				}
-				return nil
+				return i, nil
 			}
 		}
 		_ = timedOut // ループ継続
@@ -549,6 +575,68 @@ func authFailedSignal(text string) bool {
 	return false
 }
 
+// commandRejectionRes は「機器が取得コマンドを受け付けなかった」ことを示す応答。
+//
+// 各社の CLI が返す定型のエラー行のみを対象にする。コンフィグ本文中の文字列と
+// 衝突しないよう、行頭の "%" や既知の定型文に限定してマッチさせる。
+var commandRejectionRes = []*regexp.Regexp{
+	// Cisco IOS / YAMAHA SWX 系: "% Invalid input detected at '^' marker."
+	regexp.MustCompile(`(?im)^\s*%\s*invalid input detected`),
+	// "% Unknown command" / "% Unrecognized command"
+	regexp.MustCompile(`(?im)^\s*%\s*unknown command`),
+	regexp.MustCompile(`(?im)^\s*%\s*unrecognized command`),
+	// "% Incomplete command."
+	regexp.MustCompile(`(?im)^\s*%\s*incomplete command`),
+	// "% Ambiguous command: ..."
+	regexp.MustCompile(`(?im)^\s*%\s*ambiguous command`),
+	// 権限不足: "% Permission denied" / "Command authorization failed"
+	regexp.MustCompile(`(?im)^\s*%\s*permission denied`),
+	regexp.MustCompile(`(?im)^\s*command authorization failed`),
+	// YAMAHA RT 系: "Error: unknown command" / "エラー: コマンドが違います"
+	regexp.MustCompile(`(?im)^\s*error:\s*unknown command`),
+	regexp.MustCompile(`(?im)^\s*エラー`),
+	// 汎用シェル系（generic で誤ったコマンドを指定した場合）。
+	// "-sh: show: command not found" のように接頭辞が付くため行頭には固定しない。
+	regexp.MustCompile(`(?im)command not found`),
+	regexp.MustCompile(`(?im)^\s*syntax error`),
+}
+
+// commandRejected は本文がコマンド拒否の応答かどうかを判定し、
+// 該当した場合は原因となった行をメッセージとして返す。
+//
+// 拒否パターンを含んでいても本文が十分に長い場合は、コンフィグ本文の一部に
+// たまたま一致しただけとみなして通す（誤検出でユーザーの取得を失敗させない）。
+func commandRejected(body string) (string, bool) {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return "", false
+	}
+	// 正常な running-config がこの行数に収まることはまずない。長い本文の中の
+	// 一致は誤検出とみなす。
+	const maxRejectionLines = 10
+	if strings.Count(trimmed, "\n")+1 > maxRejectionLines {
+		return "", false
+	}
+	for _, re := range commandRejectionRes {
+		if loc := re.FindString(trimmed); loc != "" {
+			return "device rejected the fetch command: " +
+					strings.TrimSpace(firstMatchingLine(trimmed, re)),
+				true
+		}
+	}
+	return "", false
+}
+
+// firstMatchingLine は re に最初に一致した行を返す（メッセージ表示用）。
+func firstMatchingLine(text string, re *regexp.Regexp) string {
+	for _, line := range strings.Split(text, "\n") {
+		if re.MatchString(line) {
+			return line
+		}
+	}
+	return text
+}
+
 // cleanBody はコマンドエコー・プロンプト行を除去し、純粋なコンフィグ本文を抽出する。
 //
 // 除去対象:
@@ -619,10 +707,6 @@ func sanitizeUTF8(s string) string {
 func classifyLoginErr(ctx context.Context, err error) *Error {
 	if err == nil {
 		return nil
-	}
-	if errors.Is(err, errPromptEarly) {
-		// プロンプトが先に出た → ログイン不要 → 呼び出し側で処理されるはず。
-		return NewError(CodePromptNotFound, "unexpected prompt before login", err)
 	}
 	var se *Error
 	if errors.As(err, &se) {

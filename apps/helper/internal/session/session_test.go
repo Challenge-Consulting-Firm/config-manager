@@ -3,6 +3,8 @@ package session
 import (
 	"bytes"
 	"context"
+	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -491,6 +493,155 @@ func TestAuthFailedSignal(t *testing.T) {
 		t.Run(tt.text, func(t *testing.T) {
 			if got := authFailedSignal(tt.text); got != tt.want {
 				t.Errorf("authFailedSignal(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCommandRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			// SWX3100 に YAMAHA RT 用の "show config" を送ったときの実応答。
+			name: "cisco style invalid input",
+			body: "                          ^\n% Invalid input detected at '^' marker.",
+			want: true,
+		},
+		{
+			name: "unknown command",
+			body: "% Unknown command.",
+			want: true,
+		},
+		{
+			name: "incomplete command",
+			body: "% Incomplete command.",
+			want: true,
+		},
+		{
+			name: "ambiguous command",
+			body: "% Ambiguous command: \"sh conf\"",
+			want: true,
+		},
+		{
+			name: "permission denied",
+			body: "% Permission denied",
+			want: true,
+		},
+		{
+			name: "yamaha rt japanese error",
+			body: "エラー: コマンドが違います",
+			want: true,
+		},
+		{
+			name: "shell command not found",
+			body: "-sh: show: command not found",
+			want: true,
+		},
+		{
+			name: "normal config is not rejected",
+			body: "!\nhostname swx3100\n!\ninterface port1.1\n switchport mode access\n!\nend",
+			want: false,
+		},
+		{
+			// 本文が十分に長ければ、途中の "%" 行は誤検出とみなして通す。
+			name: "long body with percent line passes",
+			body: "!\nhostname r1\n" + strings.Repeat("line\n", 20) +
+				"% Invalid input detected at '^' marker.\n" + strings.Repeat("line\n", 20),
+			want: false,
+		},
+		{
+			name: "empty body",
+			body: "   \n  ",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, got := commandRejected(tt.body)
+			if got != tt.want {
+				t.Errorf("commandRejected() = %v, want %v (msg=%q)", got, tt.want, msg)
+			}
+			if got && msg == "" {
+				t.Error("rejected but message is empty")
+			}
+		})
+	}
+}
+
+// TestWaitForAny は「どのパターンにマッチしたか」が正しく返ることを検証する。
+// net.Pipe の net.Conn をそのまま Stream として渡す（Read/Write/SetReadDeadline
+// を満たすため）。
+//
+// 回帰防止: 以前の実装は promptLineRe を単独で渡した場合でも「プロンプトが
+// 先に出た」エラーを返しており、ページング抑制後やenable昇格後のプロンプト
+// 待ちが必ず失敗していた（症状: unexpected prompt before login）。
+func TestWaitForAny(t *testing.T) {
+	tests := []struct {
+		name    string
+		send    string
+		res     []*regexp.Regexp
+		wantIdx int
+	}{
+		{
+			// ページング抑制後・enable 昇格後のプロンプト待ち。
+			name:    "prompt only succeeds",
+			send:    "swx3100#",
+			res:     []*regexp.Regexp{promptLineRe},
+			wantIdx: 0,
+		},
+		{
+			name:    "username prompt wins",
+			send:    "\r\nUsername: ",
+			res:     []*regexp.Regexp{loginPromptRe, passwordRe, promptLineRe},
+			wantIdx: 0,
+		},
+		{
+			// ユーザー名を求めず、いきなり Password を出す機器。
+			name:    "password prompt without username",
+			send:    "\r\nPassword: ",
+			res:     []*regexp.Regexp{loginPromptRe, passwordRe, promptLineRe},
+			wantIdx: 1,
+		},
+		{
+			// 認証なしでプロンプトが出る機器。
+			name:    "shell prompt means no auth",
+			send:    "\r\nrt1>",
+			res:     []*regexp.Regexp{loginPromptRe, passwordRe, promptLineRe},
+			wantIdx: 2,
+		},
+		{
+			name:    "enable asks for password",
+			send:    "\r\nPassword: ",
+			res:     []*regexp.Regexp{passwordRe, promptLineRe},
+			wantIdx: 0,
+		},
+		{
+			// enable 済みならプロンプトがそのまま返る。
+			name:    "enable already privileged",
+			send:    "\r\nswx3100#",
+			res:     []*regexp.Regexp{passwordRe, promptLineRe},
+			wantIdx: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			// 接続は閉じない。閉じると waitForAny が EOF を読み取り、
+			// マッチ判定に到達する前に read error として返ってしまう。
+			defer server.Close()
+			go func() { _, _ = server.Write([]byte(tt.send)) }()
+			idx, err := waitForAny(
+				context.Background(), client, 3*time.Second, tt.res...,
+			)
+			if err != nil {
+				t.Fatalf("waitForAny() error = %v", err)
+			}
+			if idx != tt.wantIdx {
+				t.Errorf("waitForAny() idx = %d, want %d", idx, tt.wantIdx)
 			}
 		})
 	}

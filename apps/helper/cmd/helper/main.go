@@ -124,7 +124,7 @@ func runCLIFetch(args []string) {
 	// ポート既定値はプロトコルに応じて後段で決めるため 0 を初期値にする。
 	port := fs.Int("port", 0, "接続ポート（既定: telnet=23 / ssh=22）")
 	protocol := fs.String("protocol", "telnet", "接続プロトコル (telnet | ssh)")
-	osHint := fs.String("os", "cisco-ios", "機種ヒント (cisco-ios | yamaha-rt | generic)")
+	osHint := fs.String("os", "cisco-ios", "機種ヒント (cisco-ios | yamaha-rt | yamaha-swx | generic)")
 	username := fs.String("username", "", "ログインユーザー名")
 	commandOverride := fs.String("command", "", "コンフィグ取得コマンドの上書き（任意）")
 	knownHosts := fs.String("known-hosts", "", "SSH の known_hosts パス（既定: OS のユーザー設定ディレクトリ）")
@@ -151,7 +151,7 @@ func runCLIFetch(args []string) {
 		os.Exit(2)
 	}
 	if !commands.Valid(*osHint) {
-		fmt.Fprintf(os.Stderr, "--os は cisco-ios | yamaha-rt | generic のいずれかです\n")
+		fmt.Fprintf(os.Stderr, "--os は cisco-ios | yamaha-rt | yamaha-swx | generic のいずれかです\n")
 		os.Exit(2)
 	}
 

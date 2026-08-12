@@ -5,9 +5,13 @@ import {
   detectHelperAssetKey,
   resolveHelperAsset,
   shutdownHelper,
+  HELPER_DETECT_TIMEOUT_INTERACTIVE_MS,
   type HelperLatestManifest,
   type HelperAssetKey,
 } from "../utils/helperClient";
+
+/** 自動ポーリングの最大回数（4 秒間隔）。以降は手動の「接続テスト」に委ねる。 */
+const MAX_AUTO_POLLS = 5;
 
 /**
  * 「ローカル取得のセットアップ」画面。
@@ -32,6 +36,9 @@ export function HelperSetupPage() {
     null,
   );
   const pollTimer = useRef<number | null>(null);
+  // 検出処理が pending 中かどうか。権限プロンプト表示中に次の検出が重ならない
+  // ようにする（setProbing は非同期反映のため setInterval からは参照できない）。
+  const probingRef = useRef(false);
 
   // 初回マウントでマニフェスト取得と OS 判定。
   useEffect(() => {
@@ -46,28 +53,54 @@ export function HelperSetupPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const stopPolling = useCallback(() => {
+    if (pollTimer.current) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+  }, []);
+
   // 検出されていない場合は定期ポーリング（セットアップ直後の検出用）。
+  //
+  // ただし無期限には回さない。ユーザーが Local Network Access の権限を
+  // 「ブロック」した場合、以後の検出は即座に失敗し続けるため、回し続けても
+  // 意味がない。数回で打ち切り、以降は「接続テスト」ボタンに委ねる。
   useEffect(() => {
     if (detectedPort) {
-      if (pollTimer.current) {
-        clearInterval(pollTimer.current);
-        pollTimer.current = null;
-      }
+      stopPolling();
       return;
     }
+    let remaining = MAX_AUTO_POLLS;
     pollTimer.current = window.setInterval(() => {
+      if (remaining <= 0) {
+        stopPolling();
+        return;
+      }
+      remaining -= 1;
       void probeOnce();
     }, 4000);
-    return () => {
-      if (pollTimer.current) clearInterval(pollTimer.current);
-    };
+    return stopPolling;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detectedPort]);
 
-  const probeOnce = useCallback(async (): Promise<number | null> => {
+  // 検出は常に長いタイムアウトで待つ。
+  //
+  // 「長い＝遅い」ではない。ヘルパーが起動していなければ 127.0.0.1 への接続は
+  // 即 ECONNREFUSED で返るため、実際に待たされるのは Local Network Access の
+  // 権限プロンプトが表示されている間だけ、つまり待つべきときだけである。
+  // 逆に短いタイムアウトで abort すると、そのプロンプトを自分で閉じてしまい
+  // 永久に未検出のままになる。
+  //
+  // pending 中の多重実行は probingRef で抑止する（ポーリングが重なると
+  // プロンプトが並んで出るため）。
+  const probeOnce = useCallback(async (
+    timeoutMs = HELPER_DETECT_TIMEOUT_INTERACTIVE_MS,
+  ): Promise<number | null> => {
+    if (probingRef.current) return null;
+    probingRef.current = true;
     setProbing(true);
     try {
-      const found = await detectHelper(800);
+      const found = await detectHelper(timeoutMs);
       if (found) {
         setDetectedPort(found.port);
         setHelperVersion(found.status.version);
@@ -78,22 +111,31 @@ export function HelperSetupPage() {
         return null;
       }
     } finally {
+      probingRef.current = false;
       setProbing(false);
     }
   }, []);
 
   async function retest() {
     setMsg(null);
+    // 背景ポーリングを止めてから実行する。ポーリングの abort が
+    // Local Network Access の権限プロンプトを閉じてしまうため。
+    stopPolling();
     // probeOnce の戻り値（最新の検出結果）を直接使う。React state は非同期更新で
     // 同じ関数内では古い値になるため、闭包の detectedPort を参照すると成败メッセージが
     // 反転する。
-    const port = await probeOnce();
+    // ユーザー操作起点なので長いタイムアウトを使い、権限プロンプトへ
+    // 応答する時間を確保する。
+    const port = await probeOnce(HELPER_DETECT_TIMEOUT_INTERACTIVE_MS);
     setMsg(
       port
         ? { type: "ok", text: "ヘルパーを検出しました。" }
         : {
             type: "info",
-            text: "ヘルパーは検出されませんでした。起動手順に従ってヘルパーを起動してください。",
+            text:
+              "ヘルパーは検出されませんでした。起動手順に従ってヘルパーを起動してください。" +
+              "起動済みの場合は、ブラウザの「ローカルネットワークへのアクセス」が" +
+              "ブロックされていないかご確認ください（手順 2 の注記を参照）。",
           },
     );
   }
@@ -136,6 +178,19 @@ export function HelperSetupPage() {
   const manifestAssetKeys = manifest
     ? (Object.keys(manifest.assets) as HelperAssetKey[])
     : [];
+
+  // macOS はブラウザ経由のダウンロードで実行権限（+x）が落ち、隔離属性が付く。
+  // そのままダブルクリックするとテキストエディットで開いてしまうため、
+  // ターミナルで実行してもらうコマンドを提示する。
+  const isMac = preferredKey?.startsWith("darwin") ?? false;
+  const macBinaryName =
+    resolvedAsset?.url.split("/").pop() || "config-manager-helper";
+  const macSetupCommands = [
+    "cd ~/Downloads",
+    `chmod +x ${macBinaryName}`,
+    `xattr -d com.apple.quarantine ${macBinaryName}`,
+    `./${macBinaryName}`,
+  ].join("\n");
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -285,13 +340,69 @@ export function HelperSetupPage() {
         <h2 className="mb-2 text-sm font-semibold uppercase text-slate-500">
           手順 2. ヘルパーを起動
         </h2>
-        <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-700">
-          <li>ダウンロードしたバイナリをダブルクリックして起動してください。</li>
-          <li>
-            コンソールウィンドウが開き「待ち受けポート: 53712」と表示されたら
-            準備完了です。上記「ヘルパーの状態」が自動的に「稼働中」に切り替わります。
-          </li>
-        </ol>
+        {isMac ? (
+          <>
+            <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-700">
+              <li>
+                ダウンロードしたファイルには実行権限が付いていないため、
+                そのままダブルクリックするとテキストエディットで開いてしまいます。
+                ターミナル（アプリケーション &gt; ユーティリティ）で下記を実行してください。
+              </li>
+              <li>
+                「待ち受けポート: 53712」と表示されたら準備完了です。
+                上記「ヘルパーの状態」が自動的に「稼働中」に切り替わります。
+              </li>
+            </ol>
+            <div className="mt-3">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-xs font-medium text-slate-600">
+                  ターミナルに貼り付けて実行:
+                </span>
+                <button
+                  type="button"
+                  className="rounded border border-slate-300 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50"
+                  onClick={() => {
+                    void navigator.clipboard
+                      .writeText(macSetupCommands)
+                      .then(() =>
+                        setMsg({ type: "ok", text: "コマンドをコピーしました。" }),
+                      );
+                  }}
+                >
+                  コピー
+                </button>
+              </div>
+              <pre className="overflow-x-auto rounded-md bg-slate-800 px-3 py-2 text-xs leading-relaxed text-slate-100">
+                {macSetupCommands}
+              </pre>
+              <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-slate-600">
+                <li>
+                  <code className="rounded bg-slate-100 px-1">chmod +x</code> は実行権限の付与です。
+                </li>
+                <li>
+                  <code className="rounded bg-slate-100 px-1">xattr -d</code> は
+                  ダウンロード時に付く隔離属性の解除です（未署名バイナリのため
+                  Gatekeeper にブロックされます）。
+                </li>
+                <li>
+                  2 回目以降は
+                  <code className="rounded bg-slate-100 px-1">
+                    ~/Downloads/config-manager-helper
+                  </code>
+                  を実行するだけで起動できます。
+                </li>
+              </ul>
+            </div>
+          </>
+        ) : (
+          <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-700">
+            <li>ダウンロードしたバイナリをダブルクリックして起動してください。</li>
+            <li>
+              コンソールウィンドウが開き「待ち受けポート: 53712」と表示されたら
+              準備完了です。上記「ヘルパーの状態」が自動的に「稼働中」に切り替わります。
+            </li>
+          </ol>
+        )}
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
           <p className="font-semibold">未署名バイナリの警告が出る場合:</p>
           <ul className="mt-1 list-disc space-y-0.5 pl-5">
@@ -301,10 +412,24 @@ export function HelperSetupPage() {
               「実行」を選んでください。
             </li>
             <li>
-              <span className="font-medium">macOS:</span> Gatekeeper で開けない場合は、
-              Finder でバイナリを右クリック →「開く」を選んでください（初回のみ）。
+              <span className="font-medium">macOS:</span> 上記の
+              <code className="rounded bg-amber-100 px-1">xattr -d</code>
+              を実行せずに開いた場合は Gatekeeper にブロックされます。
+              その場合は Finder でバイナリを右クリック →「開く」を選んでください。
             </li>
           </ul>
+        </div>
+        <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+          <p className="font-semibold">
+            「ローカルネットワークへのアクセス」の確認が出た場合:
+          </p>
+          <p className="mt-1">
+            ヘルパーは PC 内（127.0.0.1）で待ち受けるため、Chrome 138 以降では
+            本サイトからの接続にユーザーの許可が必要です。確認ダイアログが出たら
+            「許可」を選んでください。誤って「ブロック」した場合は、アドレスバー左の
+            アイコン → サイトの設定から「ローカルネットワークへのアクセス」を
+            「許可」に変更してください。
+          </p>
         </div>
       </section>
 

@@ -20,52 +20,98 @@ import {
 export type HelperPort = number;
 
 /**
- * 各候補ポートへ並列で status ポーリングを行い、最初に応答したポートを返す。
- * タイムアウト（既定 800ms）以内に応答がなければ null。
+ * ユーザー操作起点（「接続テスト」ボタン等）の検出タイムアウト。
  *
- * ポートは最大 5 つだが、接続できないポートは即 ECONNREFUSED になるため、
- * Promise.race ではなく全件並列で投げて最初の成功を採用する。
+ * Local Network Access の権限プロンプトへ応答する時間を確保するため長めに取る。
+ * 背景の自動ポーリングで使う 800ms とは用途が異なる。
+ */
+export const HELPER_DETECT_TIMEOUT_INTERACTIVE_MS = 60_000;
+
+/** 前回ヘルパーを見つけたポートの記憶に使う localStorage キー。 */
+const LAST_PORT_STORAGE_KEY = "config-manager:helper-port";
+
+function readLastPort(): number | null {
+  try {
+    const v = Number(localStorage.getItem(LAST_PORT_STORAGE_KEY));
+    return (HELPER_PORT_CANDIDATES as readonly number[]).includes(v) ? v : null;
+  } catch {
+    // localStorage が使えない環境（プライベートモード等）では記憶しない。
+    return null;
+  }
+}
+
+function writeLastPort(port: number | null): void {
+  try {
+    if (port === null) localStorage.removeItem(LAST_PORT_STORAGE_KEY);
+    else localStorage.setItem(LAST_PORT_STORAGE_KEY, String(port));
+  } catch {
+    // 保存できなくても検出自体は動くので無視する。
+  }
+}
+
+/** 単一ポートへ status を撃つ。応答がヘルパーでなければ null。 */
+async function probePort(
+  port: number,
+  timeoutMs: number,
+): Promise<{ port: HelperPort; status: HelperStatusResponse } | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/status`, {
+      method: "GET",
+      signal: ctrl.signal,
+      // Local Network Access のため、明示的に credentialed にしない。
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as HelperStatusResponse;
+    if (!json.ok) return null;
+    return { port, status: json };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 候補ポートを順に叩き、最初に応答したポートを返す。
+ * タイムアウト以内にどのポートも応答しなければ null。
+ *
+ * **逐次探索にしている理由**: 全ポートを並列で叩くと、ヘルパーが使っていない
+ * 4 ポート分の `net::ERR_CONNECTION_REFUSED` が毎回 DevTools コンソールに
+ * 出る。これはブラウザがネットワーク層で直接出力するもので、fetch を
+ * try/catch しても抑制できない。接続拒否は即座に返るため、逐次でも実測の
+ * 所要時間はほぼ変わらない。
+ *
+ * 前回見つけたポートを localStorage に記憶して最初に試すので、通常は 1 回の
+ * リクエストで検出が終わり、コンソールは綺麗なままになる。
+ *
+ * **タイムアウトの注意**: Chrome 138 以降の Local Network Access では、
+ * 公開サイトから 127.0.0.1 への初回アクセス時に権限プロンプトが表示され、
+ * ユーザーが応答するまで fetch は解決しない。短いタイムアウトで abort すると
+ * プロンプトが消えて権限が記録されないため、ユーザー操作起点の検出では
+ * HELPER_DETECT_TIMEOUT_INTERACTIVE_MS を使うこと。
  */
 export async function detectHelper(
   timeoutMs = 800,
 ): Promise<{ port: HelperPort; status: HelperStatusResponse } | null> {
-  const controllers = HELPER_PORT_CANDIDATES.map(() => new AbortController());
-  const timeout = setTimeout(() => {
-    for (const c of controllers) c.abort();
-  }, timeoutMs);
+  const lastPort = readLastPort();
+  const order = lastPort
+    ? [lastPort, ...HELPER_PORT_CANDIDATES.filter((p) => p !== lastPort)]
+    : [...HELPER_PORT_CANDIDATES];
 
-  const probes = HELPER_PORT_CANDIDATES.map(async (port, i) => {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/status`, {
-        method: "GET",
-        signal: controllers[i].signal,
-        // Private Network Access のため、明示的に credentialed にしない。
-      });
-      if (!res.ok) return null;
-      const json = (await res.json()) as HelperStatusResponse;
-      if (!json.ok) return null;
-      // 最初に成功したら他の probe を中止。
-      for (const c of controllers) {
-        if (c !== controllers[i]) c.abort();
-      }
-      // HelperPort は number のエイリアスなので、port（联合型のリテラル）は
-      // そのまま代入可能。
-      return { port: port as number, status: json };
-    } catch {
-      return null;
+  const deadline = Date.now() + timeoutMs;
+  for (const port of order) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const found = await probePort(port, remaining);
+    if (found) {
+      writeLastPort(found.port);
+      return found;
     }
-  });
-
-  try {
-    const results = await Promise.all(probes);
-    return (
-      results.find(
-        (r): r is { port: number; status: HelperStatusResponse } => r !== null,
-      ) ?? null
-    );
-  } finally {
-    clearTimeout(timeout);
   }
+  writeLastPort(null);
+  return null;
 }
 
 /**

@@ -211,7 +211,7 @@ func (s *Server) routes() http.Handler {
 	return mux
 }
 
-// withCORS は CORS / Private Network Access のプリフライトと Origin チェックを適用する。
+// withCORS は CORS / ローカルネットワークアクセスのプリフライトと Origin チェックを適用する。
 func (s *Server) withCORS(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -221,12 +221,13 @@ func (s *Server) withCORS(h http.HandlerFunc) http.HandlerFunc {
 		w.Header().Add("Vary", "Origin")
 
 		if r.Method == http.MethodOptions {
-			// プリフライト応答。許可 Origin にのみ PNA・CORS ヘッダを付与。
+			// プリフライト応答。許可 Origin にのみ LNA/PNA・CORS ヘッダを付与。
 			if origin != "" && originAllowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+				setLocalNetworkHeaders(w)
 				w.Header().Set("Access-Control-Allow-Headers", "content-type")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -250,11 +251,26 @@ func (s *Server) withCORS(h http.HandlerFunc) http.HandlerFunc {
 		// 許可 Origin には CORS ヘッダを付与（GET も含む）。
 		if origin != "" && originAllowed {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			setLocalNetworkHeaders(w)
 		}
 
 		h(w, r)
 	}
+}
+
+// setLocalNetworkHeaders は、公開サイト（https）から loopback アドレスへの
+// リクエストを許可するためのヘッダを付与する。
+//
+// Chrome は当初 Private Network Access（PNA）として
+// Access-Control-Allow-Private-Network を要求していたが、Chrome 138 以降は
+// Local Network Access（LNA）へ置き換わり Access-Control-Allow-Local-Network-Access
+// を見るようになった。新旧どちらのブラウザでも通るよう両方を返す。
+//
+// なお LNA ではこのヘッダに加えてユーザーの許可（ブラウザの権限プロンプト）も
+// 必要になる。ヘッダだけでは通らない点に注意。
+func setLocalNetworkHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Local-Network-Access", "true")
+	w.Header().Set("Access-Control-Allow-Private-Network", "true")
 }
 
 // originAllowed は Origin が allowlist に含まれるかを返す。
