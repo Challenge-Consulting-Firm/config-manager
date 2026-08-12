@@ -125,11 +125,22 @@ lipo -create -output config-manager-helper config-manager-helper-arm64 config-ma
 
 ### サーバモード（通常利用）
 
-ダブルクリック、または端末から起動します。
+Windows はダブルクリック、macOS / Linux は端末から起動します。
 
 ```bash
 ./config-manager-helper
 ```
+
+> **macOS の注意**: ブラウザでダウンロードしたファイルは実行権限（`+x`）が落ちるため、
+> ダブルクリックするとテキストエディットで開いてしまいます。また未署名（ad-hoc 署名）の
+> ため Gatekeeper の隔離属性も外す必要があります。初回のみ以下を実行してください。
+>
+> ```bash
+> cd ~/Downloads
+> chmod +x config-manager-helper
+> xattr -d com.apple.quarantine config-manager-helper
+> ./config-manager-helper
+> ```
 
 起動時に許可 Origin を追加指定できます（staging 確認等）:
 
@@ -198,7 +209,7 @@ export HELPER_ENABLE_PASSWORD='***'   # 任意（Cisco enable 昇格用）
 | ------------- | ------------ | ------------------------------------------------- |
 | `--host`      | （必須）     | 接続先ホスト（IP またはホスト名）                 |
 | `--port`      | 23           | Telnet ポート                                     |
-| `--os`        | `cisco-ios`  | 機種ヒント（`cisco-ios` / `yamaha-rt` / `generic`）|
+| `--os`        | `cisco-ios`  | 機種ヒント（`cisco-ios` / `yamaha-rt` / `yamaha-swx` / `generic`）|
 | `--username`  | （必須）     | ログインユーザー名                                |
 | `--command`   | （os 別既定）| コンフィグ取得コマンドの上書き                    |
 
@@ -308,11 +319,21 @@ Telnet 取得の実行。リクエストボディ（JSON）:
 
 ## OS 別コマンドマップ（フェーズ 1）
 
-| osHint      | ページング抑制      | コンフィグ取得        |
-| ----------- | ------------------- | --------------------- |
-| `cisco-ios` | `terminal length 0` | `show running-config` |
-| `yamaha-rt` | （不要）            | `show config`         |
-| `generic`   | `terminal length 0` を試行 | `commandOverride` 必須 |
+| osHint       | ページング抑制      | コンフィグ取得        | 対象機器 |
+| ------------ | ------------------- | --------------------- | -------- |
+| `cisco-ios`  | `terminal length 0` | `show running-config` | Cisco IOS / IOS-XE |
+| `yamaha-rt`  | （不要）            | `show config`         | YAMAHA ルーター（RTX 等） |
+| `yamaha-swx` | `terminal length 0` | `show running-config` | YAMAHA スイッチ（SWX2100/2200/2300/3100/3200 等） |
+| `generic`    | `terminal length 0` を試行 | `commandOverride` 必須 | その他 |
+
+> **YAMAHA は 2 系統ある点に注意**: ルーター（RTX）とスイッチ（SWX）で CLI 体系が
+> 異なります。SWX は Cisco 風の CLI を持つため、`yamaha-rt` を指定して `show config`
+> を送ると機器が `% Invalid input detected at '^' marker.` を返して失敗します。
+> スイッチには必ず `yamaha-swx` を使ってください。
+
+機器が取得コマンドを受け付けなかった場合、ヘルパーは本文を世代として返さず
+`command_rejected` エラーで失敗させます（エラーメッセージがコンフィグとして
+登録されるのを防ぐため）。
 
 ---
 

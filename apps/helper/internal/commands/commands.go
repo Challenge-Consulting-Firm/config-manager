@@ -17,9 +17,10 @@ type CommandSet struct {
 
 // OsHint 定数。packages/shared/src/helper.ts の HelperOsHint と一致させる。
 const (
-	OsHintCiscoIOS = "cisco-ios"
-	OsHintYamahaRT = "yamaha-rt"
-	OsHintGeneric  = "generic"
+	OsHintCiscoIOS  = "cisco-ios"
+	OsHintYamahaRT  = "yamaha-rt"
+	OsHintYamahaSWX = "yamaha-swx"
+	OsHintGeneric   = "generic"
 )
 
 // Lookup は osHint に対応するコマンドセットを返す。
@@ -39,6 +40,14 @@ func Lookup(osHint string) CommandSet {
 		return CommandSet{
 			PagerSuppress: "",
 			Fetch:         "show config",
+		}
+	case OsHintYamahaSWX:
+		// YAMAHA SWX（L2/L3 スイッチ）は RT と CLI 体系が異なり、Cisco 風の
+		// "show running-config" / "terminal length 0" を使う。RT 用の
+		// "show config" を送ると "% Invalid input detected at '^' marker." を返す。
+		return CommandSet{
+			PagerSuppress: "terminal length 0",
+			Fetch:         "show running-config",
 		}
 	case OsHintGeneric:
 		// generic: フェーズ 1 では動作確認対象外（正式サポートは Cisco IOS/IOS-XE と
@@ -60,7 +69,7 @@ func Lookup(osHint string) CommandSet {
 // Valid は osHint が既知の値かを返す。
 func Valid(osHint string) bool {
 	switch osHint {
-	case OsHintCiscoIOS, OsHintYamahaRT, OsHintGeneric:
+	case OsHintCiscoIOS, OsHintYamahaRT, OsHintYamahaSWX, OsHintGeneric:
 		return true
 	default:
 		return false
