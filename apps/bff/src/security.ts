@@ -8,9 +8,25 @@
  */
 
 import type { Context, Next } from "hono";
+import { HELPER_PORT_CANDIDATES } from "@config-manager/shared";
 
 /** Methods that mutate server state and therefore require CSRF defenses. */
 const STATE_CHANGING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+/**
+ * connect-src entries for the local Telnet helper.
+ *
+ * The SPA talks to the helper on 127.0.0.1 over plain HTTP, which the default
+ * `connect-src 'self'` blocks outright — the browser refuses the request before
+ * CORS or Local Network Access are ever consulted.
+ *
+ * Only the exact loopback ports the helper can bind to are listed. CSP has no
+ * port-range syntax, and a wildcard (`http://127.0.0.1:*`) would widen this to
+ * every local service, so the candidate list is expanded verbatim.
+ */
+const HELPER_CONNECT_SRC = HELPER_PORT_CANDIDATES.map(
+  (port) => `http://127.0.0.1:${port}`,
+).join(" ");
 
 /**
  * Derive the set of accepted request origins from PUBLIC_BASE_URL.
@@ -153,7 +169,8 @@ export async function securityHeaders(c: Context, next: Next) {
     "camera=(), microphone=(), geolocation=(), payment=()",
   );
   // frame-ancestors mirrors X-Frame-Options for modern browsers.
-  // connect-src includes 'self' only; Meraki/Kintone calls go server-side.
+  // connect-src is 'self' plus the loopback ports of the local Telnet helper;
+  // Meraki/Kintone calls go server-side.
   h.set(
     "Content-Security-Policy",
     [
@@ -167,7 +184,7 @@ export async function securityHeaders(c: Context, next: Next) {
       // React/Tailwind may set style attributes; keep scripts strict.
       "style-src 'self' 'unsafe-inline'",
       "script-src 'self'",
-      "connect-src 'self'",
+      `connect-src 'self' ${HELPER_CONNECT_SRC}`,
     ].join("; "),
   );
   // HSTS only when the request itself is HTTPS (or behind a TLS-terminating
