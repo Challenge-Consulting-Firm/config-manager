@@ -2,12 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   detectDeviceInfo,
+  HELPER_DEFAULT_PORTS,
   HELPER_DEFAULT_TIMEOUTS,
   HELPER_ERROR_LABELS,
   type DeviceIdentifiers,
   type DeviceDetection,
   type HelperFetchResponse,
   type HelperOsHint,
+  type HelperProtocol,
   type Role,
 } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
@@ -18,17 +20,17 @@ import {
 } from "../utils/helperClient";
 
 /**
- * Telnet 取得ダイアログ。
+ * コンフィグ取得ダイアログ（Telnet / SSH）。
  *
- * ローカルヘルパー経由で NW 機器から Telnet でコンフィグを取得し、
+ * ローカルヘルパー経由で NW 機器からコンフィグを取得し、
  * 取得した本文を既存の `/api/upload` フロー（same-origin + cookie セッション）
  * で世代登録する。パスワード類は BFF には送信されず、ヘルパーとの通信にのみ
  * 使われる（設計は Issue #43 最終コメント）。
  *
- * `note` に `source=local-helper` / 対象 IP / 使用コマンドを記録し、
+ * `note` に `source=local-helper` / プロトコル / 対象 IP / 使用コマンドを記録し、
  * 作業履歴で取得経路が追えるようにする。
  */
-export function TelnetFetchDialog({
+export function DeviceFetchDialog({
   identifiers,
   onClose,
   onCompleted,
@@ -44,7 +46,10 @@ export function TelnetFetchDialog({
 
   // 接続情報（都度入力）。ホストは既定で identifiers.ipAddress を補完。
   const [host, setHost] = useState(identifiers.ipAddress ?? "");
-  const [port, setPort] = useState(23);
+  // プロトコルは既存運用を変えないため Telnet を既定にする（SSH 対応機器では
+  // SSH を選ぶよう UI で促す）。
+  const [protocol, setProtocol] = useState<HelperProtocol>("telnet");
+  const [port, setPort] = useState<number>(HELPER_DEFAULT_PORTS.telnet);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [enablePassword, setEnablePassword] = useState("");
@@ -63,6 +68,8 @@ export function TelnetFetchDialog({
   const [uploadMsg, setUploadMsg] = useState<{
     type: "ok" | "err" | "info";
     text: string;
+    /** 補助情報（ヘルパーが返す英語の詳細メッセージなど）。 */
+    detail?: string;
   } | null>(null);
 
   // 初回マウントでヘルパー検出。
@@ -79,6 +86,17 @@ export function TelnetFetchDialog({
   useEffect(() => {
     void probe();
   }, [probe]);
+
+  /**
+   * プロトコル切替。ポートが切替前プロトコルの既定値のままなら、新しい
+   * プロトコルの既定値へ追従させる（ユーザーが手で変えた値は保持する）。
+   */
+  function changeProtocol(next: HelperProtocol) {
+    setPort((prev) =>
+      prev === HELPER_DEFAULT_PORTS[protocol] ? HELPER_DEFAULT_PORTS[next] : prev,
+    );
+    setProtocol(next);
+  }
 
   async function runFetch() {
     if (!helperPort) return;
@@ -104,7 +122,7 @@ export function TelnetFetchDialog({
       const res = await fetchConfigViaHelper(helperPort, {
         host: host.trim(),
         port,
-        protocol: "telnet",
+        protocol,
         username: username.trim(),
         password,
         enablePassword: enablePassword || undefined,
@@ -119,11 +137,14 @@ export function TelnetFetchDialog({
         setDetected(d.confidence > 0 ? d : null);
         setPhase("idle");
       } else {
-        // 失敗コードに応じた既定メッセージ。message があればそちらを優先表示。
-        const label = HELPER_ERROR_LABELS[res.code];
+        // 失敗コードに応じた日本語メッセージを主に表示し、ヘルパーが返す
+        // 英語の詳細（ホスト鍵の指紋や known_hosts のパスなど）を併記する。
+        const label =
+          HELPER_ERROR_LABELS[res.code] ?? "コンフィグの取得に失敗しました";
         setUploadMsg({
           type: "err",
-          text: res.message?.trim() ? res.message : label,
+          text: label,
+          detail: res.message?.trim() || undefined,
         });
         setPhase("idle");
       }
@@ -146,6 +167,7 @@ export function TelnetFetchDialog({
       // note に取得経路・対象・コマンドを残す（作業履歴で追跡可能にする）。
       const noteParts = [
         "source=local-helper",
+        `protocol=${protocol}`,
         `host=${host.trim()}`,
         `command=${command}`,
       ];
@@ -210,7 +232,7 @@ export function TelnetFetchDialog({
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-slate-900">
-            Telnet でコンフィグを取得
+            コンフィグを取得（Telnet / SSH）
           </h2>
           <button
             onClick={onClose}
@@ -269,12 +291,27 @@ export function TelnetFetchDialog({
           </label>
           <label className="block">
             <span className="mb-1 block text-xs font-medium uppercase text-slate-500">
+              プロトコル
+            </span>
+            <select
+              value={protocol}
+              onChange={(e) => changeProtocol(e.target.value as HelperProtocol)}
+              className={inputCls}
+            >
+              <option value="telnet">Telnet（平文）</option>
+              <option value="ssh">SSH（暗号化）</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium uppercase text-slate-500">
               ポート
             </span>
             <input
               type="number"
               value={port}
-              onChange={(e) => setPort(Number(e.target.value) || 23)}
+              onChange={(e) =>
+                setPort(Number(e.target.value) || HELPER_DEFAULT_PORTS[protocol])
+              }
               min={1}
               max={65535}
               className={inputCls}
@@ -350,6 +387,22 @@ export function TelnetFetchDialog({
           </label>
         </div>
 
+        {/* プロトコル別の注意書き */}
+        {protocol === "telnet" ? (
+          <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <span className="font-semibold">【Telnet は平文です】</span>
+            ユーザー名・パスワードが LAN 上を暗号化されずに流れます。機器が SSH に
+            対応している場合は SSH を選んでください。
+          </div>
+        ) : (
+          <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+            <span className="font-semibold">【SSH のホスト鍵】</span>
+            初回接続時のホスト鍵をヘルパーの known_hosts に記録し、以降は一致を
+            検証します。機器の交換・初期化で鍵が変わった場合は取得が
+            「ホスト鍵不一致」で失敗するため、該当行を削除してから再取得してください。
+          </div>
+        )}
+
         {/* 取得ボタン */}
         <div className="mt-4 flex items-center justify-between">
           <p className="text-xs text-slate-500">
@@ -369,7 +422,11 @@ export function TelnetFetchDialog({
               }
               className="rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
             >
-              {phase === "fetching" ? "取得中…" : "Telnet で取得"}
+              {phase === "fetching"
+                ? "取得中…"
+                : protocol === "ssh"
+                  ? "SSH で取得"
+                  : "Telnet で取得"}
             </button>
           </div>
         </div>
@@ -425,6 +482,11 @@ export function TelnetFetchDialog({
             }`}
           >
             {uploadMsg.text}
+            {uploadMsg.detail && (
+              <p className="mt-1 break-words text-xs opacity-80">
+                詳細: {uploadMsg.detail}
+              </p>
+            )}
           </div>
         )}
 

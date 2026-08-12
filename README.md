@@ -323,9 +323,9 @@ Meraki Dashboard API 経由で MR/MX/MS の設定を取得して世代管理に�
 > - 都度入力・環境変数の API キーは Meraki Dashboard への読み取り要求にのみ使われ、Kintone やログには保存されません。
 > - **接続情報アプリに保存した API キー**は、`CREDENTIALS_ENCRYPTION_KEY` 設定時に `enc:v1:...` 形式で暗号化されます。一覧画面では末尾 4 文字のみ表示。鍵未設定時は平文のため本番では必ず鍵を設定してください。
 
-### G. ローカル取得（Telnet・ヘルパーアプリ・省略可）
+### G. ローカル取得（Telnet / SSH・ヘルパーアプリ・省略可）
 
-社内 LAN 上の NW 機器から Telnet でコンフィグを自動取得する場合は、**ローカル取得ヘルパー（Go 製ポータブルアプリ）** を使います。ブラウザ単体では生 TCP（Telnet 23番）を開けないため、ユーザー PC 上で動くヘルパーが `127.0.0.1` で待ち受けて SPA からの要求を中継します。詳細な設計経緯は Issue #43 の最終コメントを参照。
+社内 LAN 上の NW 機器から Telnet または SSH でコンフィグを自動取得する場合は、**ローカル取得ヘルパー（Go 製ポータブルアプリ）** を使います。ブラウザ単体では生 TCP（Telnet 23番 / SSH 22番）を開けないため、ユーザー PC 上で動くヘルパーが `127.0.0.1` で待ち受けて SPA からの要求を中継します。詳細な設計経緯は Issue #43 の最終コメントを参照。
 
 > **ヘルパーのビルド・仕様は [`apps/helper/README.md`](apps/helper/README.md) にまとめています。**
 
@@ -336,13 +336,16 @@ Meraki Dashboard API 経由で MR/MX/MS の設定を取得して世代管理に�
    ```
    - `HELPER_RELEASE_BASE_URL` 環境変数で GitHub Releases の URL を指定すると、`latest.json` の URL を絶対 URL に切替えられます（社内 PC が github.com へ到達可能な場合）。
 2. **ユーザー側の初回セットアップ**: SPA の「ローカル取得」メニューからセットアップ画面を開き、お使いの OS 向けバイナリを DL → ダブルクリック起動 → 接続テストで検出を確認します。
-3. **日常運用**: 機器詳細画面で「Telnet で取得」ボタンを押し、接続情報（ホスト・ユーザー名・パスワード・enable パスワード・機種）を入力して取得します。取得した本文は既存 `/api/upload` フロー（same-origin + cookie セッション）で世代登録され、同一 hash はスキップされます。
+3. **日常運用**: 機器詳細画面で「Telnet / SSH で取得」ボタンを押し、接続情報（プロトコル・ホスト・ポート・ユーザー名・パスワード・enable パスワード・機種）を入力して取得します。取得した本文は既存 `/api/upload` フロー（same-origin + cookie セッション）で世代登録され、同一 hash はスキップされます。
 4. **利用後**: SPA の「停止」ボタン、またはコンソールウィンドウを閉じてヘルパーを終了してください（ポータブル型のため、ファイル削除だけで完全に撤去できます）。
 
-**対応機種（フェーズ 1）**: Cisco IOS / IOS-XE（`terminal length 0` + `show running-config`）、YAMAHA RT（`show config`）。その他はカスタムコマンド指定で取得可能です。SSH はフェーズ 2 で追加予定です。
+**対応プロトコル**: Telnet（既定ポート 23）と SSH（既定ポート 22）。SSH はパスワード認証（機器が要求する場合は keyboard-interactive）に対応し、旧世代機向けに SHA-1 系鍵交換・CBC 暗号・`ssh-rsa` ホスト鍵を低優先で許可します。
+
+**対応機種**: Cisco IOS / IOS-XE（`terminal length 0` + `show running-config`）、YAMAHA RT（`show config`）。その他はカスタムコマンド指定で取得可能です。
 
 > **セキュリティ注意**:
-> - Telnet は平文プロトコルです。LAN 上でパスワードが平文で流れます。社内ポリシー上 Telnet が許可されていることを確認してください。
+> - Telnet は平文プロトコルです。LAN 上でパスワードが平文で流れます。機器が SSH に対応している場合は SSH を選んでください（Telnet を使う場合は社内ポリシー上許可されていることを確認してください）。
+> - SSH のホスト鍵は初回接続時にヘルパーの `known_hosts`（`os.UserConfigDir()/config-manager-helper/known_hosts`）へ記録され、以降は一致を検証します。不一致時は取得を中断します（`host_key_mismatch`）。機器の交換・初期化で鍵が変わった場合は該当行を削除してから再取得してください。
 > - パスワード・enablePassword はヘルパーとの通信にのみ使われ、**BFF には送信されません**（取得したコンフィグ本文のみを SPA → BFF へ送ります）。
 > - ヘルパーは `127.0.0.1` のみで待ち受け、許可 Origin（`PUBLIC_BASE_URL` + 開発用 localhost）以外からの要求は拒否します。
 

@@ -72,7 +72,9 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.21"
+          # golang.org/x/crypto（SSH 取得で使用）が go 1.25 以上を要求するため、
+          # apps/helper/go.mod の go ディレクティブに合わせる。
+          go-version: "1.25"
           cache-dependency-path: apps/helper/go.sum
 
       - name: Download dependencies

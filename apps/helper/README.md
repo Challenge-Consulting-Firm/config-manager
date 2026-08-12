@@ -1,6 +1,6 @@
-# config-manager ヘルパー（ローカル Telnet 取得アプリ）
+# config-manager ヘルパー（ローカル Telnet / SSH 取得アプリ）
 
-NW 機器から Telnet でコンフィグを自動取得する **Go 製ローカルヘルパーアプリ** です。
+NW 機器から Telnet または SSH でコンフィグを自動取得する **Go 製ローカルヘルパーアプリ** です。
 ユーザー PC 上で動作し、SPA（fly.io 上）からの要求を受けてコンフィグ本文を取得します。
 
 > 設計の経緯は Issue #43 の最終確定コメントを参照してください。
@@ -16,7 +16,7 @@ NW 機器から Telnet でコンフィグを自動取得する **Go 製ローカ
 │   SPA       │ ───────────────▶│  ヘルパー        │
 │ (fly.io/HTTPS)│                │ (127.0.0.1/HTTP) │
 └─────────────┘                 └────────┬─────────┘
-      │ ②コンフィグ本文                   │ ③Telnet (port 23)
+      │ ②コンフィグ本文                   │ ③Telnet (23) / SSH (22)
       ▼                                   ▼
 ┌─────────────┐                 ┌──────────────────┐
 │   BFF       │                 │  NW 機器         │
@@ -38,8 +38,8 @@ NW 機器から Telnet でコンフィグを自動取得する **Go 製ローカ
 
 ### 前提
 
-- Go 1.21 以上
-- 外部依存は `golang.org/x/text`（SJIS 変換用）のみ
+- Go 1.25 以上（`golang.org/x/crypto` の要求バージョン。CI も 1.25 を使用）
+- 外部依存は `golang.org/x/text`（SJIS 変換用）と `golang.org/x/crypto`（SSH 用）
 
 ### 初回セットアップ
 
@@ -159,6 +159,8 @@ lipo -create -output config-manager-helper config-manager-helper-arm64 config-ma
   ・本ヘルパーは 127.0.0.1 のみで待ち受けます（外部公開なし）
   ・許可された Origin 以外からの要求は拒否します
   ・Telnet は平文プロトコルです。機器との通信は暗号化されません
+  ・SSH の場合はホスト鍵を初回接続時に記録し、以降の変更を検知します
+    known_hosts: /Users/you/Library/Application Support/config-manager-helper/known_hosts
 ========================================================
 
 SPA 側でこのヘルパーを検出したら、取得ボタンが有効になります。
@@ -174,7 +176,7 @@ SPA 側でこのヘルパーを検出したら、取得ボタンが有効にな�
 
 ### CLI デバッグモード（SPA なしで E2E 検証）
 
-`fetch` サブコマンドを使うと、HTTP サーバを起動せずに Telnet 取得を直接実行できます。
+`fetch` サブコマンドを使うと、HTTP サーバを起動せずに取得を直接実行できます。
 **パスワードはコマンドライン引数には乗せません**（プロセス一覧で漏洩するため）。
 環境変数または標準入力から読み込みます。
 
@@ -190,17 +192,22 @@ export HELPER_ENABLE_PASSWORD='***'   # 任意（Cisco enable 昇格用）
 
 # 取得コマンドを上書き
 ./config-manager-helper fetch --host 192.168.1.1 --os generic --username admin --command "show startup-config"
+
+# SSH で取得（ポートは既定 22）
+./config-manager-helper fetch --host 192.168.1.1 --protocol ssh --os cisco-ios --username admin
 ```
 
 フラグ:
 
-| フラグ        | 既定値       | 説明                                              |
-| ------------- | ------------ | ------------------------------------------------- |
-| `--host`      | （必須）     | 接続先ホスト（IP またはホスト名）                 |
-| `--port`      | 23           | Telnet ポート                                     |
-| `--os`        | `cisco-ios`  | 機種ヒント（`cisco-ios` / `yamaha-rt` / `generic`）|
-| `--username`  | （必須）     | ログインユーザー名                                |
-| `--command`   | （os 別既定）| コンフィグ取得コマンドの上書き                    |
+| フラグ          | 既定値              | 説明                                               |
+| --------------- | ------------------- | -------------------------------------------------- |
+| `--host`        | （必須）            | 接続先ホスト（IP またはホスト名）                  |
+| `--protocol`    | `telnet`            | 接続プロトコル（`telnet` / `ssh`）                 |
+| `--port`        | telnet=23 / ssh=22  | 接続ポート                                         |
+| `--os`          | `cisco-ios`         | 機種ヒント（`cisco-ios` / `yamaha-rt` / `generic`）|
+| `--username`    | （必須）            | ログインユーザー名                                 |
+| `--command`     | （os 別既定）       | コンフィグ取得コマンドの上書き                     |
+| `--known-hosts` | OS のユーザー設定DIR | SSH の known_hosts パス（`HELPER_KNOWN_HOSTS` でも指定可）|
 
 ---
 
@@ -249,7 +256,8 @@ export HELPER_ENABLE_PASSWORD='***'   # 任意（Cisco enable 昇格用）
 
 ### `POST /api/fetch`
 
-Telnet 取得の実行。リクエストボディ（JSON）:
+コンフィグ取得の実行。`protocol` は `"telnet"` または `"ssh"`（省略不可）。
+リクエストボディ（JSON）:
 
 ```json
 {
@@ -287,7 +295,10 @@ Telnet 取得の実行。リクエストボディ（JSON）:
 ```
 
 エラーコード: `connect_failed` / `auth_failed` / `prompt_not_found` / `timeout` /
-`pager_detected` / `empty_body`
+`pager_detected` / `empty_body` / `handshake_failed`（SSH のみ） /
+`host_key_mismatch`（SSH のみ）
+
+`port` を省略した場合はプロトコル既定値（telnet=23 / ssh=22）が使われます。
 
 ### `POST /api/shutdown`
 
@@ -306,7 +317,7 @@ Telnet 取得の実行。リクエストボディ（JSON）:
 
 ---
 
-## OS 別コマンドマップ（フェーズ 1）
+## OS 別コマンドマップ
 
 | osHint      | ページング抑制      | コンフィグ取得        |
 | ----------- | ------------------- | --------------------- |
@@ -324,7 +335,21 @@ Telnet 取得の実行。リクエストボディ（JSON）:
   メモリ上で取得後に参照を破棄します。CLI でもコマンドライン引数には乗せません。
 - **Telnet は平文プロトコルです**: 本ヘルパーと機器間の通信は暗号化されません。
   同一セグメント上のパケットキャプチャで認証情報が漏洩する可能性があります。
-  機密性の高い環境では SSH 等の暗号化プロトコルの利用を検討してください。
+  機器が SSH に対応している場合は `protocol: "ssh"` を使ってください。
+- **SSH のホスト鍵検証（TOFU）**: 初回接続時のホスト鍵を `known_hosts` に記録し、
+  以降は一致を検証します。不一致の場合は `host_key_mismatch` で取得を中断します
+  （中間者攻撃の検知）。機器の交換・初期化で鍵が正当に変わった場合は、
+  `known_hosts` の該当行を削除してから再取得してください。
+  - 既定の保存先: `os.UserConfigDir()/config-manager-helper/known_hosts`
+    （Windows: `%AppData%\config-manager-helper\known_hosts`、
+    macOS: `~/Library/Application Support/config-manager-helper/known_hosts`、
+    Linux: `~/.config/config-manager-helper/known_hosts`）
+  - `HELPER_KNOWN_HOSTS` 環境変数、または CLI の `--known-hosts` で変更できます
+  - ファイル形式は OpenSSH の `known_hosts` と同一です
+- **SSH の暗号方式**: 旧世代の NW 機器向けに、SHA-1 系の鍵交換（`diffie-hellman-group1-sha1` 等）・
+  CBC 暗号（`aes128-cbc`）・`ssh-rsa` ホスト鍵を**低優先で**許可しています。機器が新しい方式に
+  対応していればネゴシエーションで自動的にそちらが選ばれます（平文の Telnet を使わずに
+  済むことを優先した判断です）。
 
 ---
 
@@ -339,7 +364,11 @@ apps/helper/
 ├── README.md
 ├── cmd/helper/main.go          # エントリポイント（サーバ + CLI デバッグモード）
 ├── internal/server/server.go   # 127.0.0.1 HTTP・CORS/PNA・Origin allowlist
-├── internal/telnet/telnet.go   # Telnet プロトコル（IAC・ログイン・プロンプト学習・ページング）
+├── internal/session/session.go # Telnet / SSH 共通の取得状態機械（ログイン・プロンプト学習・整形）
+├── internal/telnet/telnet.go   # Telnet トランスポート（TCP 接続・IAC ネゴシエーション）
+├── internal/ssh/ssh.go         # SSH トランスポート（ハンドシェイク・PTY シェル・暗号方式）
+├── internal/ssh/hostkey.go     # SSH ホスト鍵検証（TOFU / known_hosts）
+├── internal/ssh/stream.go      # SSH の stdin/stdout を期限付きストリームへ適合
 ├── internal/commands/commands.go # osHint 別コマンドマップ
 └── internal/encoding/encoding.go # SJIS→UTF-8 変換
 ```
@@ -354,9 +383,11 @@ apps/helper/
 cd apps/helper
 go build ./...
 go vet ./...
+go test ./...
 ```
 
 ### 外部依存
 
-- `golang.org/x/text v0.16.0`（SJIS 変換用 `encoding/japanese`）のみ。
+- `golang.org/x/text`（SJIS 変換用 `encoding/japanese`）
+- `golang.org/x/crypto`（SSH クライアント `ssh` / `ssh/knownhosts`）
 - それ以外は Go 標準ライブラリで実装しています。
