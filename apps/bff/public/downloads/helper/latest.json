@@ -1,6 +1,14 @@
 {
-  "version": "0.0.0",
-  "releasedAt": "",
-  "note": "このファイルは scripts/build-helper.sh によって生成・上書きされます。配布物（バイナリ + sha256）を生成するまで assets は空です。",
-  "assets": {}
+  "version": "0.4.0",
+  "releasedAt": "2026-08-12T04:58:42Z",
+  "assets": {
+    "windows-x64": {
+      "url": "/downloads/helper/windows-x64/config-manager-helper.exe",
+      "sha256": "bba03679be64e7be8c3366228115b8a06082c0ea6736efa54736bc01dced2476"
+    },
+    "darwin-universal": {
+      "url": "/downloads/helper/darwin-universal/config-manager-helper",
+      "sha256": "0124d3955a480420ea200def88e3320f46514dd9ea84bac45d4919f8f2a96f73"
+    }
+  }
 }
