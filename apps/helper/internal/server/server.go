@@ -7,7 +7,7 @@
 //   - /api/status, /api/fetch, /api/shutdown を提供する
 //
 // バインドは 127.0.0.1 のみ（0.0.0.0 には絶対にバインドしない）。
-// パスワード類は Telnet パッケージ経由でメモリ上のみ扱い、ログ/ファイルへ出さない。
+// パスワード類は telnet / ssh パッケージ経由でメモリ上のみ扱い、ログ/ファイルへ出さない。
 package server
 
 import (
@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/commands"
+	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/session"
+	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/ssh"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/telnet"
 )
 
@@ -61,12 +63,18 @@ const (
 // 不正な巨大ペイロードでメモリを圧迫されないよう制限する。
 const maxBodyBytes = 1 << 20 // 1 MiB
 
+// サポートするプロトコル。packages/shared/src/helper.ts の HelperProtocol と一致。
+const (
+	protocolTelnet = "telnet"
+	protocolSSH    = "ssh"
+)
+
 // fetchRequest は POST /api/fetch の要求本体。
 // packages/shared/src/helper.ts の HelperFetchRequest と一致。
 type fetchRequest struct {
 	Host            string             `json:"host"`
 	Port            int                `json:"port"`
-	Protocol        string             `json:"protocol"`
+	Protocol        string             `json:"protocol"` // "telnet" | "ssh"
 	Username        string             `json:"username"`
 	Password        string             `json:"password"` // 機密: ログ/ファイル出力禁止
 	EnablePassword  string             `json:"enablePassword"`
@@ -290,8 +298,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 //
 // 【機密取り扱い】
 // req.Password / req.EnablePassword はログ/ファイルへ絶対に出さない。
-// ログ出力にはホスト・ポート・osHint のみを含める。パスワードは Telnet
-// パッケージへ渡した後、本スコープを抜ける際に GC 対象となる。
+// ログ出力にはホスト・ポート・プロトコル・osHint のみを含める。パスワードは
+// トランスポート（telnet / ssh）へ渡した後、本スコープを抜ける際に GC 対象となる。
 func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -329,10 +337,10 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// バリデーション。バリデーションエラーは 400 + {"error": ...} で返す。
-	// Telnet 実行時のエラーコード（empty_body 等）は取得フェーズの失敗を表すもので、
+	// 取得実行時のエラーコード（empty_body 等）は取得フェーズの失敗を表すもので、
 	// リクエストバリデーションエラーには使わない。
-	if req.Protocol != "telnet" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "protocol must be \"telnet\" in phase 1"})
+	if req.Protocol != protocolTelnet && req.Protocol != protocolSSH {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "protocol must be \"telnet\" or \"ssh\""})
 		return
 	}
 	if req.Host == "" {
@@ -340,7 +348,16 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Port <= 0 {
-		req.Port = 23
+		// 未指定ならプロトコル既定ポート。
+		if req.Protocol == protocolSSH {
+			req.Port = ssh.DefaultPort
+		} else {
+			req.Port = telnet.DefaultPort
+		}
+	}
+	if req.Port > 65535 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "port out of range"})
+		return
 	}
 	if !commands.Valid(req.OSHint) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported osHint"})
@@ -362,14 +379,15 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// タイムアウト解決。
 	to := resolveTimeouts(req.Timeouts)
 
-	// 【ログ出力】パスワード類は絶対に出さない。ホスト・ポート・osHint のみ。
-	log.Printf("[fetch] host=%s port=%d osHint=%s command=%q", req.Host, req.Port, req.OSHint, fetchCmd)
+	// 【ログ出力】パスワード類は絶対に出さない。ホスト・ポート・プロトコル・osHint のみ。
+	log.Printf("[fetch] protocol=%s host=%s port=%d osHint=%s command=%q",
+		req.Protocol, req.Host, req.Port, req.OSHint, fetchCmd)
 
-	// Telnet 取得実行。全体タイムアウトをコンテキストで管理。
+	// 取得実行。全体タイムアウトをコンテキストで管理。
 	ctx, cancel := context.WithTimeout(r.Context(), to.total)
 	defer cancel()
 
-	tcfg := &telnet.Config{
+	scfg := &session.Config{
 		Host:            req.Host,
 		Port:            req.Port,
 		Username:        req.Username,
@@ -385,18 +403,23 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		TotalTimeout:    to.total,
 	}
 
-	result, err := telnet.Fetch(ctx, tcfg)
+	var result *session.Result
+	if req.Protocol == protocolSSH {
+		result, err = ssh.Fetch(ctx, scfg, nil)
+	} else {
+		result, err = telnet.Fetch(ctx, scfg)
+	}
 	if err != nil {
-		var te *telnet.Error
-		if errors.As(err, &te) {
+		var se *session.Error
+		if errors.As(err, &se) {
 			writeJSON(w, http.StatusOK, fetchErrorResponse{
-				OK: false, Code: string(te.Code), Message: te.Message,
+				OK: false, Code: string(se.Code), Message: se.Message,
 			})
 			return
 		}
 		// 未知のエラーは generic timeout 扱い。
 		writeJSON(w, http.StatusOK, fetchErrorResponse{
-			OK: false, Code: string(telnet.CodeTimeout), Message: err.Error(),
+			OK: false, Code: string(session.CodeTimeout), Message: err.Error(),
 		})
 		return
 	}

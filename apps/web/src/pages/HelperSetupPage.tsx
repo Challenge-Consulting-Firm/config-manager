@@ -198,18 +198,20 @@ export function HelperSetupPage() {
         ローカル取得のセットアップ
       </h1>
       <p className="mb-4 text-sm text-slate-600">
-        社内 LAN 上の NW 機器から Telnet でコンフィグを自動取得するには、
+        社内 LAN 上の NW 機器から Telnet または SSH でコンフィグを自動取得するには、
         ローカルヘルパーアプリ（ポータブル型）が必要です。ブラウザ単体では
         生 TCP（Telnet/SSH）を開けないため、このヘルパーが 127.0.0.1 で待ち受け、
         SPA からの指示で取得を実行します。
       </p>
 
-      {/* セキュリティ注意（Telnet 平文） */}
+      {/* セキュリティ注意（Telnet 平文 / SSH ホスト鍵） */}
       <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
         <span className="font-semibold">【セキュリティ注意】</span>
         Telnet は平文プロトコルです。機器との通信は暗号化されず、LAN 上で
-        パスワードが平文で流れます。社内ポリシー上 Telnet が許可されていることを
-       確認のうえご利用ください。取得したパスワード類は BFF には送信されず、
+        パスワードが平文で流れます。機器が SSH に対応している場合は取得ダイアログで
+        SSH を選んでください（SSH ではホスト鍵を初回接続時に記録し、以降の変更を
+        検知します）。Telnet を使う場合は、社内ポリシー上許可されていることを
+        確認のうえご利用ください。取得したパスワード類は BFF には送信されず、
         ヘルパー内でのみ使用されます（取得後にメモリから破棄）。
       </div>
 

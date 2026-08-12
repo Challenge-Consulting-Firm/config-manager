@@ -13,7 +13,7 @@ import {
 import { apiFetch, ApiError } from "../apiClient";
 import { useAuth } from "../auth";
 import { RoleBadge } from "../components/RoleBadge";
-import { TelnetFetchDialog } from "../components/TelnetFetchDialog";
+import { DeviceFetchDialog } from "../components/DeviceFetchDialog";
 
 interface PromoteResult {
   created?: { id: string; generation: number };
@@ -64,8 +64,8 @@ export function DeviceDetailPage() {
     text: string;
   } | null>(null);
   const [metaSubmitting, setMetaSubmitting] = useState(false);
-  // Telnet 取得ダイアログの表示状態。
-  const [telnetOpen, setTelnetOpen] = useState(false);
+  // コンフィグ取得ダイアログ（Telnet / SSH）の表示状態。
+  const [fetchDialogOpen, setFetchDialogOpen] = useState(false);
 
   useEffect(() => {
     if (!decodedKey) return;
@@ -240,17 +240,17 @@ export function DeviceDetailPage() {
         )}
         {identifiers && (
           <div className="flex flex-wrap gap-2">
-            {/* ローカルヘルパー経由の Telnet 取得（Issue #43）。ヘルパー起動中のみ
-                有効。ダイアログ内で未検出時はセットアップ画面へ誘導する。 */}
+            {/* ローカルヘルパー経由の取得（Telnet / SSH・Issue #43）。ヘルパー
+                起動中のみ有効。ダイアログ内で未検出時はセットアップ画面へ誘導する。 */}
             {canOperate && (
               <button
                 onClick={() => {
-                  setTelnetOpen(true);
+                  setFetchDialogOpen(true);
                   setMetaMsg(null);
                 }}
                 className="rounded-md bg-indigo-600 px-3 py-2 text-sm text-white hover:bg-indigo-700"
               >
-                Telnet で取得
+                Telnet / SSH で取得
               </button>
             )}
             {isMerakiDevice ? (
@@ -654,11 +654,11 @@ export function DeviceDetailPage() {
         />
       )}
 
-      {/* Telnet 取得ダイアログ（ローカルヘルパー経由・Issue #43） */}
-      {telnetOpen && identifiers && (
-        <TelnetFetchDialog
+      {/* コンフィグ取得ダイアログ（ローカルヘルパー経由・Issue #43） */}
+      {fetchDialogOpen && identifiers && (
+        <DeviceFetchDialog
           identifiers={identifiers}
-          onClose={() => setTelnetOpen(false)}
+          onClose={() => setFetchDialogOpen(false)}
           onCompleted={() => {
             // 世代登録（またはスキップ）後に一覧を再読込。
             void reloadVersions();

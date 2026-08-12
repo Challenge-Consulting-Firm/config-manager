@@ -1,15 +1,16 @@
-// Command helper は NW 機器から Telnet でコンフィグを自動取得する
+// Command helper は NW 機器から Telnet / SSH でコンフィグを自動取得する
 // ローカルヘルパーアプリ（ポータブル型）のエントリポイント。
 //
 // 2 つのモードを持つ:
 //  1. サーバモード（既定）: 127.0.0.1 に HTTP サーバを開き、SPA からの要求を待つ
-//  2. CLI モード（fetch サブコマンド）: HTTP サーバを起動せず Telnet 取得を直接実行
+//  2. CLI モード（fetch サブコマンド）: HTTP サーバを起動せず取得を直接実行
 //
 // セキュリティ:
 //   - バインドは 127.0.0.1 のみ（0.0.0.0 禁止）
 //   - Origin allowlist による CORS 制限
 //   - パスワード類はログ/ファイルへ出さない
-//   - Telnet は平文プロトコル（詳細は README のセキュリティ注意）
+//   - Telnet は平文プロトコル。暗号化が必要な場合は --protocol ssh を使う
+//     （詳細は README のセキュリティ注意）
 package main
 
 import (
@@ -26,6 +27,8 @@ import (
 
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/commands"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server"
+	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/session"
+	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/ssh"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/telnet"
 )
 
@@ -82,6 +85,10 @@ func runServer(args []string) {
 	fmt.Println("  ・本ヘルパーは 127.0.0.1 のみで待ち受けます（外部公開なし）")
 	fmt.Println("  ・許可された Origin 以外からの要求は拒否します")
 	fmt.Println("  ・Telnet は平文プロトコルです。機器との通信は暗号化されません")
+	fmt.Println("  ・SSH の場合はホスト鍵を初回接続時に記録し、以降の変更を検知します")
+	if p, err := ssh.DefaultKnownHostsPath(); err == nil {
+		fmt.Printf("    known_hosts: %s\n", p)
+	}
 	fmt.Println("========================================================")
 	fmt.Println()
 	fmt.Println("SPA 側でこのヘルパーを検出したら、取得ボタンが有効になります。")
@@ -100,7 +107,7 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return "" }
 func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }
 
-// runCLIFetch は CLI デバッグモードで Telnet 取得を直接実行する。
+// runCLIFetch は CLI デバッグモードで取得を直接実行する。
 //
 // パスワードはコマンドライン引数には乗せない（プロセス一覧で漏洩するため）。
 // 標準入力または環境変数から読み込む。
@@ -108,16 +115,32 @@ func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }
 // 使い方:
 //
 //	helper fetch --host 192.168.1.1 --os cisco-ios --username admin
+//	helper fetch --host 192.168.1.1 --protocol ssh --os cisco-ios --username admin
 //	（パスワードは HELPER_PASSWORD / HELPER_ENABLE_PASSWORD 環境変数、
 //	 または未設定時は標準入力からプロンプトで読み込む）
 func runCLIFetch(args []string) {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
 	host := fs.String("host", "", "接続先ホスト（IP またはホスト名）")
-	port := fs.Int("port", 23, "Telnet ポート")
+	// ポート既定値はプロトコルに応じて後段で決めるため 0 を初期値にする。
+	port := fs.Int("port", 0, "接続ポート（既定: telnet=23 / ssh=22）")
+	protocol := fs.String("protocol", "telnet", "接続プロトコル (telnet | ssh)")
 	osHint := fs.String("os", "cisco-ios", "機種ヒント (cisco-ios | yamaha-rt | yamaha-swx | generic)")
 	username := fs.String("username", "", "ログインユーザー名")
 	commandOverride := fs.String("command", "", "コンフィグ取得コマンドの上書き（任意）")
+	knownHosts := fs.String("known-hosts", "", "SSH の known_hosts パス（既定: OS のユーザー設定ディレクトリ）")
 	_ = fs.Parse(args)
+
+	if *protocol != "telnet" && *protocol != "ssh" {
+		fmt.Fprintln(os.Stderr, "--protocol は telnet | ssh のいずれかです")
+		os.Exit(2)
+	}
+	if *port == 0 {
+		if *protocol == "ssh" {
+			*port = ssh.DefaultPort
+		} else {
+			*port = telnet.DefaultPort
+		}
+	}
 
 	if *host == "" {
 		fmt.Fprintln(os.Stderr, "--host は必須です")
@@ -159,7 +182,7 @@ func runCLIFetch(args []string) {
 		os.Exit(2)
 	}
 
-	tcfg := &telnet.Config{
+	scfg := &session.Config{
 		Host:            *host,
 		Port:            *port,
 		Username:        *username,
@@ -178,11 +201,17 @@ func runCLIFetch(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	result, err := telnet.Fetch(ctx, tcfg)
+	var result *session.Result
+	var err error
+	if *protocol == "ssh" {
+		result, err = ssh.Fetch(ctx, scfg, &ssh.Options{KnownHostsPath: *knownHosts})
+	} else {
+		result, err = telnet.Fetch(ctx, scfg)
+	}
 	if err != nil {
-		var te *telnet.Error
-		if asTelnetErr(err, &te) {
-			fmt.Fprintf(os.Stderr, "取得失敗 [%s]: %s\n", te.Code, te.Message)
+		var se *session.Error
+		if asSessionErr(err, &se) {
+			fmt.Fprintf(os.Stderr, "取得失敗 [%s]: %s\n", se.Code, se.Message)
 		} else {
 			fmt.Fprintf(os.Stderr, "取得失敗: %v\n", err)
 		}
@@ -198,11 +227,11 @@ func runCLIFetch(args []string) {
 	fmt.Println(result.Body)
 }
 
-// asTelnetErr は telnet.Error への型アサーション（errors.As のラップ）。
+// asSessionErr は session.Error への型アサーション（errors.As のラップ）。
 // errors パッケージを都度 import しないための小さなヘルパ。
-func asTelnetErr(err error, target **telnet.Error) bool {
-	if te, ok := err.(*telnet.Error); ok {
-		*target = te
+func asSessionErr(err error, target **session.Error) bool {
+	if se, ok := err.(*session.Error); ok {
+		*target = se
 		return true
 	}
 	return false

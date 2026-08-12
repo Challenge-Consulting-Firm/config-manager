@@ -11,7 +11,16 @@
  */
 
 /**
- * Telnet 接続先の機種を大まかに指定するヒント値。
+ * 機器への接続プロトコル。
+ *
+ * `telnet` は平文で認証情報が流れるため、機器が SSH に対応している場合は
+ * `ssh` を選ぶこと。SSH ではホスト鍵を初回接続時にヘルパーの known_hosts へ
+ * 記録し、以降は一致を検証する（不一致時は `host_key_mismatch`）。
+ */
+export type HelperProtocol = "telnet" | "ssh";
+
+/**
+ * 接続先の機種を大まかに指定するヒント値。
  * ヘルパーはこの値に基づきページング抑制コマンドとコンフィグ取得コマンドを
  * 選ぶ（`commandOverride` があればそちらが優先）。
  *
@@ -30,7 +39,7 @@ export type HelperOsHint =
   | "generic";
 
 /**
- * Telnet 取得の段階別タイムアウト（ミリ秒）。全項目省略可能で、省略時は
+ * 取得処理の段階別タイムアウト（ミリ秒）。全項目省略可能で、省略時は
  * ヘルパーの既定値が使われる。単一の全体タイムアウトにすると大容量
  * running-config の取得が途中で切れるため、段階的に設定する。
  */
@@ -49,10 +58,10 @@ export interface HelperFetchTimeouts {
 export interface HelperFetchRequest {
   /** 接続先ホスト（IP またはホスト名）。 */
   host: string;
-  /** Telnet ポート。省略時は 23。 */
+  /** 接続ポート。省略時はプロトコル既定値（{@link HELPER_DEFAULT_PORTS}）。 */
   port?: number;
-  /** プロトコル。フェーズ 1 は `"telnet"` のみ。 */
-  protocol: "telnet";
+  /** プロトコル（`"telnet"` または `"ssh"`）。 */
+  protocol: HelperProtocol;
   /** ログインユーザー名。 */
   username: string;
   /** ログインパスワード。 */
@@ -97,6 +106,8 @@ export interface HelperFetchOkResponse {
 /**
  * 失敗時のエラーコード。UI で原因を区別して表示するために使う。
  * レビュー指摘 5 を反映し、現場で頻発する失敗モードを明示的に区別する。
+ *
+ * `handshake_failed` / `host_key_mismatch` は SSH 固有。
  */
 export type HelperFetchErrorCode =
   | "connect_failed"
@@ -106,7 +117,9 @@ export type HelperFetchErrorCode =
   | "pager_detected"
   | "empty_body"
   /** 機器が取得コマンドを拒否した（コマンド体系の不一致・権限不足など）。 */
-  | "command_rejected";
+  | "command_rejected"
+  | "handshake_failed"
+  | "host_key_mismatch";
 
 /** `POST /api/fetch` の失敗時レスポンス。 */
 export interface HelperFetchErrorResponse {
@@ -143,6 +156,12 @@ export const HELPER_PORT_CANDIDATES = [
   53712, 53713, 53714, 53715, 53716,
 ] as const;
 
+/** プロトコル別の既定ポート。`port` 未指定時にヘルパーが適用する値。 */
+export const HELPER_DEFAULT_PORTS: Record<HelperProtocol, number> = {
+  telnet: 23,
+  ssh: 22,
+};
+
 /** ヘルパーの既定タイムアウト（ミリ秒）。レビュー指摘の推奨値。 */
 export const HELPER_DEFAULT_TIMEOUTS: Required<HelperFetchTimeouts> = {
   connectMs: 10_000,
@@ -164,4 +183,8 @@ export const HELPER_ERROR_LABELS: Record<HelperFetchErrorCode, string> = {
   empty_body: "コンフィグ本文を取得できませんでした（空または極端に短い応答です）",
   command_rejected:
     "機器が取得コマンドを受け付けませんでした（機種の選択、または特権モードへの昇格を確認してください）",
+  handshake_failed:
+    "SSH の暗号方式が一致しませんでした（機器が対応する鍵交換方式・暗号を確認してください）",
+  host_key_mismatch:
+    "SSH のホスト鍵が記録済みの鍵と一致しません（中間者攻撃の可能性、または機器の交換・初期化が原因です）",
 };
