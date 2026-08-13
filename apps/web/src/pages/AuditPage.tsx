@@ -8,6 +8,8 @@ const ACTION_LABEL: Record<string, string> = {
   diff: "差分表示",
   download: "ダウンロード",
   delete: "削除",
+  edit: "メタ編集",
+  credential: "認証情報",
 };
 
 export function AuditPage() {
@@ -94,6 +96,10 @@ function actionBadge(action: string): string {
       return `${base} bg-emerald-100 text-emerald-700`;
     case "delete":
       return `${base} bg-red-100 text-red-700`;
+    // 機器のパスワードに触れた記録。追跡対象として一覧で埋もれないよう、
+    // 削除と並ぶ強さの色を当てる。
+    case "credential":
+      return `${base} bg-amber-100 text-amber-800`;
     case "diff":
       return `${base} bg-blue-100 text-blue-700`;
     default:
