@@ -21,7 +21,8 @@
         "diff": { "label": "diff", "index": 2 },
         "download": { "label": "download", "index": 3 },
         "delete": { "label": "delete", "index": 4 },
-        "edit": { "label": "edit", "index": 5 }
+        "edit": { "label": "edit", "index": 5 },
+        "credential": { "label": "credential", "index": 6 }
       }
     },
     "customer": {

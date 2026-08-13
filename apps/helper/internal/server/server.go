@@ -72,12 +72,16 @@ const (
 // fetchRequest は POST /api/fetch の要求本体。
 // packages/shared/src/helper.ts の HelperFetchRequest と一致。
 type fetchRequest struct {
-	Host            string             `json:"host"`
-	Port            int                `json:"port"`
-	Protocol        string             `json:"protocol"` // "telnet" | "ssh"
-	Username        string             `json:"username"`
-	Password        string             `json:"password"` // 機密: ログ/ファイル出力禁止
-	EnablePassword  string             `json:"enablePassword"`
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	Protocol       string `json:"protocol"` // "telnet" | "ssh"
+	Username       string `json:"username"`
+	Password       string `json:"password"` // 機密: ログ/ファイル出力禁止
+	EnablePassword string `json:"enablePassword"`
+	// CredentialToken は BFF が発行した一回限りの引き換えトークン（Issue #53）。
+	// 指定時は Username / Password の代わりに、検証済み Origin の BFF から
+	// 平文を引き換えて使う。SPA が平文を保持しないための経路。
+	CredentialToken string             `json:"credentialToken"`
 	OSHint          string             `json:"osHint"`
 	CommandOverride *string            `json:"commandOverride"` // null 許容
 	Timeouts        *fetchTimeoutsJSON `json:"timeouts,omitempty"`
@@ -334,6 +338,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		req.Password = ""
 		req.EnablePassword = ""
+		req.CredentialToken = ""
 	}()
 
 	// バリデーション。バリデーションエラーは 400 + {"error": ...} で返す。
@@ -363,6 +368,11 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported osHint"})
 		return
 	}
+	// 認証情報は「都度入力」か「引き換えトークン」のどちらかで渡る。
+	if req.CredentialToken == "" && req.Password == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "password or credentialToken is required"})
+		return
+	}
 
 	// コマンド解決。
 	cmdSet := commands.Lookup(req.OSHint)
@@ -379,13 +389,52 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// タイムアウト解決。
 	to := resolveTimeouts(req.Timeouts)
 
-	// 【ログ出力】パスワード類は絶対に出さない。ホスト・ポート・プロトコル・osHint のみ。
-	log.Printf("[fetch] protocol=%s host=%s port=%d osHint=%s command=%q",
-		req.Protocol, req.Host, req.Port, req.OSHint, fetchCmd)
-
 	// 取得実行。全体タイムアウトをコンテキストで管理。
 	ctx, cancel := context.WithTimeout(r.Context(), to.total)
 	defer cancel()
+
+	// 認証情報の解決。トークンが指定されていれば、機器へ接続する直前に
+	// 検証済み Origin の BFF から平文を引き換える。
+	//
+	// 【機密取り扱い】引き換えた平文はこのスコープのローカル変数にのみ置き、
+	// ログ・エラー応答へは出さない。関数終了時に参照を切る。
+	credentialSource := "manual"
+	if req.CredentialToken != "" {
+		credentialSource = "token"
+		// withCORS が POST に対して allowlist 照合済みの Origin。
+		redeemed, rerr := redeemCredential(ctx, r.Header.Get("Origin"), req.CredentialToken)
+		if rerr != nil {
+			// 失敗理由（期限切れ・使用済み・到達不可）は区別せず 1 つのコードで返す。
+			log.Printf("[fetch] credential redeem failed: %v", rerr)
+			writeJSON(w, http.StatusOK, fetchErrorResponse{
+				OK:      false,
+				Code:    "credential_redeem_failed",
+				Message: "failed to redeem the credential token",
+			})
+			return
+		}
+		defer func() {
+			redeemed.Username = ""
+			redeemed.Password = ""
+			redeemed.EnablePassword = ""
+		}()
+		req.Username = redeemed.Username
+		req.Password = redeemed.Password
+		// enable パスワードは顧客情報アプリに専用欄が無く通常は空。返ってきた
+		// 場合のみ採用し、都度入力の値は上書きしない。
+		if redeemed.EnablePassword != "" {
+			req.EnablePassword = redeemed.EnablePassword
+		}
+	}
+
+	if req.Username == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "username is required"})
+		return
+	}
+
+	// 【ログ出力】パスワード類は絶対に出さない。ホスト・ポート・プロトコル・osHint のみ。
+	log.Printf("[fetch] protocol=%s host=%s port=%d osHint=%s command=%q credential=%s",
+		req.Protocol, req.Host, req.Port, req.OSHint, fetchCmd, credentialSource)
 
 	scfg := &session.Config{
 		Host:            req.Host,

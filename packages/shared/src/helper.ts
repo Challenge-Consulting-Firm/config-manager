@@ -62,12 +62,28 @@ export interface HelperFetchRequest {
   port?: number;
   /** プロトコル（`"telnet"` または `"ssh"`）。 */
   protocol: HelperProtocol;
-  /** ログインユーザー名。 */
-  username: string;
-  /** ログインパスワード。 */
-  password: string;
+  /**
+   * ログインユーザー名。`credentialToken` を使う場合は省略できる
+   * （redeem で得た値が優先される）。
+   */
+  username?: string;
+  /**
+   * ログインパスワード。`credentialToken` を使う場合は省略する。
+   * どちらも無い場合はヘルパーが 400 を返す。
+   */
+  password?: string;
   /** Cisco 機器の特権モード（enable）パスワード（任意）。 */
   enablePassword?: string;
+  /**
+   * 認証情報トークン（Issue #53）。指定するとヘルパーは、要求元の検証済み
+   * Origin に対して `POST /helper/credentials/redeem` を行い、ユーザー名と
+   * パスワードを受け取ってから機器へログインする。
+   *
+   * これにより平文パスワードがブラウザの JS ヒープ・DevTools・拡張機能に
+   * 一切載らない。トークンは一回限り・短命で、redeem 先は要求元 Origin に
+   * 固定される（SPA が任意の URL を指定することはできない）。
+   */
+  credentialToken?: string;
   /** 機種ヒント。コマンド選択に使う。 */
   osHint: HelperOsHint;
   /**
@@ -119,7 +135,9 @@ export type HelperFetchErrorCode =
   /** 機器が取得コマンドを拒否した（コマンド体系の不一致・権限不足など）。 */
   | "command_rejected"
   | "handshake_failed"
-  | "host_key_mismatch";
+  | "host_key_mismatch"
+  /** 認証情報トークンの引き換えに失敗した（期限切れ・使用済み・BFF 到達不可）。 */
+  | "credential_redeem_failed";
 
 /** `POST /api/fetch` の失敗時レスポンス。 */
 export interface HelperFetchErrorResponse {
@@ -187,4 +205,15 @@ export const HELPER_ERROR_LABELS: Record<HelperFetchErrorCode, string> = {
     "SSH の暗号方式が一致しませんでした（機器が対応する鍵交換方式・暗号を確認してください）",
   host_key_mismatch:
     "SSH のホスト鍵が記録済みの鍵と一致しません（中間者攻撃の可能性、または機器の交換・初期化が原因です）",
+  credential_redeem_failed:
+    "認証情報の取得に失敗しました（トークンの期限切れ・使用済み、またはサーバへ到達できません）。候補を選び直してください",
 };
+
+/**
+ * ヘルパーが認証情報トークンを引き換える BFF 側のパス。
+ * ヘルパーは要求元の検証済み Origin にこのパスを連結して POST する。
+ */
+export const HELPER_CREDENTIAL_REDEEM_PATH = "/helper/credentials/redeem";
+
+/** 認証情報トークンの有効期限（ミリ秒）。発行から redeem までの猶予。 */
+export const NODE_CREDENTIAL_TOKEN_TTL_MS = 60_000;

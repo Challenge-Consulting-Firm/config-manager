@@ -307,9 +307,41 @@ export HELPER_ENABLE_PASSWORD='***'   # 任意（Cisco enable 昇格用）
 
 エラーコード: `connect_failed` / `auth_failed` / `prompt_not_found` / `timeout` /
 `pager_detected` / `empty_body` / `command_rejected` / `handshake_failed`（SSH のみ） /
-`host_key_mismatch`（SSH のみ）
+`host_key_mismatch`（SSH のみ） / `credential_redeem_failed`
 
 `port` を省略した場合はプロトコル既定値（telnet=23 / ssh=22）が使われます。
+
+#### 認証情報の渡し方
+
+`username` / `password` を直接乗せる（都度入力）ほかに、BFF が発行した
+**一回限りのトークン**を渡す経路があります（Issue #53）。
+
+```json
+{
+  "host": "192.168.1.1",
+  "protocol": "ssh",
+  "credentialToken": "<BFF が発行した単回トークン>",
+  "osHint": "yamaha-rt"
+}
+```
+
+`credentialToken` が指定されると、ヘルパーは機器へ接続する直前に
+
+```
+POST <検証済み Origin>/helper/credentials/redeem   { "token": "..." }
+  → { "username": "...", "password": "..." }
+```
+
+で平文を引き換え、それを使ってログインします。SPA は平文を一度も保持しません。
+
+- 引き換え先はリクエストボディからは受け取らず、**withCORS が allowlist 照合済みの
+  `Origin` ヘッダ**から組み立てます。SPA が任意の URL を指定することはできません。
+- リモートホストへの平文 HTTP は拒否します（`localhost` / `127.0.0.1` は開発用に許可）。
+- 引き換えに失敗した場合は `credential_redeem_failed` を返します。理由（期限切れ・
+  使用済み・到達不可）は区別しません。
+- 引き換えた平文はメモリ上のみで扱い、ログ・エラー応答には出しません。
+
+`password` と `credentialToken` のどちらも無い場合は 400 を返します。
 
 ### `POST /api/shutdown`
 

@@ -161,7 +161,36 @@ async function applyFields({ label, token, appId, file }) {
   }
   console.log(`  added ${added}, already-existed ${skipped}.`);
 
-  if (added === 0) {
+  // 1b. Sync the option list of dropdowns that already exist.
+  //
+  //     Adding a field is idempotent, but an *existing* field is skipped
+  //     wholesale — so a newly added dropdown option (e.g. the `credential`
+  //     audit action) would never reach Kintone. Writing a record with a value
+  //     that is not in the option list is rejected by Kintone, so the option
+  //     list has to be kept in sync or the feature breaks at runtime.
+  //
+  //     Only DROP_DOWN fields are updated, and only with the definition in the
+  //     JSON file, so this cannot clobber unrelated manual customisation.
+  let updated = 0;
+  for (const code of codes) {
+    const prop = properties[code];
+    if (prop?.type !== "DROP_DOWN") continue;
+    const one = await call("/k/v1/preview/app/form/fields.json", {
+      method: "PUT",
+      token,
+      body: { app: id, properties: { [code]: prop } },
+    });
+    if (one.ok) {
+      updated++;
+      console.log(`    - ${code}: options synced`);
+    } else {
+      console.log(
+        `    - ${code}: option sync failed (${one.json?.code ?? one.status})`,
+      );
+    }
+  }
+
+  if (added === 0 && updated === 0) {
     console.log("  no changes to deploy.");
     return;
   }

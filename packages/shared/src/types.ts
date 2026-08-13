@@ -2,6 +2,8 @@
  * Shared domain types used by both the BFF and the React frontend.
  */
 
+import type { HelperOsHint, HelperProtocol } from "./helper.js";
+
 /** Role tag distinguishing production devices from spare (cold-standby)
  *  devices. Spares are swapped in to replace a failed production device. */
 export type Role = "production" | "spare";
@@ -193,7 +195,9 @@ export type AuditAction =
   | "diff"
   | "download"
   | "delete"
-  | "edit";
+  | "edit"
+  /** 顧客情報アプリの機器認証情報を参照した（候補一覧・トークン発行・redeem）。 */
+  | "credential";
 
 export interface AuditLogEntry {
   id: string;
@@ -475,4 +479,109 @@ export interface MerakiCredential {
   memo?: string;
   /** 最終更新日時 (ms)。 */
   updatedAt: number;
+}
+
+// ===== 機器認証情報（顧客情報アプリ）=====
+// 社内の Kintone「ノード管理」アプリに登録済みのアカウント名 / パスワードを
+// ローカル取得ヘルパーのログインへ適用するための型。設計は Issue #53 を参照。
+//
+// 重要: パスワードはこの型に一切載せない。SPA へ渡すのは候補のメタ情報と
+// 一回限りのトークンだけで、平文はヘルパーが BFF から redeem して受け取る。
+
+/** 候補レコードのうち、不可視文字の混入を検出しうるフィールド。 */
+export type NodeCredentialField =
+  | "nodeName"
+  | "ipAddress"
+  | "accountName"
+  | "password";
+
+/**
+ * `備考` の自由記述から推定した接続ヒント。**初期値の提案にのみ使う**。
+ * 推定は当たらないことがあるため UI で上書きでき、永続化もしない。
+ */
+export interface NodeCredentialHint {
+  /** 推定プロトコル。判断材料が無ければ null（Telnet へは倒さない）。 */
+  protocol: HelperProtocol | null;
+  /** 推定機種。判断材料が無ければ null。 */
+  osHint: HelperOsHint | null;
+  /** UI に表示する推定根拠（例: `備考に「SSH接続」`）。 */
+  reason: string;
+}
+
+/**
+ * 取得ダイアログに提示する認証情報の候補。
+ *
+ * 検索は IP アドレスの正規化後の完全一致で行い、同一 IP が複数顧客に存在
+ * しうるため候補が 1 件でも自動選択はしない。`customerName` と `nodeName`
+ * を利用者に見せて選ばせる前提の型。
+ */
+export interface NodeCredentialCandidate {
+  /** Kintone レコード ID。トークン発行時に指定する。 */
+  id: string;
+  /** 顧客名（`1004 野原ホールディングス` 形式）。 */
+  customerName: string;
+  /** 機器名。Kintone 上のフィールド名は `名前`。 */
+  nodeName: string;
+  /** IP アドレス（照合用に正規化済み）。 */
+  ipAddress: string;
+  /** ログインアカウント名（照合用に正規化済み）。 */
+  accountName: string;
+  /** システム種別の詳細区分（`Router` / `L2 Switch` など）。 */
+  systemType: string;
+  /** 備考の自由記述。機種や接続方法の手掛かりが書かれていることが多い。 */
+  note: string;
+  /** 対象機器の `customer` と一致したか。並び順と UI の強調に使う。 */
+  matchesCustomer: boolean;
+  /** 対象機器の `hostname` と一致したか。 */
+  matchesHostname: boolean;
+  /**
+   * 元レコードに不可視文字（`U+200B` 等）が混入しているフィールド。
+   * パスワードが含まれる場合は、そのまま使うか除去するかを利用者に選ばせる。
+   */
+  invisibleCharFields: NodeCredentialField[];
+  /** 備考から推定した接続ヒント。 */
+  hint: NodeCredentialHint;
+}
+
+/** `GET /api/node-credentials` の応答。 */
+export interface NodeCredentialListResponse {
+  /** 顧客情報アプリが env で有効化されているか。false なら候補は空。 */
+  enabled: boolean;
+  candidates: NodeCredentialCandidate[];
+}
+
+/** `POST /api/node-credentials/:id/issue-token` の要求本体。 */
+export interface NodeCredentialTokenRequest {
+  /** 対象機器の識別子。発行するトークンをこの機器に束縛する。 */
+  customer: string;
+  hostname: string;
+  ipAddress: string;
+  /**
+   * パスワードに含まれる不可視文字を除去してから機器へ送るか。
+   * 既定は false（Kintone に入っている値をそのまま使う）。
+   */
+  stripInvisible?: boolean;
+}
+
+/** `POST /api/node-credentials/:id/issue-token` の応答。 */
+export interface NodeCredentialTokenResponse {
+  /** 一回限り・短命の不透明トークン。ヘルパーへ渡す。 */
+  token: string;
+  /** 有効期限（ミリ秒）。 */
+  expiresInMs: number;
+  /** ログインアカウント名。機密ではないので UI 表示に使ってよい。 */
+  username: string;
+}
+
+/**
+ * `POST /helper/credentials/redeem` の応答（ヘルパーが受け取る）。
+ *
+ * このエンドポイントは `/api/*` の外に置かれ、セッション Cookie を要求しない。
+ * トークン自体が唯一の資格情報であり、単回・短命であることで保護する。
+ */
+export interface NodeCredentialRedeemResponse {
+  username: string;
+  password: string;
+  /** Cisco 機器の特権モードパスワード。app 55 には専用欄が無いため通常は空。 */
+  enablePassword?: string;
 }

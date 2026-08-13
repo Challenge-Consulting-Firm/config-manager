@@ -10,6 +10,9 @@ import {
   type HelperFetchResponse,
   type HelperOsHint,
   type HelperProtocol,
+  type NodeCredentialCandidate,
+  type NodeCredentialListResponse,
+  type NodeCredentialTokenResponse,
   type Role,
 } from "@config-manager/shared";
 import { apiFetch, ApiError } from "../apiClient";
@@ -44,6 +47,24 @@ export function DeviceFetchDialog({
   // ヘルパー検出状態。
   const [helperPort, setHelperPort] = useState<HelperPort | null>(null);
   const [probing, setProbing] = useState(true);
+
+  // 保存済み認証情報（顧客情報アプリ）の候補。
+  //
+  // 【重要】ここに平文パスワードは入らない。取得時に一回限りのトークンを
+  // 発行し、平文はヘルパーが BFF から引き換える（Issue #53）。
+  const [credentials, setCredentials] = useState<{
+    enabled: boolean;
+    candidates: NodeCredentialCandidate[];
+    loading: boolean;
+    error?: string;
+  }>({ enabled: false, candidates: [], loading: true });
+  /** 選択中の候補 ID。null は「手入力」。同一 IP が複数顧客に存在しうるため、
+   *  候補が 1 件でも既定では選択しない。 */
+  const [selectedCredId, setSelectedCredId] = useState<string | null>(null);
+  /** パスワードの不可視文字を除去して送るか（利用者が明示的に選んだ場合のみ）。 */
+  const [stripInvisible, setStripInvisible] = useState(false);
+  /** Telnet で保存済み認証情報を使うことへの明示同意。 */
+  const [telnetAck, setTelnetAck] = useState(false);
 
   // 接続情報（都度入力）。ホストは既定で identifiers.ipAddress を補完。
   const [host, setHost] = useState(identifiers.ipAddress ?? "");
@@ -92,6 +113,45 @@ export function DeviceFetchDialog({
     void probe();
   }, [probe]);
 
+  // 保存済み認証情報の候補を取得する。突合は IP の完全一致のみで、顧客名と
+  // ホスト名は候補の並び順と表示に使われる（BFF 側で判定）。
+  useEffect(() => {
+    const ip = identifiers.ipAddress?.trim();
+    if (!ip) {
+      setCredentials({ enabled: false, candidates: [], loading: false });
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const params = new URLSearchParams({ ip });
+      if (identifiers.hostname) params.set("hostname", identifiers.hostname);
+      if (identifiers.customer) params.set("customer", identifiers.customer);
+      try {
+        const res = await apiFetch<NodeCredentialListResponse>(
+          `/api/node-credentials?${params.toString()}`,
+        );
+        if (cancelled) return;
+        setCredentials({
+          enabled: res.enabled,
+          candidates: res.candidates,
+          loading: false,
+        });
+      } catch (e) {
+        if (cancelled) return;
+        // 候補が引けなくても手入力で取得できるので、致命的な扱いにはしない。
+        setCredentials({
+          enabled: false,
+          candidates: [],
+          loading: false,
+          error: e instanceof ApiError ? e.message : String(e),
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [identifiers.ipAddress, identifiers.hostname, identifiers.customer]);
+
   /**
    * プロトコル切替。ポートが切替前プロトコルの既定値のままなら、新しい
    * プロトコルの既定値へ追従させる（ユーザーが手で変えた値は保持する）。
@@ -101,11 +161,54 @@ export function DeviceFetchDialog({
       prev === HELPER_DEFAULT_PORTS[protocol] ? HELPER_DEFAULT_PORTS[next] : prev,
     );
     setProtocol(next);
+    // プロトコルを変えたら Telnet の同意はリセットする。
+    setTelnetAck(false);
   }
+
+  /**
+   * 候補を選択する。アカウント名と、備考から推定した protocol / osHint を
+   * **初期値として**反映する。推定は外れることがあるので、以降ユーザーが
+   * 自由に上書きできる（推定値は保存もしない）。
+   */
+  function selectCandidate(cand: NodeCredentialCandidate) {
+    setSelectedCredId(cand.id);
+    setUsername(cand.accountName);
+    // 保存済み認証情報を使う場合、パスワード欄は使わない。
+    setPassword("");
+    setStripInvisible(false);
+    setTelnetAck(false);
+    if (cand.hint.protocol) changeProtocol(cand.hint.protocol);
+    if (cand.hint.osHint) setOsHint(cand.hint.osHint);
+  }
+
+  /** 「手入力」へ戻す。 */
+  function clearCandidate() {
+    setSelectedCredId(null);
+    setStripInvisible(false);
+    setTelnetAck(false);
+  }
+
+  const selectedCandidate =
+    credentials.candidates.find((x) => x.id === selectedCredId) ?? null;
+  const usingStoredCredential = selectedCandidate !== null;
 
   async function runFetch() {
     if (!helperPort) return;
-    if (!host.trim() || !username.trim() || !password) {
+    if (!host.trim()) {
+      setUploadMsg({ type: "err", text: "ホストは必須です" });
+      return;
+    }
+    if (usingStoredCredential) {
+      // 保存済み認証情報を Telnet で使うと、管理者パスワードが LAN 上を
+      // 平文で流れる。明示的な同意を必須にする。
+      if (protocol === "telnet" && !telnetAck) {
+        setUploadMsg({
+          type: "err",
+          text: "Telnet で保存済み認証情報を使う場合は、平文送信への同意チェックが必要です",
+        });
+        return;
+      }
+    } else if (!username.trim() || !password) {
       setUploadMsg({ type: "err", text: "ホスト・ユーザー名・パスワードは必須です" });
       return;
     }
@@ -124,13 +227,44 @@ export function DeviceFetchDialog({
     setDetected(null);
     setUploadMsg(null);
     try {
+      // 保存済み認証情報を使う場合は、平文ではなく一回限りのトークンを取得する。
+      // 平文はヘルパーが BFF から直接引き換えるので、SPA は一度も保持しない。
+      let credentialToken: string | undefined;
+      if (usingStoredCredential && selectedCredId) {
+        try {
+          const issued = await apiFetch<NodeCredentialTokenResponse>(
+            `/api/node-credentials/${encodeURIComponent(selectedCredId)}/issue-token`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                customer: identifiers.customer,
+                hostname: identifiers.hostname,
+                ipAddress: identifiers.ipAddress,
+                stripInvisible,
+              }),
+            },
+          );
+          credentialToken = issued.token;
+          setUsername(issued.username);
+        } catch (e) {
+          setUploadMsg({
+            type: "err",
+            text: "認証情報の取得に失敗しました",
+            detail: e instanceof ApiError ? e.message : String(e),
+          });
+          setPhase("idle");
+          return;
+        }
+      }
+
       const res = await fetchConfigViaHelper(helperPort, {
         host: host.trim(),
         port,
         protocol,
-        username: username.trim(),
-        password,
+        username: credentialToken ? undefined : username.trim(),
+        password: credentialToken ? undefined : password,
         enablePassword: enablePassword || undefined,
+        credentialToken,
         osHint,
         commandOverride: commandOverride.trim() || null,
         timeouts: HELPER_DEFAULT_TIMEOUTS,
@@ -283,6 +417,130 @@ export function DeviceFetchDialog({
           )}
         </div>
 
+        {/* 保存済み認証情報の候補（顧客情報アプリ） */}
+        {credentials.loading ? (
+          <div className="mb-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+            登録済みの認証情報を検索中…
+          </div>
+        ) : credentials.candidates.length > 0 ? (
+          <div className="mb-4 rounded-md border border-slate-200 bg-white">
+            <div className="border-b border-slate-200 bg-slate-50 px-3 py-2">
+              <p className="text-sm font-medium text-slate-800">
+                登録済みの認証情報（{credentials.candidates.length} 件）
+              </p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                IP アドレスが一致するレコードです。
+                <span className="font-medium">
+                  同じ IP が別の顧客にも存在する場合があります
+                </span>
+                。顧客名と機器名を確認して選んでください。
+              </p>
+            </div>
+            <ul className="divide-y divide-slate-100">
+              {credentials.candidates.map((cand) => (
+                <li key={cand.id}>
+                  <label className="flex cursor-pointer items-start gap-2 px-3 py-2 hover:bg-slate-50">
+                    <input
+                      type="radio"
+                      name="node-credential"
+                      className="mt-1"
+                      checked={selectedCredId === cand.id}
+                      onChange={() => selectCandidate(cand)}
+                    />
+                    <span className="min-w-0 flex-1 text-sm">
+                      <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span className="font-medium text-slate-900">
+                          {cand.accountName || "(アカウント名なし)"}
+                        </span>
+                        <span className="text-slate-500">@</span>
+                        <span className="text-slate-700">
+                          {cand.nodeName || "(機器名なし)"}
+                        </span>
+                        {cand.matchesHostname && (
+                          <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                            ホスト名一致
+                          </span>
+                        )}
+                        {cand.matchesCustomer && (
+                          <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-700">
+                            顧客一致
+                          </span>
+                        )}
+                      </span>
+                      <span className="mt-0.5 block text-xs text-slate-500">
+                        {cand.customerName || "(顧客なし)"} ・ {cand.systemType}
+                      </span>
+                      {cand.note.trim() && (
+                        <span className="mt-0.5 block truncate text-xs text-slate-400">
+                          備考: {cand.note.replace(/\s+/g, " ").slice(0, 120)}
+                        </span>
+                      )}
+                      {cand.hint.reason && (
+                        <span className="mt-0.5 block text-xs text-slate-500">
+                          推定: {cand.hint.protocol ?? "プロトコル不明"}
+                          {cand.hint.osHint ? ` / ${cand.hint.osHint}` : ""}（
+                          {cand.hint.reason}）
+                        </span>
+                      )}
+                      {cand.invisibleCharFields.length > 0 && (
+                        <span className="mt-0.5 block text-xs text-amber-700">
+                          ⚠ このレコードは不可視文字を含みます（
+                          {cand.invisibleCharFields.join(", ")}）
+                        </span>
+                      )}
+                    </span>
+                  </label>
+                </li>
+              ))}
+              <li>
+                <label className="flex cursor-pointer items-center gap-2 px-3 py-2 text-sm hover:bg-slate-50">
+                  <input
+                    type="radio"
+                    name="node-credential"
+                    checked={selectedCredId === null}
+                    onChange={clearCandidate}
+                  />
+                  <span className="text-slate-700">
+                    手入力する（登録済みの認証情報を使わない）
+                  </span>
+                </label>
+              </li>
+            </ul>
+            {usingStoredCredential && (
+              <div className="space-y-2 border-t border-slate-200 bg-slate-50 px-3 py-2">
+                <p className="text-xs text-slate-600">
+                  パスワードはブラウザには渡りません。取得時に一回限りのトークンを
+                  発行し、ヘルパーが直接引き換えます。
+                </p>
+                <label className="flex items-start gap-2 text-xs text-slate-700">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={stripInvisible}
+                    onChange={(e) => setStripInvisible(e.target.checked)}
+                  />
+                  <span>
+                    パスワードの不可視文字（ゼロ幅スペース等）を除去して送信する
+                    <span className="mt-0.5 block text-slate-500">
+                      Excel からの貼り付けでゼロ幅スペースが混入しているレコードが
+                      あります。認証に失敗する場合はこれを試してください。既定では
+                      Kintone の値をそのまま送ります。
+                    </span>
+                  </span>
+                </label>
+              </div>
+            )}
+          </div>
+        ) : credentials.enabled ? (
+          <div className="mb-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+            この IP アドレスに一致する登録済み認証情報はありません。手入力で取得してください。
+          </div>
+        ) : credentials.error ? (
+          <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            登録済み認証情報の検索に失敗しました（手入力で取得できます）: {credentials.error}
+          </div>
+        ) : null}
+
         {/* 接続情報入力（都度入力） */}
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className="block">
@@ -326,25 +584,30 @@ export function DeviceFetchDialog({
           </label>
           <label className="block">
             <span className="mb-1 block text-xs font-medium uppercase text-slate-500">
-              ユーザー名 *
+              ユーザー名 {usingStoredCredential ? "（登録済み）" : "*"}
             </span>
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               autoComplete="off"
-              className={inputCls}
+              disabled={usingStoredCredential}
+              className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
             />
           </label>
           <label className="block">
             <span className="mb-1 block text-xs font-medium uppercase text-slate-500">
-              パスワード *
+              パスワード {usingStoredCredential ? "（登録済み）" : "*"}
             </span>
             <input
               type="password"
-              value={password}
+              value={usingStoredCredential ? "" : password}
               onChange={(e) => setPassword(e.target.value)}
               autoComplete="off"
-              className={inputCls}
+              disabled={usingStoredCredential}
+              placeholder={
+                usingStoredCredential ? "ヘルパーが直接引き換えます" : undefined
+              }
+              className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
             />
           </label>
           <label className="block">
@@ -411,6 +674,19 @@ export function DeviceFetchDialog({
             <span className="font-semibold">【Telnet は平文です】</span>
             ユーザー名・パスワードが LAN 上を暗号化されずに流れます。機器が SSH に
             対応している場合は SSH を選んでください。
+            {usingStoredCredential && (
+              <label className="mt-2 flex items-start gap-2 font-medium">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={telnetAck}
+                  onChange={(e) => setTelnetAck(e.target.checked)}
+                />
+                <span>
+                  登録済みの管理者パスワードが平文で送信されることを承知しました
+                </span>
+              </label>
+            )}
           </div>
         ) : (
           <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
@@ -424,7 +700,9 @@ export function DeviceFetchDialog({
         {/* 取得ボタン */}
         <div className="mt-4 flex items-center justify-between">
           <p className="text-xs text-slate-500">
-            パスワード類はヘルパーとの通信にのみ使われ、BFF には送信されません。
+            {usingStoredCredential
+              ? "パスワードはブラウザを通りません。ヘルパーが一回限りのトークンで引き換えます。"
+              : "パスワード類はヘルパーとの通信にのみ使われ、BFF には送信されません。"}
           </p>
           <div className="flex gap-2">
             <button

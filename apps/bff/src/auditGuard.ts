@@ -14,7 +14,10 @@ export type DestructiveKind =
   | "device.delete"
   | "credential.create"
   | "credential.update"
-  | "credential.delete";
+  | "credential.delete"
+  /** 顧客情報アプリの機器認証情報を参照した（トークン発行・引き換え）。
+   *  削除系ではないが、平文パスワードに触れる操作なのでバースト検知の対象に含める。 */
+  | "credential.reveal";
 
 export interface DestructiveAuditFields {
   kind: DestructiveKind;
