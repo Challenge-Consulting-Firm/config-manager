@@ -30,6 +30,9 @@ import {
   toAuthUser,
 } from "./entra.js";
 import { api, type AppEnv } from "./api.js";
+import { getNodeCredentialSecret, writeAudit } from "./kintone.js";
+import { consumeNodeCredentialToken } from "./nodeCredentialTokens.js";
+import { formatDestructiveDetail } from "./auditGuard.js";
 import {
   createCsrfOriginGuard,
   securityHeaders,
@@ -167,6 +170,101 @@ app.get("/downloads/helper/*", (c) => {
   c.header("Content-Type", ct);
   c.header("Content-Disposition", `attachment; filename="${filename}"`);
   return c.body(data);
+});
+
+// ---- 機器認証情報の引き換え（ローカル取得ヘルパー専用・Issue #53）----
+//
+// このルートを `/api/*` の外に置いているのは意図的。呼び出し元はブラウザでは
+// なくユーザー PC 上のヘルパー（Go）で、セッション Cookie も Origin も持たない
+// ため、`/api/*` のセッションガードと CSRF Origin ガードのどちらも通れない。
+//
+// 代わりの保護は引き換えトークンそのものが担う。32 バイトの乱数・一回限り・
+// 数十秒で失効し、発行時の利用者と対象機器に束縛される。平文パスワードが
+// ブラウザを一切通らないことと引き換えに、この経路を開けている。
+app.post("/helper/credentials/redeem", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const payload = await c.req.json<{ token?: string }>().catch(() => null);
+  const token = payload?.token?.trim();
+  if (!token) {
+    return c.json({ error: "token is required" }, 400);
+  }
+
+  const ctx = consumeNodeCredentialToken(token);
+  if (!ctx) {
+    // 期限切れ・使用済み・未知のいずれか。理由は区別せず返す（総当たりの
+    // 手掛かりを与えないため）。ログ側にも token は残さない。
+    console.warn("[node-credentials] redeem rejected: unknown or expired token");
+    return c.json({ error: "token is invalid or expired" }, 401);
+  }
+
+  try {
+    const secret = await getNodeCredentialSecret(cfg, ctx.credentialId, {
+      stripInvisible: ctx.stripInvisible,
+    });
+    if (!secret) {
+      await writeAudit(cfg, {
+        operator: ctx.operator,
+        operatorEmail: ctx.operatorEmail,
+        action: "credential",
+        customer: ctx.target.customer,
+        hostname: ctx.target.hostname,
+        detail: formatDestructiveDetail({
+          kind: "credential.reveal",
+          summary: "機器認証情報の引き換えに失敗（レコードが対象外または削除済み）",
+          attrs: {
+            id: ctx.credentialId,
+            ip: ctx.target.ipAddress,
+            result: "not_found",
+          },
+        }),
+      });
+      return c.json({ error: "credential not found" }, 404);
+    }
+
+    // 【監査】平文を渡す直前に fail closed で記録する。監査を書けないなら
+    // 平文は出さない（記録できない参照を許すと追跡不能になるため）。
+    // 監査アプリの action ドロップダウンに `credential` の選択肢が無いと
+    // ここで失敗する。`node scripts/setup-kintone.mjs --app audit` で同期すること。
+    try {
+      await writeAudit(
+        cfg,
+        {
+          operator: ctx.operator,
+          operatorEmail: ctx.operatorEmail,
+          action: "credential",
+          customer: ctx.target.customer,
+          hostname: ctx.target.hostname,
+          detail: formatDestructiveDetail({
+            kind: "credential.reveal",
+            summary: `機器認証情報をヘルパーへ引き換え: ${secret.nodeName}`,
+            attrs: {
+              id: ctx.credentialId,
+              ip: ctx.target.ipAddress,
+              account: secret.username,
+              customerRecord: secret.customerName,
+              result: "redeemed",
+            },
+          }),
+        },
+        { failClosed: true },
+      );
+    } catch {
+      // writeAudit 側で既にログ出力済み。平文は返さない。
+      return c.json(
+        {
+          error:
+            "監査ログを記録できなかったため、認証情報の引き換えを中止しました",
+        },
+        503,
+      );
+    }
+
+    // 【機密】この応答だけが平文を運ぶ。ログには絶対に出さない。
+    return c.json({ username: secret.username, password: secret.password });
+  } catch (err) {
+    console.error("[node-credentials] redeem failed:", err);
+    return c.json({ error: "failed to load credential" }, 500);
+  }
 });
 
 // ---- Auth routes ----

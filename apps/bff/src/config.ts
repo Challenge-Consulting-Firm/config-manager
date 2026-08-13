@@ -75,6 +75,12 @@ export interface AppConfig {
      *  は無効化され、Meraki 取得画面では都度入力のみとなる。 */
     merakiAppId: string;
     merakiAppToken: string;
+    /** 顧客情報（ノード管理）アプリ（任意・読み取り専用）。機器のアカウント名 /
+     *  パスワードの正本で、ローカル取得ヘルパーのログインに適用する（Issue #53）。
+     *  未設定時は候補提示が無効化され、取得ダイアログは都度入力のみとなる。
+     *  トークンは**閲覧のみ**の権限で発行すること（本機能は書き込みを一切行わない）。 */
+    customerInfoAppId: string;
+    customerInfoAppToken: string;
   };
   commentPrefixes: string[];
   /** Meraki Dashboard API 関連のオプション設定。API キーは環境変数
@@ -165,6 +171,9 @@ export function loadConfig(): AppConfig {
       // Meraki 接続情報アプリは任意。未設定時は Meraki クレデンシャル機能が無効。
       merakiAppId: optional("KINTONE_MERAKI_APP_ID", ""),
       merakiAppToken: optional("KINTONE_MERAKI_APP_TOKEN", ""),
+      // 顧客情報アプリも任意。未設定時は機器認証情報の候補提示が無効。
+      customerInfoAppId: optional("KINTONE_CUSTOMER_INFO_APP_ID", ""),
+      customerInfoAppToken: optional("KINTONE_CUSTOMER_INFO_APP_TOKEN", ""),
       username: optional("KINTONE_USERNAME"),
       password: optional("KINTONE_PASSWORD"),
       baseUrl: `https://${domain}`,

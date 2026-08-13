@@ -29,8 +29,10 @@ import {
   deleteVersion,
   deleteVersions,
   getMerakiCredential,
+  isEnabledCustomerInfo,
   isEnabledMerakiCredentials,
   listMerakiCredentials,
+  listNodeCredentials,
   updateMerakiCredential,
   updateVersionMeta,
 } from "./kintone.js";
@@ -62,10 +64,12 @@ import type {
   FirewallRule,
   MerakiDeviceInfo,
   MerakiProductType,
+  NodeCredentialTokenRequest,
   Role,
   RoutingRoute,
   WirelessExtraction,
 } from "@config-manager/shared";
+import { issueNodeCredentialToken } from "./nodeCredentialTokens.js";
 import { fetchMerakiConfig } from "./meraki.js";
 import { requireRole } from "./rbac.js";
 import { rateLimit } from "./rateLimit.js";
@@ -1066,6 +1070,167 @@ api.delete("/meraki/credentials/:id", requireRole("admin"), async (c) => {
     );
   }
 });
+
+// ===== 機器認証情報（顧客情報アプリ / Issue #53）=====
+//
+// 【この経路が守っていること】
+//   - 平文パスワードは応答に一切含めない（長さも返さない）。SPA が受け取るのは
+//     候補のメタ情報と、一回限りの不透明トークンだけ。
+//   - 候補は対象機器の IP コンテキスト経由でしか引けない。ID 直打ちでサーバや
+//     SaaS のアカウントを引き出せないよう、区分は kintone.ts 側でも再確認する。
+//   - ロール制限は設けない。参照元の Kintone アプリが社内全員に公開されており、
+//     config-manager 側で絞っても実効的な保護にならないため（Issue #53 決定 B）。
+//     代わりに参照は必ず監査ログに残す。
+
+/** GET /api/node-credentials?ip=&hostname=&customer= — 認証情報の候補一覧。
+ *
+ *  突合は IP アドレスの完全一致のみ。同一 IP が複数顧客に存在しうるため、
+ *  候補が 1 件でも UI 側で自動選択してはならない（顧客名と機器名を見せて
+ *  利用者に選ばせる）。 */
+api.get(
+  "/node-credentials",
+  rateLimit({ name: "node-credentials-list", limit: 60, windowMs: 60_000 }),
+  async (c) => {
+    const cfg = c.var.cfg;
+    // 候補にはアカウント名・機器名・備考が含まれるため、キャッシュさせない。
+    c.header("Cache-Control", "no-store");
+    if (!isEnabledCustomerInfo(cfg)) {
+      return c.json({ enabled: false, candidates: [] });
+    }
+    const ip = c.req.query("ip") ?? "";
+    if (!ip.trim()) {
+      return c.json({ error: "ip query param is required" }, 400);
+    }
+    try {
+      const candidates = await listNodeCredentials(cfg, {
+        ipAddress: ip,
+        hostname: c.req.query("hostname") ?? undefined,
+        customer: c.req.query("customer") ?? undefined,
+      });
+      return c.json({ enabled: true, candidates });
+    } catch (e) {
+      return c.json(
+        { error: publicErrorMessage(e, cfg.nodeEnv, "認証情報の検索に失敗") },
+        500,
+      );
+    }
+  },
+);
+
+/** POST /api/node-credentials/:id/issue-token — 引き換えトークンを発行する。
+ *
+ *  応答に平文は含まれない。ヘルパーがこのトークンを
+ *  POST /helper/credentials/redeem で引き換えてパスワードを受け取る。 */
+api.post(
+  "/node-credentials/:id/issue-token",
+  rateLimit({ name: "node-credentials-token", limit: 20, windowMs: 60_000 }),
+  async (c) => {
+    const cfg = c.var.cfg;
+    c.header("Cache-Control", "no-store");
+    if (!isEnabledCustomerInfo(cfg)) {
+      return c.json({ error: "顧客情報アプリが未設定です" }, 503);
+    }
+    const id = c.req.param("id");
+    const payload = await c.req
+      .json<NodeCredentialTokenRequest>()
+      .catch(() => null);
+    if (!payload) return c.json({ error: "invalid JSON body" }, 400);
+    const ipAddress = (payload.ipAddress ?? "").trim();
+    if (!ipAddress) {
+      return c.json({ error: "ipAddress is required" }, 400);
+    }
+
+    try {
+      // 対象機器のコンテキストで候補を引き直し、要求されたレコードが本当に
+      // その機器の候補かを検証する。ID だけを差し替えた要求を弾くため、
+      // 発行時にも突合をやり直す（候補一覧の結果は信用しない）。
+      const candidates = await listNodeCredentials(cfg, {
+        ipAddress,
+        hostname: payload.hostname,
+        customer: payload.customer,
+      });
+      const candidate = candidates.find((x) => x.id === id);
+      if (!candidate) {
+        await writeAudit(cfg, {
+          operator: c.var.user.displayName,
+          operatorEmail: c.var.user.email,
+          action: "credential",
+          customer: payload.customer,
+          hostname: payload.hostname,
+          detail: formatDestructiveDetail({
+            kind: "credential.reveal",
+            summary: "機器認証情報のトークン発行を拒否（対象機器の候補ではありません）",
+            attrs: { id, ip: ipAddress, result: "denied" },
+          }),
+        });
+        return c.json(
+          { error: "指定された認証情報は対象機器の候補ではありません" },
+          404,
+        );
+      }
+
+      const { token, expiresInMs } = issueNodeCredentialToken({
+        credentialId: id,
+        stripInvisible: payload.stripInvisible === true,
+        operator: c.var.user.displayName,
+        operatorEmail: c.var.user.email,
+        target: {
+          customer: payload.customer ?? "",
+          hostname: payload.hostname ?? "",
+          ipAddress,
+        },
+      });
+
+      const actor = c.var.user.email || c.var.user.displayName;
+      const burst = watchDestructiveBurst(actor, "credential.reveal");
+      // 監査は fail closed。記録できないならトークンも渡さない。監査アプリの
+      // action ドロップダウンに `credential` の選択肢が無いとここで失敗するので、
+      // `node scripts/setup-kintone.mjs --app audit` で同期しておくこと。
+      try {
+        await writeAudit(
+          cfg,
+          {
+            operator: c.var.user.displayName,
+            operatorEmail: c.var.user.email,
+            action: "credential",
+            customer: payload.customer,
+            hostname: payload.hostname,
+            detail: formatDestructiveDetail({
+              kind: "credential.reveal",
+              summary: `機器認証情報の引き換えトークンを発行: ${candidate.nodeName}`,
+              attrs: {
+                id,
+                ip: ipAddress,
+                account: candidate.accountName,
+                customerRecord: candidate.customerName,
+                stripInvisible:
+                  payload.stripInvisible === true ? "yes" : undefined,
+                result: "issued",
+                alert: burst.alerted ? "burst" : undefined,
+              },
+            }),
+          },
+          { failClosed: true },
+        );
+      } catch {
+        return c.json(
+          {
+            error:
+              "監査ログを記録できなかったため、認証情報の利用を中止しました（作業履歴アプリの action に credential の選択肢があるか確認してください）",
+          },
+          503,
+        );
+      }
+
+      return c.json({ token, expiresInMs, username: candidate.accountName });
+    } catch (e) {
+      return c.json(
+        { error: publicErrorMessage(e, cfg.nodeEnv, "トークン発行に失敗") },
+        500,
+      );
+    }
+  },
+);
 
 /** API キーをマスク表示用に変換（ラスト 4 文字のみ残す）。 */
 function maskApiKey(key: string): string {

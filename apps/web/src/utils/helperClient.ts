@@ -143,11 +143,13 @@ export async function checkHelperStatus(
 }
 
 /**
- * ヘルパーへ Telnet 取得を要求する（POST /api/fetch）。
+ * ヘルパーへ取得を要求する（POST /api/fetch）。
  *
- * パスワード・enablePassword はこのリクエストにのみ乗せ、BFF には送らない
- * （設計上、BFF への upload は SPA が取得した本文のみで行う）。
- * レスポンスに応じて成功・失敗を返す。
+ * 認証情報の渡し方は 2 通りある。
+ *   1. 都度入力: password / enablePassword をこのリクエストに乗せる。BFF には
+ *      送らない（BFF への upload は取得した本文のみ）。
+ *   2. 保存済み認証情報: credentialToken だけを乗せる。平文はヘルパーが BFF
+ *      から引き換えるため、SPA は一度もパスワードを保持しない（Issue #53）。
  */
 export async function fetchConfigViaHelper(
   port: HelperPort,

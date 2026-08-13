@@ -15,7 +15,12 @@ import type {
   ConfigVersion,
   DeviceDetection,
   DeviceIdentifiers,
+  HelperOsHint,
+  HelperProtocol,
   MerakiCredential,
+  NodeCredentialCandidate,
+  NodeCredentialField,
+  NodeCredentialHint,
   Role,
 } from "@config-manager/shared";
 import { ROLE_LABELS } from "@config-manager/shared";
@@ -92,6 +97,19 @@ const F = {
     hostname: "hostname",
     generation: "generation",
     detail: "detail",
+  },
+  // 顧客情報（ノード管理）アプリ（任意・読み取り専用）
+  // 既存の社内アプリを参照するため、フィールドコードは日本語のまま。
+  // config-manager 側の命名規則には合わせられない（アプリ側の正本が優先）。
+  customerInfo: {
+    customerName: "顧客名",
+    nodeName: "名前",
+    ipAddress: "IPアドレス",
+    accountName: "アカウント名",
+    password: "パスワード",
+    systemType: "システム種別_詳細区分",
+    note: "備考",
+    target: "対象",
   },
   // Meraki credentials app (optional)
   meraki: {
@@ -499,6 +517,16 @@ export async function writeAudit(
     generation?: number;
     detail?: string;
   },
+  opts: {
+    /**
+     * true のとき、監査の書き込みに失敗したら例外を投げる。
+     *
+     * 既定（false）はベストエフォートで、監査が書けなくても操作自体は続行する。
+     * 機器認証情報の参照のように「記録できないなら実行してはいけない」操作では
+     * true を渡し、呼び出し側で操作を中止すること。
+     */
+    failClosed?: boolean;
+  } = {},
 ): Promise<void> {
   const fields: Record<string, { value: string }> = {
     [F.audit.operator]: { value: entry.operator },
@@ -523,6 +551,7 @@ export async function writeAudit(
     );
   } catch (err) {
     console.error("[audit] failed to write audit entry:", err);
+    if (opts.failClosed) throw err;
   }
 }
 
@@ -852,4 +881,353 @@ export async function deleteMerakiCredential(
       ids: [id],
     }),
   });
+}
+
+// ===== 顧客情報（ノード管理）アプリ =====
+// 社内の既存アプリに登録済みの機器アカウントを、ローカル取得ヘルパーの
+// ログインへ適用するための読み取り専用アクセス（Issue #53）。
+//
+// 【設計上の約束】
+//   - 書き込みは一切行わない（API トークンも閲覧のみで発行する）。
+//   - パスワードは候補一覧の経路では読まない。単一レコード取得でのみ読む。
+//   - 照合用の正規化はキー項目にのみ適用し、パスワード本文には適用しない。
+
+/**
+ * 照合対象とする NW 機器の `システム種別_詳細区分`。
+ *
+ * このアプリはサーバ・SaaS アカウントも含む 600 件規模の正本なので、
+ * 取得ダイアログに出すのは NW 機器に限定する。値は正規化後に比較するため、
+ * アプリ側のオプションに紛れている不可視文字は無視される。
+ *
+ * アプリ側で区分が追加されたらここも見直すこと（未知の区分は候補に出ない）。
+ */
+const NETWORK_DEVICE_TYPES = new Set([
+  "Router",
+  "L2 Switch",
+  "L3基幹スイッチ",
+  "基幹L3SW",
+  "管理L2SW",
+  "WAN用L2SW",
+  "YamahaRTX",
+  "本社2F ルーター",
+  "監視用FW",
+  "KCPS 拡張 Firewall",
+  "WAF",
+  "CATO",
+  "Secure Internet Gateway",
+  "Load Balancer",
+  "拡張ロードバランサーWebUI",
+]);
+
+/** `対象` が明示的にこの値のレコードは候補から除外する（空欄は対象に含める）。 */
+const TARGET_EXCLUDED = "削除・管理外";
+
+/**
+ * ゼロ幅スペース類と BOM。
+ *
+ * このアプリのデータは Excel からの貼り付け痕跡とみられる `U+200B` を広範に
+ * 含んでおり（調査時点で IP 75 件 / アカウント名 94 件 / パスワード 102 件）、
+ * 除去しないと IP の完全一致が成立しない。
+ *
+ * 【重要】除去してよいのは照合キーだけ。パスワードは任意の文字列であり、
+ * 不可視文字を含む正当なパスワードを壊しうるため、既定では触らない。
+ */
+const INVISIBLE_CHARS = /[\u200B-\u200D\uFEFF]/g;
+
+/** 照合キー用の正規化。不可視文字の除去と前後空白の除去のみを行う。 */
+function normalizeLookupValue(raw: string): string {
+  return raw.replace(INVISIBLE_CHARS, "").trim();
+}
+
+/** 値に不可視文字（または前後空白）が含まれるか。UI の警告表示に使う。 */
+function hasInvisibleChars(raw: string): boolean {
+  if (!raw) return false;
+  return normalizeLookupValue(raw) !== raw;
+}
+
+/** 顧客情報アプリが env で有効化されているか。 */
+export function isEnabledCustomerInfo(cfg: AppConfig): boolean {
+  return (
+    cfg.kintone.customerInfoAppId.length > 0 &&
+    cfg.kintone.customerInfoAppToken.length > 0
+  );
+}
+
+function customerInfoGuard(cfg: AppConfig): void {
+  if (!isEnabledCustomerInfo(cfg)) {
+    throw new Error(
+      "顧客情報アプリが未設定です。KINTONE_CUSTOMER_INFO_APP_ID / KINTONE_CUSTOMER_INFO_APP_TOKEN を設定してください。",
+    );
+  }
+}
+
+/**
+ * 候補検索の対象レコード（パスワードを含まない）。
+ *
+ * Kintone の `like` はテキストのトークン化に依存し、IP アドレスのような文字列
+ * では期待どおりに絞り込めないことがある。対象アプリは 700 件規模と小さいので、
+ * **クエリで絞らず全件を取得して JS 側で正規化・完全一致**させるほうが確実で、
+ * クエリ文字列のエスケープ問題も避けられる。
+ */
+interface CustomerInfoRow {
+  id: string;
+  customerName: string;
+  nodeName: string;
+  ipAddress: string;
+  accountName: string;
+  systemType: string;
+  note: string;
+  /** 不可視文字を含んでいたキー項目（パスワードは単一取得時に判定する）。 */
+  dirtyFields: NodeCredentialField[];
+}
+
+/** 全件取得のページサイズ（Kintone の上限）。 */
+const CUSTOMER_INFO_PAGE_SIZE = 500;
+/** 取得するページ数の上限。アプリが想定外に肥大化した場合の保険。 */
+const CUSTOMER_INFO_MAX_PAGES = 10;
+/** 全件キャッシュの有効期間 (ms)。追加が即反映されなくても実害は小さい。 */
+const CUSTOMER_INFO_CACHE_TTL_MS = 5 * 60_000;
+
+let customerInfoCache: { rows: CustomerInfoRow[]; fetchedAt: number } | null =
+  null;
+
+/** テストおよび設定変更時にキャッシュを捨てる。 */
+export function clearCustomerInfoCache(): void {
+  customerInfoCache = null;
+}
+
+/**
+ * 顧客情報アプリの全レコードを取得する（パスワードは取得しない）。
+ * 一定時間はプロセス内にキャッシュする。
+ */
+async function loadCustomerInfoRows(
+  cfg: AppConfig,
+): Promise<CustomerInfoRow[]> {
+  customerInfoGuard(cfg);
+  const now = Date.now();
+  if (
+    customerInfoCache &&
+    now - customerInfoCache.fetchedAt < CUSTOMER_INFO_CACHE_TTL_MS
+  ) {
+    return customerInfoCache.rows;
+  }
+
+  const C = F.customerInfo;
+  // パスワードは意図的に fields から外す。候補一覧の経路で平文を読み込まない。
+  const fields = [
+    "$id",
+    C.customerName,
+    C.nodeName,
+    C.ipAddress,
+    C.accountName,
+    C.systemType,
+    C.note,
+    C.target,
+  ];
+
+  const rows: CustomerInfoRow[] = [];
+  for (let page = 0; page < CUSTOMER_INFO_MAX_PAGES; page++) {
+    const offset = page * CUSTOMER_INFO_PAGE_SIZE;
+    const res = await kintoneFetch<{ records: KintoneRecord[] }>(
+      cfg,
+      cfg.kintone.customerInfoAppToken,
+      "/records.json",
+      {
+        method: "POST",
+        headers: { "X-HTTP-Method-Override": "GET" },
+        body: JSON.stringify({
+          app: cfg.kintone.customerInfoAppId,
+          query: `order by $id asc limit ${CUSTOMER_INFO_PAGE_SIZE} offset ${offset}`,
+          fields,
+        }),
+      },
+    );
+    const batch = res.records ?? [];
+    for (const rec of batch) {
+      const raw = (k: string) => rec[k]?.value ?? "";
+      if (normalizeLookupValue(raw(C.target)) === TARGET_EXCLUDED) continue;
+
+      const rawNode = raw(C.nodeName);
+      const rawIp = raw(C.ipAddress);
+      const rawAccount = raw(C.accountName);
+      const dirty: NodeCredentialField[] = [];
+      if (hasInvisibleChars(rawNode)) dirty.push("nodeName");
+      if (hasInvisibleChars(rawIp)) dirty.push("ipAddress");
+      if (hasInvisibleChars(rawAccount)) dirty.push("accountName");
+
+      rows.push({
+        id: rec.$id.value,
+        customerName: normalizeLookupValue(raw(C.customerName)),
+        nodeName: normalizeLookupValue(rawNode),
+        ipAddress: normalizeLookupValue(rawIp),
+        accountName: normalizeLookupValue(rawAccount),
+        systemType: normalizeLookupValue(raw(C.systemType)),
+        note: raw(C.note),
+        dirtyFields: dirty,
+      });
+    }
+    if (batch.length < CUSTOMER_INFO_PAGE_SIZE) break;
+    if (page === CUSTOMER_INFO_MAX_PAGES - 1) {
+      console.warn(
+        `[customer-info] reached the ${CUSTOMER_INFO_MAX_PAGES}-page cap ` +
+          `(${rows.length} records). Later records are not searched — raise the cap.`,
+      );
+    }
+  }
+
+  customerInfoCache = { rows, fetchedAt: now };
+  return rows;
+}
+
+/** レコードが NW 機器の区分かどうか。 */
+function isNetworkDeviceRow(row: CustomerInfoRow): boolean {
+  return NETWORK_DEVICE_TYPES.has(row.systemType);
+}
+
+/**
+ * `備考` の自由記述から接続ヒントを推定する。**初期値の提案にのみ使う**。
+ *
+ * プロトコルが読み取れない場合は null を返し、Telnet へは倒さない
+ * （誤推定で平文接続に落ちるのを避けるため）。
+ */
+export function inferNodeCredentialHint(note: string): NodeCredentialHint {
+  const reasons: string[] = [];
+  let protocol: HelperProtocol | null = null;
+  let osHint: HelperOsHint | null = null;
+
+  if (/ssh/i.test(note)) {
+    protocol = "ssh";
+    reasons.push("備考に「SSH」の記載");
+  } else if (/telnet/i.test(note)) {
+    protocol = "telnet";
+    reasons.push("備考に「Telnet」の記載");
+  }
+
+  if (/SWX/i.test(note)) {
+    osHint = "yamaha-swx";
+    reasons.push("備考に YAMAHA SWX の記載");
+  } else if (/YAMAHA|RTX\s*\d|FWX\s*\d|NVR\s*\d/i.test(note)) {
+    osHint = "yamaha-rt";
+    reasons.push("備考に YAMAHA ルーターの記載");
+  } else if (/cisco|catalyst/i.test(note)) {
+    osHint = "cisco-ios";
+    reasons.push("備考に Cisco の記載");
+  }
+
+  return { protocol, osHint, reason: reasons.join(" / ") };
+}
+
+/**
+ * 対象機器に対する認証情報の候補を返す。
+ *
+ * 突合は **IP アドレスの正規化後の完全一致**のみで行う。顧客名とホスト名は
+ * 絞り込みには使わず、並び順（一致するものを上位へ）と UI 表示に使う。
+ * 同一 IP が複数顧客に存在しうるため、呼び出し側は候補が 1 件でも自動確定
+ * してはならない。
+ */
+export async function listNodeCredentials(
+  cfg: AppConfig,
+  target: { ipAddress: string; hostname?: string; customer?: string },
+): Promise<NodeCredentialCandidate[]> {
+  const ip = normalizeLookupValue(target.ipAddress);
+  if (!ip) return [];
+
+  const rows = await loadCustomerInfoRows(cfg);
+  const hostname = normalizeLookupValue(target.hostname ?? "");
+  const customer = normalizeLookupValue(target.customer ?? "");
+
+  const candidates = rows
+    .filter((row) => row.ipAddress === ip && isNetworkDeviceRow(row))
+    .map<NodeCredentialCandidate>((row) => ({
+      id: row.id,
+      customerName: row.customerName,
+      nodeName: row.nodeName,
+      ipAddress: row.ipAddress,
+      accountName: row.accountName,
+      systemType: row.systemType,
+      note: row.note,
+      // 顧客名は形式が異なる（app 側は "1004 野原ホールディングス"）ため、
+      // 部分一致で「一致っぽさ」を見るに留める。一致しなくても候補から外さない。
+      matchesCustomer:
+        customer.length > 0 &&
+        (row.customerName.includes(customer) ||
+          customer.includes(row.customerName)),
+      matchesHostname:
+        hostname.length > 0 &&
+        row.nodeName.toLowerCase() === hostname.toLowerCase(),
+      invisibleCharFields: row.dirtyFields,
+      hint: inferNodeCredentialHint(row.note),
+    }));
+
+  // 対象機器と一致する候補を上位に。次いでアカウント名で安定ソート。
+  const score = (c: NodeCredentialCandidate) =>
+    (c.matchesHostname ? 2 : 0) + (c.matchesCustomer ? 1 : 0);
+  return candidates.sort((a, b) => {
+    const diff = score(b) - score(a);
+    if (diff !== 0) return diff;
+    return a.accountName.localeCompare(b.accountName);
+  });
+}
+
+/** {@link getNodeCredentialSecret} が返す平文。ログへ出さないこと。 */
+export interface NodeCredentialSecret {
+  username: string;
+  password: string;
+  /** 監査ログ用の識別情報（機密ではない）。 */
+  customerName: string;
+  nodeName: string;
+  ipAddress: string;
+}
+
+/**
+ * レコード 1 件の平文パスワードを取得する。
+ *
+ * 呼び出し側は必ず対象機器のコンテキスト（IP）を検証済みであること。ここでも
+ * NW 機器の区分と `対象` を再確認し、レコード ID の直接指定で他区分のアカウント
+ * （サーバ・SaaS）を引き出せないようにする。
+ *
+ * `stripInvisible` が true のときだけパスワードの不可視文字を除去する。既定は
+ * false で、Kintone に入っている値をそのまま返す。
+ */
+export async function getNodeCredentialSecret(
+  cfg: AppConfig,
+  id: string,
+  opts: { stripInvisible?: boolean } = {},
+): Promise<NodeCredentialSecret | null> {
+  customerInfoGuard(cfg);
+  const C = F.customerInfo;
+
+  let rec: KintoneRecord;
+  try {
+    const res = await kintoneFetch<KintoneGetRecordResponse>(
+      cfg,
+      cfg.kintone.customerInfoAppToken,
+      "/record.json",
+      {
+        method: "POST",
+        headers: { "X-HTTP-Method-Override": "GET" },
+        body: JSON.stringify({ app: cfg.kintone.customerInfoAppId, id }),
+      },
+    );
+    rec = res.record;
+  } catch {
+    return null;
+  }
+
+  const raw = (k: string) => rec[k]?.value ?? "";
+  const systemType = normalizeLookupValue(raw(C.systemType));
+  if (!NETWORK_DEVICE_TYPES.has(systemType)) return null;
+  if (normalizeLookupValue(raw(C.target)) === TARGET_EXCLUDED) return null;
+
+  const storedPassword = raw(C.password);
+  return {
+    username: normalizeLookupValue(raw(C.accountName)),
+    // 既定では手を加えない。除去は利用者が明示的に選んだときだけ。
+    password: opts.stripInvisible
+      ? normalizeLookupValue(storedPassword)
+      : storedPassword,
+    customerName: normalizeLookupValue(raw(C.customerName)),
+    nodeName: normalizeLookupValue(raw(C.nodeName)),
+    ipAddress: normalizeLookupValue(raw(C.ipAddress)),
+  };
 }
