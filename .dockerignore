@@ -1,6 +1,22 @@
-node_modules
-dist
-build
+# Docker のパターンはコンテキスト直下しかマッチしない。ネストしたものまで
+# 除外するには `**/` を付ける必要がある。
+#
+# ここを `node_modules` と書いていたために apps/*/node_modules がイメージへ
+# コピーされ、Dockerfile 内の `pnpm install` の結果を上書きしていた。pnpm の
+# node_modules はリポジトリ直下 `/node_modules/.pnpm/<pkg>@<version>_<peer hash>`
+# を指すシンボリックリンクの束で、その実体（直下の node_modules）はここで
+# 除外されるため、ホストとコンテナで解決先がずれた瞬間にリンク切れになる。
+# ホストの pnpm install がロックファイルとずれているとビルドが壊れる、という
+# 再現条件の分かりにくい壊れ方をするので、必ず `**/` を付けること。
+**/node_modules
+**/dist
+**/build
+**/coverage
+
+# Claude Code の作業ディレクトリ。worktree を切ると node_modules ごと
+# ここにぶら下がり、ビルドコンテキストが数百 MB に膨らむ。
+.claude
+
 .env
 .env.*
 !.env.example
@@ -9,4 +25,3 @@ build
 .fly
 *.log
 .DS_Store
-coverage
