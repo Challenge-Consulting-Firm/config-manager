@@ -892,32 +892,20 @@ export async function deleteMerakiCredential(
 //   - パスワードは候補一覧の経路では読まない。単一レコード取得でのみ読む。
 //   - 照合用の正規化はキー項目にのみ適用し、パスワード本文には適用しない。
 
-/**
- * 照合対象とする NW 機器の `システム種別_詳細区分`。
- *
- * このアプリはサーバ・SaaS アカウントも含む 600 件規模の正本なので、
- * 取得ダイアログに出すのは NW 機器に限定する。値は正規化後に比較するため、
- * アプリ側のオプションに紛れている不可視文字は無視される。
- *
- * アプリ側で区分が追加されたらここも見直すこと（未知の区分は候補に出ない）。
- */
-const NETWORK_DEVICE_TYPES = new Set([
-  "Router",
-  "L2 Switch",
-  "L3基幹スイッチ",
-  "基幹L3SW",
-  "管理L2SW",
-  "WAN用L2SW",
-  "YamahaRTX",
-  "本社2F ルーター",
-  "監視用FW",
-  "KCPS 拡張 Firewall",
-  "WAF",
-  "CATO",
-  "Secure Internet Gateway",
-  "Load Balancer",
-  "拡張ロードバランサーWebUI",
-]);
+// `システム種別_詳細区分` によるホワイトリスト絞り込みは廃止した。
+//
+// 当初は「NW 機器だけを候補に出す」ための露出制限として入れたが、
+//   - 参照元アプリは社内全員が閲覧できるため（Issue #53 決定 B）、ここで絞っても
+//     実効的な保護にならない
+//   - 区分はアプリ側で自由に増える値で、追加のたびにコード修正が必要になる
+//   - 実際、区分が未設定の実在機器を軒並み除外してしまい、候補に出せなかった
+// という理由で、守っているものに対して害が大きすぎた。
+//
+// 実質的なゲートは以下で、これらは維持している。
+//   - IP アドレスの正規化後の完全一致（機器コンテキスト無しには引けない）
+//   - トークンのレコード ID 束縛（発行時に IP で再検証する）
+//   - 監査ログ（fail closed）
+// 区分は候補一覧に表示するので、利用者が見て選べる（自動選択はしない）。
 
 /** `対象` が明示的にこの値のレコードは候補から除外する（空欄は対象に含める）。 */
 const TARGET_EXCLUDED = "削除・管理外";
@@ -985,8 +973,15 @@ interface CustomerInfoRow {
 const CUSTOMER_INFO_PAGE_SIZE = 500;
 /** 取得するページ数の上限。アプリが想定外に肥大化した場合の保険。 */
 const CUSTOMER_INFO_MAX_PAGES = 10;
-/** 全件キャッシュの有効期間 (ms)。追加が即反映されなくても実害は小さい。 */
-const CUSTOMER_INFO_CACHE_TTL_MS = 5 * 60_000;
+/**
+ * 全件キャッシュの有効期間 (ms)。
+ *
+ * 長くすると Kintone への往復は減るが、「機器を登録した直後に取得を試す」
+ * という一番ありがちな流れで候補が出ず、原因の分からない待ちが発生する。
+ * 対象は 700 件規模（1 回あたり 2 リクエスト）で取得コストが小さいため、
+ * 反映の速さを優先して短めに倒している。
+ */
+const CUSTOMER_INFO_CACHE_TTL_MS = 60_000;
 
 let customerInfoCache: { rows: CustomerInfoRow[]; fetchedAt: number } | null =
   null;
@@ -1079,11 +1074,6 @@ async function loadCustomerInfoRows(
   return rows;
 }
 
-/** レコードが NW 機器の区分かどうか。 */
-function isNetworkDeviceRow(row: CustomerInfoRow): boolean {
-  return NETWORK_DEVICE_TYPES.has(row.systemType);
-}
-
 /**
  * `備考` の自由記述から接続ヒントを推定する。**初期値の提案にのみ使う**。
  *
@@ -1137,7 +1127,7 @@ export async function listNodeCredentials(
   const customer = normalizeLookupValue(target.customer ?? "");
 
   const candidates = rows
-    .filter((row) => row.ipAddress === ip && isNetworkDeviceRow(row))
+    .filter((row) => row.ipAddress === ip)
     .map<NodeCredentialCandidate>((row) => ({
       id: row.id,
       customerName: row.customerName,
@@ -1182,9 +1172,9 @@ export interface NodeCredentialSecret {
 /**
  * レコード 1 件の平文パスワードを取得する。
  *
- * 呼び出し側は必ず対象機器のコンテキスト（IP）を検証済みであること。ここでも
- * NW 機器の区分と `対象` を再確認し、レコード ID の直接指定で他区分のアカウント
- * （サーバ・SaaS）を引き出せないようにする。
+ * 呼び出し側は必ず対象機器のコンテキスト（IP）を検証済みであること。トークン
+ * 発行時に候補一覧を引き直して突合しているため、ここへ到達する ID は対象機器の
+ * IP と一致するレコードに限られる。この関数では `対象` のみ再確認する。
  *
  * `stripInvisible` が true のときだけパスワードの不可視文字を除去する。既定は
  * false で、Kintone に入っている値をそのまま返す。
@@ -1215,8 +1205,6 @@ export async function getNodeCredentialSecret(
   }
 
   const raw = (k: string) => rec[k]?.value ?? "";
-  const systemType = normalizeLookupValue(raw(C.systemType));
-  if (!NETWORK_DEVICE_TYPES.has(systemType)) return null;
   if (normalizeLookupValue(raw(C.target)) === TARGET_EXCLUDED) return null;
 
   const storedPassword = raw(C.password);

@@ -533,7 +533,16 @@ export function DeviceFetchDialog({
           </div>
         ) : credentials.enabled ? (
           <div className="mb-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
-            この IP アドレスに一致する登録済み認証情報はありません。手入力で取得してください。
+            <p>
+              IP アドレス
+              <span className="mono mx-1">{identifiers.ipAddress}</span>
+              に一致する登録済み認証情報はありません。手入力で取得してください。
+            </p>
+            <p className="mt-1 text-slate-400">
+              顧客情報アプリに登録済みのはずが出てこない場合は、IP
+              アドレスが完全に一致しているか（前後の空白や全角文字に注意）と、
+              登録直後であれば 1 分ほど待ってから開き直すことを確認してください。
+            </p>
           </div>
         ) : credentials.error ? (
           <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
