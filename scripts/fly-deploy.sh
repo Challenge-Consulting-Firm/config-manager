@@ -150,7 +150,38 @@ log "fly アプリの存在を確認しています..."
 # fly apps list --json の "Name" フィールドを正規表現で拾う。
 # fly CLI はバージョンによって "Name":"x" / "Name": "x" の両方を出力するため、
 # コロン前後の空白を許容する正規表現を使う。
-if ! fly apps list --json 2>/dev/null | grep -E "\"Name\"[[:space:]]*:[[:space:]]*\"${APP_NAME}\"" >/dev/null; then
+#
+# 【重要】コマンド自体の失敗と「アプリが無い」を区別する。ここを一括で
+# 「見つかりません」と扱うと、認証エラーやトークンのスコープ不足のときにも
+# 初回セットアップ手順（fly launch）を案内してしまう。それに従うと本番とは
+# 別の空アプリが作られ、fly.toml も書き換わる。
+# デプロイトークンはアプリ単位にスコープされ org 全体の一覧を引けないため、
+# 一覧が失敗しても即エラーにはせず、アプリ単体への到達性で確認し直す。
+APPS_JSON="$(fly apps list --json 2>/dev/null || true)"
+APP_FOUND=0
+if grep -E "\"Name\"[[:space:]]*:[[:space:]]*\"${APP_NAME}\"" <<<"$APPS_JSON" >/dev/null 2>&1; then
+  APP_FOUND=1
+elif fly status --app "${APP_NAME}" >/dev/null 2>&1; then
+  # 一覧は引けないがアプリ単体は見える（＝デプロイトークン運用）。
+  APP_FOUND=1
+  info "org 全体の一覧は取得できませんでしたが、アプリ単体へは到達できました。"
+elif [[ -z "$APPS_JSON" ]]; then
+  # 一覧もアプリ単体も取れない。アプリ未作成と認証失敗を区別できないため、
+  # fly launch は案内せずここで止める。
+  echo
+  fatal "fly の API 呼び出しに失敗しました（認証切れ、またはトークンのスコープ不足の可能性があります）。
+  次を実行して原因を切り分けてください:
+    fly auth whoami
+    fly apps list
+    fly status --app ${APP_NAME}
+  いずれも失敗する場合は 'fly auth logout && fly auth login'、
+  それでも解決しない場合はダッシュボードで deploy token を発行し
+  FLY_API_TOKEN に設定して再実行してください。
+  ※ アプリが存在するのに 'fly launch' を実行すると別アプリが作られ
+    fly.toml が書き換わります。存在確認が取れるまで実行しないでください。"
+fi
+
+if [[ "$APP_FOUND" -eq 0 ]]; then
   echo
   warn "fly アプリ '${APP_NAME}' が見つかりません。初回デプロイとしてセットアップが必要です。"
   echo
