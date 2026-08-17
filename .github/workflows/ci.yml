@@ -51,7 +51,7 @@ jobs:
       helper: ${{ steps.filter.outputs.helper }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           # helper 関連ファイルの変更がない PR では後続の helper ジョブをスキップ。
