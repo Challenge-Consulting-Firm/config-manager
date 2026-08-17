@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           # golang.org/x/crypto（SSH 取得で使用）が go 1.25 以上を要求するため、
           # apps/helper/go.mod の go ディレクティブに合わせる。
