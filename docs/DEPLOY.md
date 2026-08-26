@@ -353,28 +353,34 @@ curl https://config-manager.fly.dev/healthz
 
 ## ロールバック
 
-問題が発生した場合は、直前のリリースへ戻せます。
+問題が発生した場合は、リリース履歴から戻し先の image を明示して再デプロイします。現在の flyctl には専用の `rollback` コマンドがないため、「直前」を暗黙に選ばないでください。
 
 ```bash
-bash scripts/fly-deploy.sh --rollback
-```
+# ImageRef を含む履歴を確認
+fly releases --app config-manager --image --json
 
-または直接コマンド:
+# 戻し先を確認して明示的に指定
+fly deploy --app config-manager \
+  --image registry.fly.io/config-manager:deployment-XXXXXXXX \
+  --yes
 
-```bash
-fly rollback --app config-manager
+# 復旧確認
+curl https://config-manager.fly.dev/healthz
+fly status --app config-manager
 ```
 
 ### ロールバック時の注意
 
-- **コードは前バージョンに戻りますが、シークレットは現在のまま** です。シークレットが原因の場合は別途 `fly secrets set` で戻してください
-- **Kintone のレコードはロールバックされません**。コード変更が Kintone のスキーマ (フィールド追加等) に依存している場合は注意してください
-- ロールバック後も `fly status` でマシン状態を確認してください
+- 実行中・待機中の自動デプロイがないことを先に確認してください
+- 現在の release と、戻し先の `ImageRef` を取り違えないでください
+- **コードは前バージョンに戻りますが、シークレットは現在のまま**です。シークレットが原因の場合は別途 `fly secrets set` で戻してください
+- **Kintone のレコードはロールバックされません**。コード変更が Kintone のスキーマ（フィールド追加等）に依存している場合は注意してください
+- ロールバック後は `fly status` と `/healthz` の両方を確認してください
 
 ### リリース履歴の確認
 
 ```bash
-fly releases --app config-manager
+fly releases --app config-manager --image
 ```
 
 ---
@@ -473,45 +479,54 @@ fly machine status <machine-id>
 
 ---
 
-## CI/CD 連携のヒント
+## CI/CD 連携
 
-GitHub Actions 等で自動デプロイする場合の設定例です。
+`.github/workflows/deploy.yml` が、`main` への push を検証した CI の成功後に Fly.io へ完全自動デプロイします。PR の CI 成功だけではデプロイせず、squash merge 後の `main` コミットを CI で再検証し、その同じ SHA を checkout します。
 
-### 必要なシークレット (CI 側)
+### GitHub 側の設定
 
-- `FLY_API_TOKEN`: `fly tokens create deploy -a config-manager` で発行
+1. Environment `production` を作成する
+2. deployment branch を `main` に限定する
+3. 完全自動運用のため required reviewer は設定しない
+4. Environment secret `FLY_API_TOKEN` を登録する
 
-### サンプル workflow
+`FLY_API_TOKEN` は、アプリ単位・期限付きの deploy token を使用します。
 
-```yaml
-# .github/workflows/deploy.yml
-name: Deploy to fly.io
-on:
-  push:
-    branches: [main]
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v3
-        with:
-          version: 9.0.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm -r run typecheck
-      - run: pnpm build
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --yes --remote-only
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+```bash
+fly tokens create deploy -a config-manager --expiry 2160h
 ```
 
-> CI からは `--remote-only` を付け、Docker ビルドを fly.io 側で実行することを推奨します (CI ランナーのリソースを消費しない)。
-> シークレット同期は CI からは行わず、開発者が手動で `fly secrets set` してください。
+期限切れになる前に新しい token を発行し、値をログへ表示せず Environment secret を更新してください。org-wide token や個人の認証 token は使用しません。
+
+### 自動デプロイの流れ
+
+1. `main` の CI が `build` / `changes` / `helper-gate` を含めて成功
+2. `workflow_run` が成功した同じコミット SHA を checkout
+3. `flyctl deploy --app config-manager --remote-only --yes` を実行
+4. Fly 内部の `/healthz` check で Machine の健全性を確認
+5. 公開 `https://config-manager.fly.dev/healthz` が HTTP 200・本文 `ok` を返すまで retry
+6. GitHub Environment の deployment 履歴へ結果を記録
+
+デプロイは `fly-production` concurrency で直列化し、進行中の rollout は後続コミットでキャンセルしません。helper-only や文書だけの変更も含め、`main` の CI が通った変更は同じ経路を通すことで path 判定漏れを避けます。
+
+### シークレットと権限
+
+- workflow の GitHub 権限は `contents: read` のみです
+- Fly token は deploy step にだけ渡します
+- Fly.io に既に設定済みの本番シークレットは、CI から同期・変更しません
+- `.env` を CI や Fly.io へ一括投入しないでください
+
+### 失敗とロールバック
+
+Fly build、内部 health check、公開 health check のいずれかが失敗すると deployment は失敗として残ります。自動 rollback は行いません。公開経路の一時障害や別の手動操作と競合して、誤った「直前リリース」へ戻す事故を避けるためです。
+
+ロールバックが必要な場合は、実行中の deployment がないことと対象 release/image を確認してから、この文書の「ロールバック」手順を実行してください。ロールバック後も `/healthz` を確認します。
+
+### 手動再デプロイ
+
+安全のため、GitHub Actions から未検証の SHA を手動デプロイする入口は設けていません。Fly 側の一時障害や token ローテーション後に再デプロイが必要な場合は、対象が CI 成功済みの `main` コミットであることを確認し、ローカルの `scripts/fly-deploy.sh` を使用してください。
+
+> CI からは `--remote-only` を使い、Docker ビルドを Fly.io 側で実行します。ローカルの `scripts/fly-deploy.sh` はシークレット変更・手動デプロイ・調査時の標準手順として引き続き利用します。
 
 ---
 

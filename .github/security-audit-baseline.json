@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "npm": [
+    {
+      "package": "xlsx",
+      "severity": "high",
+      "ghsa": "GHSA-4r6h-8v6p-xvw6",
+      "cves": [
+        "CVE-2023-30533"
+      ],
+      "advisory": "https://github.com/advisories/GHSA-4r6h-8v6p-xvw6",
+      "reason": "npm では修正版が公開されておらず、任意ファイルの読み込みには使用していないため。代替ライブラリへの移行を期限までに再評価する。",
+      "expiresOn": "2026-11-30"
+    },
+    {
+      "package": "xlsx",
+      "severity": "high",
+      "ghsa": "GHSA-5pgg-2g8v-p4x9",
+      "cves": [
+        "CVE-2024-22363"
+      ],
+      "advisory": "https://github.com/advisories/GHSA-5pgg-2g8v-p4x9",
+      "reason": "npm では修正版が公開されておらず、任意ファイルの読み込みには使用していないため。代替ライブラリへの移行を期限までに再評価する。",
+      "expiresOn": "2026-11-30"
+    }
+  ]
+}

@@ -290,7 +290,7 @@ bash scripts/fly-deploy.sh
 | --- | --- |
 | 通常デプロイ | `bash scripts/fly-deploy.sh` |
 | 個別シークレット設定 (+ デプロイ) | `bash scripts/fly-deploy.sh --set-secret KEY=VALUE` |
-| ロールバック | `bash scripts/fly-deploy.sh --rollback` |
+| 安全なロールバック手順を表示 | `bash scripts/fly-deploy.sh --rollback` |
 
 > ⚠️ **`.env` からの全体一括同期 (旧 `--sync-secrets`) は廃止しました。** ローカル開発用の `.env` (`AUTH_MODE=disabled` 等) で本番シークレットを上書きしてしまう事故を防ぐため、シークレットは必ず個別に設定してください。
 

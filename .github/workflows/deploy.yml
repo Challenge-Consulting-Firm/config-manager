@@ -1,0 +1,68 @@
+name: Deploy to Fly.io
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://config-manager.fly.dev
+    steps:
+      - name: Validate the verified commit
+        id: commit
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ ! "$VERIFIED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid verified commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$VERIFIED_SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.commit.outputs.sha }}
+          persist-credentials: false
+
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+        with:
+          version: 0.4.91
+
+      - name: Deploy the verified commit
+        run: flyctl deploy --app config-manager --remote-only --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Verify public health endpoint
+        env:
+          HEALTH_URL: https://config-manager.fly.dev/healthz
+        run: |
+          for attempt in {1..12}; do
+            body="$(curl --fail --silent --show-error --max-time 15 "$HEALTH_URL" || true)"
+            if [[ "$body" == "ok" ]]; then
+              echo "Health check succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Health check attempt $attempt/12 failed"
+            sleep 10
+          done
+          echo "Health check did not return the expected body" >&2
+          exit 1

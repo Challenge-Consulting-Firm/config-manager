@@ -11,7 +11,7 @@
 #   3. オプション: --set-secret KEY=VALUE で個別シークレット設定
 #   4. fly deploy (fly.toml を維持)
 #   5. デプロイ後のヘルスチェック (/healthz)
-#   6. オプション: --rollback で直前リリースへ戻す
+#   6. オプション: --rollback でリリース履歴と安全な復旧手順を表示する
 #
 # ⚠️ .env 一括同期 (旧 --sync-secrets) は廃止しました。
 #    ローカル開発用 .env (AUTH_MODE=disabled 等) で本番シークレットを
@@ -24,7 +24,7 @@
 #   # 個別シークレットの設定 (例: Meraki API キー追加)
 #   bash scripts/fly-deploy.sh --set-secret MERAKI_API_KEY=xxxxxxxxxxxx
 #
-#   # 直前のリリースへロールバック
+#   # 安全なロールバック手順を表示
 #   bash scripts/fly-deploy.sh --rollback
 #
 #   # アプリ名を明示 (fly.toml を使わない場合)
@@ -49,7 +49,7 @@ Usage: bash scripts/fly-deploy.sh [options]
 Options:
   --app NAME              fly.io アプリ名 (既定: fly.toml の app= 値 = ${TOML_APP:-未検出})
   --set-secret K=V        fly secrets set を 1 件発行してからデプロイ (複数回指定可)
-  --rollback              デプロイせず直前リリースへロールバック
+  --rollback              デプロイせず安全なロールバック手順を表示
   -h, --help              このヘルプを表示
 
 注意:
@@ -219,16 +219,23 @@ ok "fly アプリ '${APP_NAME}' は存在します"
 
 # --- 3. ロールバック ---------------------------------------------------------
 if [[ "$ROLLBACK" -eq 1 ]]; then
-  log "直前リリースへロールバックします..."
-  fly status --app "$APP_NAME" | head -20
+  warn "現在の flyctl には専用の rollback コマンドがありません。"
+  warn "誤ったリリースへ戻さないよう、履歴から ImageRef を明示して再デプロイしてください。"
   echo
-  read -r -p "ロールバックを実行しますか? [y/N] " ans
-  if [[ "$ans" =~ ^[Yy]$ ]]; then
-    fly rollback --app "$APP_NAME"
-    ok "ロールバック コマンドを発行しました。'fly status --app ${APP_NAME}' で確認してください。"
-  else
-    info "ロールバックをキャンセルしました。"
-  fi
+  fly releases --app "$APP_NAME" --image
+  echo
+  cat <<EOF
+${C_BOLD}復旧手順:${C_RESET}
+  1. 実行中・待機中のデプロイがないことを確認
+  2. 上の履歴から戻し先の ImageRef を確認
+  3. 次を実行:
+       fly deploy --app ${APP_NAME} --image <ImageRef> --yes
+  4. 復旧確認:
+       curl https://${APP_NAME}.fly.dev/healthz
+       fly status --app ${APP_NAME}
+
+詳細は docs/DEPLOY.md の「ロールバック」を参照してください。
+EOF
   exit 0
 fi
 
@@ -284,7 +291,7 @@ cat <<EOF
 ${C_BOLD}次のアクション:${C_RESET}
   - ログ確認:        fly logs --app ${APP_NAME}
   - ステータス確認:  fly status --app ${APP_NAME}
-  - ロールバック:    bash scripts/fly-deploy.sh --rollback
+  - ロールバック手順: bash scripts/fly-deploy.sh --rollback
   - シークレット一覧: fly secrets list --app ${APP_NAME}
 
 URL: https://${HOSTNAME}
