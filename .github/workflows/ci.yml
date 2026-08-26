@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+  pull-requests: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -14,13 +18,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: pnpm/action-setup@v6.0.10
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: 9.0.0
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 20
           cache: pnpm
@@ -35,12 +39,12 @@ jobs:
         run: pnpm build
 
       - name: Dependency audit (high+)
-        # Surfaces advisories on every PR. Currently non-blocking because some
-        # transitive highs (e.g. xlsx with no patched release) have no clean fix
-        # yet — see docs/SECURITY.md. Flip continue-on-error to false once the
-        # known exceptions are cleared or ignored via pnpm.auditConfig.
-        run: pnpm audit --audit-level=high
-        continue-on-error: true
+        # Known no-fix advisories are narrowly and temporarily allowlisted in
+        # .github/security-audit-baseline.json. New highs and expired entries fail.
+        run: pnpm audit:security
+
+      - name: Test audit baseline gate
+        run: pnpm test:audit-gate
 
   # ローカル取得ヘルパー（Go）のビルド・テスト。apps/helper のみを扱い、
   # pnpm workspace 外（package.json 無し）のため Node ジョブから独立させる。
@@ -50,8 +54,8 @@ jobs:
     outputs:
       helper: ${{ steps.filter.outputs.helper }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
         with:
           # helper 関連ファイルの変更がない PR では後続の helper ジョブをスキップ。
@@ -66,11 +70,11 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'push' || needs.changes.outputs.helper == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           # golang.org/x/crypto（SSH 取得で使用）が go 1.25 以上を要求するため、
           # apps/helper/go.mod の go ディレクティブに合わせる。
@@ -93,6 +97,13 @@ jobs:
         working-directory: apps/helper
         run: go test ./...
 
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Check reachable vulnerabilities
+        working-directory: apps/helper
+        run: govulncheck ./...
+
       - name: Cross-build smoke (Windows / macOS)
         # クロスコンパイル可能かを軽く確認（成果物は保存しない）。
         working-directory: apps/helper
@@ -105,3 +116,34 @@ jobs:
         # scripts/build-helper.sh が最新の Go コードで成功するか確認
         # （成果物は BFF 配布ディレクトリへ生成される）。
         run: ./scripts/build-helper.sh 0.0.0-ci
+
+  # Always reports a stable required-check context. The expensive helper job may
+  # skip unrelated PRs, but any required helper run must finish successfully.
+  helper-gate:
+    needs: [changes, helper]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify helper result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          HELPER_RESULT: ${{ needs.helper.result }}
+          HELPER_REQUIRED: ${{ github.event_name == 'push' || needs.changes.outputs.helper == 'true' }}
+        run: |
+          echo "changes=${CHANGES_RESULT} helper=${HELPER_RESULT} required=${HELPER_REQUIRED}"
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "changes job did not succeed" >&2
+            exit 1
+          fi
+          if [[ "$HELPER_REQUIRED" == "true" ]]; then
+            [[ "$HELPER_RESULT" == "success" ]] || {
+              echo "required helper job did not succeed" >&2
+              exit 1
+            }
+          else
+            [[ "$HELPER_RESULT" == "skipped" ]] || {
+              echo "unrequired helper job had an unexpected result" >&2
+              exit 1
+            }
+          fi

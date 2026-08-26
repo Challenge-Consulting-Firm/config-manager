@@ -11,6 +11,7 @@ coverage
 .vscode/*
 !.vscode/extensions.json
 .claude/
+.codegraph/
 tmp/
 
 # ローカル取得ヘルパーのビルド成果物（バイナリ本体 + checksum）。

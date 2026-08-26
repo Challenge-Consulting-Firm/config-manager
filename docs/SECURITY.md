@@ -212,29 +212,36 @@ event=<kind> | <summary> | k=v k2=v2
 
 | 仕組み | 内容 |
 | --- | --- |
-| Dependabot | `.github/dependabot.yml` — npm / GitHub Actions を毎週月 9:00 JST |
-| CI audit | `.github/workflows/ci.yml` — `pnpm audit --audit-level=high`（現状は可視化のみ・非ブロッキング） |
+| Dependabot | `.github/dependabot.yml` — npm / Go modules / GitHub Actions を平日 9:00 JST に確認し、更新 PR を作成 |
+| 日次 audit | `.github/workflows/security-audit.yml` — 土日を含む毎日 9:00 JST に pnpm audit、`govulncheck`、`zizmor` を実行 |
+| PR CI | `.github/workflows/ci.yml` — baseline-aware pnpm audit と、helper 変更時の `govulncheck` をマージ前に必須実行 |
+| 自動マージ | `.github/workflows/dependabot-auto-merge.yml` — Dependabot の minor / patch のみ、必須 CI 成功後に squash merge |
 
-### 既知の例外（2026-08 時点）
+Dependabot の `daily` は GitHub の仕様上、平日のみ実行されます。土日を含む「毎日」の検知は日次 audit が担い、修正版がある脆弱性は有効化済みの Dependabot security updates でも PR 化します。commit SHA に固定した GitHub Actions は Dependabot alerts の対象外になるため、`zizmor` のオンライン監査で GitHub Advisory Database と照合します。major 更新、分類不能な更新、CI に失敗した更新は自動マージしません。
 
-| パッケージ | 深刻度 | 理由 |
-| --- | --- | --- |
-| `xlsx` | high (ReDoS) | パッチ版が npm に未公開（advisory 上 Patched `<0.0.0`）。利用はブラウザ側エクスポートのみ。代替ライブラリ移行を別 Issue で検討 |
-| `vite` 5.x | high (Windows `server.fs.deny`) | 本番コンテナは Vite dev server を使わない。major 上げ（v6）は別 PR |
+### 期限付き baseline（2026-11-30 まで）
 
-これらが解消、または `package.json#pnpm.auditConfig.ignoreCves` で期限付き ignore したら、CI の `continue-on-error` を `false` に戻してゲート化する。
+| パッケージ | Advisory | 深刻度 | 理由 |
+| --- | --- | --- | --- |
+| `xlsx` | `GHSA-4r6h-8v6p-xvw6` / `CVE-2023-30533` | high (Prototype Pollution) | npm に修正版がなく、任意ファイルの読み込みには使用していない。代替ライブラリ移行を期限までに再評価 |
+| `xlsx` | `GHSA-5pgg-2g8v-p4x9` / `CVE-2024-22363` | high (ReDoS) | npm に修正版がなく、任意ファイルの読み込みには使用していない。代替ライブラリ移行を期限までに再評価 |
+
+正本は `.github/security-audit-baseline.json` です。`scripts/check-pnpm-audit.mjs` は package / severity / GHSA / CVE がすべて一致し、かつ期限内の項目だけを許容します。新規 High / Critical、監査エラー、baseline の期限切れは CI と日次 audit を失敗させます。例外が解消した場合は、確認後に baseline から削除してください。
 
 ### トリアージ方針
 
 1. **Critical / High**: 原則その PR または当日中に更新。defer する場合は Issue を切り理由・期限を書く
 2. **Moderate**: 次回依存更新 PR に含める。悪用条件が自環境に無い場合は defer 可
 3. **Low / 情報**: まとめて四半期で対応してよい
-4. **例外（fix が無い / 誤検知）**: PR 説明に advisory URL と判断理由を残し、`pnpm.auditConfig.ignoreCves` 等で明示 ignore（期限付きコメント必須）
+4. **例外（fix が無い / 誤検知）**: advisory URL、判断理由、対象識別子、期限を `.github/security-audit-baseline.json` に明示し、レビューを経て追加する
+5. **Go**: `govulncheck` が到達可能な脆弱性を検出した場合は深刻度によらず更新または明示的なトリアージを行う
 
 ローカル確認:
 
 ```bash
-pnpm audit --audit-level=high
+pnpm audit:security
+pnpm test:audit-gate
+(cd apps/helper && govulncheck ./...)
 ```
 
 ---

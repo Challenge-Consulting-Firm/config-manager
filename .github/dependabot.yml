@@ -1,12 +1,11 @@
-# Keep npm dependencies and GitHub Actions on a steady patch cadence.
+# Keep npm, Go, and GitHub Actions dependencies on a daily patch cadence.
 # See docs/SECURITY.md for triage policy (when to bump / how to carve exceptions).
 version: 2
 updates:
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "09:00"
       timezone: "Asia/Tokyo"
     open-pull-requests-limit: 10
@@ -26,11 +25,26 @@ updates:
           - "minor"
           - "patch"
 
+  - package-ecosystem: "gomod"
+    directory: "/apps/helper"
+    schedule:
+      interval: "daily"
+      time: "09:00"
+      timezone: "Asia/Tokyo"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "security"
+    groups:
+      go-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "daily"
       time: "09:00"
       timezone: "Asia/Tokyo"
     open-pull-requests-limit: 5

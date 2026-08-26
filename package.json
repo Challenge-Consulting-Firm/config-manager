@@ -8,7 +8,9 @@
     "dev": "pnpm -r --parallel --filter=./apps/* run dev",
     "build": "pnpm --filter @config-manager/web build && pnpm --filter @config-manager/bff build",
     "typecheck": "pnpm -r run typecheck",
-    "lint": "pnpm -r run lint"
+    "lint": "pnpm -r run lint",
+    "audit:security": "node scripts/check-pnpm-audit.mjs",
+    "test:audit-gate": "node --test scripts/check-pnpm-audit.test.mjs"
   },
   "devDependencies": {
     "typescript": "^7.0.2"
