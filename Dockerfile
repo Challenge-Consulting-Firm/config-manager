@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- Stage 1: build the React SPA + BFF ----
-FROM node:20-slim AS build
+FROM node:24-slim AS build
 WORKDIR /app
 
 # Enable pnpm via corepack. Version must match package.json#packageManager.
@@ -25,7 +25,7 @@ RUN pnpm --filter @config-manager/web build
 RUN pnpm --filter @config-manager/bff build
 
 # ---- Stage 2: runtime ----
-FROM node:20-slim AS runtime
+FROM node:24-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
