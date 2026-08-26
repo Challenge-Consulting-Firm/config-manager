@@ -37,7 +37,7 @@ export default function App() {
     // Should normally be redirected by the BFF; offer a manual login link.
     return (
       <div className="flex h-screen items-center justify-center bg-slate-50">
-        <div className="w-full max-w-sm rounded-lg border border-slate-200 bg-white p-8 text-center shadow-sm">
+        <div className="w-full max-w-sm rounded-lg border border-slate-200 bg-white p-8 text-center shadow-xs">
           <AppIcon className="mx-auto h-14 w-14 rounded-md" />
           <h1 className="mt-4 text-xl font-semibold text-slate-900">
             NW Config Manager
