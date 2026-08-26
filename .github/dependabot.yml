@@ -12,6 +12,12 @@ updates:
     labels:
       - "dependencies"
       - "security"
+    # 型定義は実行環境の Node メジャーに合わせる（Dockerfile / CI = Node 24）。
+    # メジャーを勝手に上げると型だけ先行し、実行環境に無い API を型チェックで
+    # 検出できなくなるため、Node 本体を上げる際に手動で追従する。
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     # Group non-major bumps to cut PR noise; majors stay individual for review.
     groups:
       production-minor-patch:
