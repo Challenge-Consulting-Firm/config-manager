@@ -1,6 +1,28 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* v3 の tailwind.config.js の content 設定と等価なソース指定 */
+@source "../index.html";
+@source "./**/*.{ts,tsx}";
+
+@layer base {
+  /*
+   * Tailwind v4 の preflight は button のカーソルをブラウザ既定(default)に戻したため、
+   * v3 までと同じクリック可能な見た目を維持する。
+   */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  /*
+   * v4 の placeholder は currentColor 50% になり、本文色(slate-900)を継承して
+   * 入力値と紛らわしくなるため、v3 相当の淡い色を明示する。
+   */
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-slate-400);
+  }
+}
 
 :root {
   color-scheme: light;
