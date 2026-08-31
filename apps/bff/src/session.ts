@@ -8,11 +8,24 @@
 import { sealData, unsealData } from "iron-session";
 import { getCookie, setCookie } from "hono/cookie";
 import type { Context } from "hono";
-import type { AuthUser } from "@config-manager/shared";
+import { isAppRole, type AuthUser } from "@config-manager/shared";
 
 const COOKIE_NAME = "cm_session";
 
+/**
+ * Session payload schema version. Bump whenever a change makes older sealed
+ * cookies unsafe to keep trusting (e.g. a new field the authorization path
+ * depends on). Cookies carrying any other version are discarded on read, which
+ * forces a fresh login instead of silently running with a stale shape.
+ *
+ * 1 — pre-versioned sessions (implicit; rejected)
+ * 2 — RBAC fail-closed: `user.role` is mandatory and validated (Issue #82)
+ */
+export const SESSION_SCHEMA_VERSION = 2;
+
 export interface SessionData {
+  /** Schema version of this payload; see SESSION_SCHEMA_VERSION. */
+  v?: number;
   user?: AuthUser;
   /** Opaque id used by the process-local revocation registry (see sessionRegistry). */
   sid?: string;
@@ -98,6 +111,9 @@ export class Session {
   async save() {
     if (this.destroyed) return;
     if (!this.dirty) return;
+    // Stamp the schema version on every write so a later deploy can tell
+    // which shape it is looking at without guessing from the fields.
+    this.data.v = SESSION_SCHEMA_VERSION;
     const sealed = await sealData(this.data, {
       password: this.options.password,
       ttl: 60 * 60 * 24 * 7,
@@ -142,10 +158,40 @@ export async function getSession(
   let data: SessionData = {};
   if (sealed) {
     try {
-      data = (await unsealData(sealed, { password: options.password })) as SessionData;
+      const unsealed = (await unsealData(sealed, {
+        password: options.password,
+      })) as SessionData;
+      data = acceptSessionData(unsealed);
     } catch {
       data = {};
     }
   }
   return new Session(ctx, options, data);
+}
+
+/**
+ * Fail-closed validation of an unsealed payload (Issue #82).
+ *
+ * Anything we cannot fully vouch for is dropped wholesale rather than
+ * repaired, so the request continues as anonymous and the user re-logs in:
+ *   - a payload from an older/unknown schema version
+ *   - a user without a valid `role` (previously backfilled to admin)
+ */
+export function acceptSessionData(data: SessionData): SessionData {
+  if (!data || typeof data !== "object") return {};
+  if (data.v !== SESSION_SCHEMA_VERSION) {
+    if (data.v !== undefined || data.user || data.sid) {
+      // Do not log the payload itself — it carries the user identity.
+      console.warn(
+        `[session] rejected cookie with schema version ${String(data.v)} ` +
+          `(expected ${SESSION_SCHEMA_VERSION}); re-login required`,
+      );
+    }
+    return {};
+  }
+  if (data.user && !isAppRole(data.user.role)) {
+    console.warn("[session] rejected cookie: user has no valid role");
+    return {};
+  }
+  return data;
 }

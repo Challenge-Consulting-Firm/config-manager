@@ -38,6 +38,9 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Unit tests
+        run: pnpm test
+
       - name: Dependency audit (high+)
         # Known no-fix advisories are narrowly and temporarily allowlisted in
         # .github/security-audit-baseline.json. New highs and expired entries fail.

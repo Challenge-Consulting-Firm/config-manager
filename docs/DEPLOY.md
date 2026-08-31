@@ -135,6 +135,11 @@ fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
 # Meraki 接続情報アプリを使う場合は API キー暗号化鍵も設定（推奨）
 fly secrets set --app config-manager CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)
 
+# RBAC ロールグループ（本番では最低 1 つ必須。全て未設定だと起動に失敗する）
+fly secrets set --app config-manager ENTRA_GROUP_ADMIN_IDS=00000000-0000-0000-0000-000000000000
+fly secrets set --app config-manager ENTRA_GROUP_OPERATOR_IDS=00000000-0000-0000-0000-000000000000
+fly secrets set --app config-manager ENTRA_GROUP_VIEWER_IDS=00000000-0000-0000-0000-000000000000
+
 # Entra ID
 fly secrets set --app config-manager ENTRA_TENANT_ID=00000000-0000-0000-0000-000000000000
 fly secrets set --app config-manager ENTRA_CLIENT_ID=00000000-0000-0000-0000-000000000000
@@ -196,6 +201,18 @@ pnpm build
 ```bash
 bash scripts/fly-deploy.sh
 ```
+
+> **セッション schema version を上げたリリースの場合**
+> `apps/bff/src/session.ts` の `SESSION_SCHEMA_VERSION` が変わったデプロイでは、既存のログイン
+> セッションは次のリクエストで 401 となり、ログイン画面へ戻ります（再ログインで復帰）。
+> 事前にユーザーへ周知してください。デプロイ直後にログイン処理の途中だったユーザーは
+> `OAuth state mismatch` となることがありますが、ログインし直せば解消します。
+> cookie の seal ごと確実に失効させたい場合は
+> `SESSION_SECRET` をローテートします（詳細は [SECURITY.md](./SECURITY.md#旧セッションの失効移行手順)）。
+>
+> ```bash
+> fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
+> ```
 
 ### 3. 動作確認
 
@@ -446,6 +463,17 @@ fly machine status <machine-id>
   - `ENTRA_REDIRECT_URI` が `https://<app>.fly.dev/auth/callback` と完全一致しているか確認
   - Entra ID 側のリダイレクト URI に fly.io の URL が追加されているか確認 (README D)
   - `SESSION_SECRET` が 32 文字以上のランダム値か確認
+  - ログに `[session] rejected cookie with schema version ...` が出ている場合は、旧
+    セッションが失効しただけ。ブラウザで再ログインすれば解消する
+
+### 起動時に `RBAC role groups are not configured` で落ちる
+
+- **原因**: `NODE_ENV=production` かつ `AUTH_MODE=oidc` なのに `ENTRA_GROUP_*_IDS` が 3 つとも未設定
+- **対処**: Entra グループ ID を最低 1 つ設定する（設定漏れによる「全員 admin」を防ぐための意図的な起動失敗）
+
+```bash
+fly secrets set --app config-manager ENTRA_GROUP_ADMIN_IDS=<group-object-id>
+```
 
 ### Meraki 取得が失敗する
 

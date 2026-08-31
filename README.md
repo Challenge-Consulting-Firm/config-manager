@@ -223,7 +223,7 @@ cp .env.example .env
 | `MERAKI_API_BASE` | Meraki API のベース URL。既定 `https://api.meraki.com/api/v1`。中国リージョン等では要変更 |
 | `MERAKI_TIMEOUT_MS` / `MERAKI_MAX_RETRIES` | Meraki API 呼び出しのタイムアウトと 429 時のリトライ回数 |
 | `ENTRA_*` / `SESSION_SECRET` | `AUTH_MODE=oidc` の時のみ必須。`SESSION_SECRET` は 32 文字以上の高エントロピー値 |
-| `ENTRA_GROUP_ADMIN_IDS` / `ENTRA_GROUP_OPERATOR_IDS` / `ENTRA_GROUP_VIEWER_IDS` | 任意。Entra グループ ID による RBAC（admin/operator/viewer）。未設定時は認証ユーザー全員を admin 扱い |
+| `ENTRA_GROUP_ADMIN_IDS` / `ENTRA_GROUP_OPERATOR_IDS` / `ENTRA_GROUP_VIEWER_IDS` | Entra グループ ID による RBAC（admin/operator/viewer）。**`NODE_ENV=production` かつ `AUTH_MODE=oidc` では最低 1 つ必須**（全て未設定なら起動失敗）。本番以外は未設定時のみ認証ユーザー全員を admin 扱い |
 | `LOCAL_DEV_USER_ROLE` | `AUTH_MODE=disabled` 時のダミーユーザー権限。`viewer` / `operator` / `admin`（既定 `admin`） |
 | `CREDENTIALS_ENCRYPTION_KEY` | 任意（本番 + Meraki 接続情報アプリ利用時は推奨）。Meraki API キーを Kintone 保存時に AES-256-GCM 暗号化。`openssl rand -base64 32` |
 

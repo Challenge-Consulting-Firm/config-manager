@@ -37,13 +37,13 @@ import {
   createCsrfOriginGuard,
   securityHeaders,
 } from "./security.js";
-import { resolveRoleFromGroups } from "./rbac.js";
+import { resolveRoleFromGroups, roleGroupsConfigured } from "./rbac.js";
 import {
   isSessionRevoked,
   newSessionId,
   revokeSession,
 } from "./sessionRegistry.js";
-import { safeReturnPath, type AuthUser } from "@config-manager/shared";
+import { isAppRole, safeReturnPath, type AuthUser } from "@config-manager/shared";
 
 const cfg = loadConfig();
 // Resolve the SPA directory relative to THIS module so it works regardless of
@@ -310,13 +310,8 @@ app.get("/auth/callback", async (c) => {
     assertIdTokenClaims(claims, cfg);
 
     // Fetch groups once; used for both the admission gate and RBAC mapping.
-    const roleGroupsConfigured =
-      cfg.entra.adminGroupIds.length +
-        cfg.entra.operatorGroupIds.length +
-        cfg.entra.viewerGroupIds.length >
-      0;
     const needGroups =
-      cfg.entra.requiredGroupIds.length > 0 || roleGroupsConfigured;
+      cfg.entra.requiredGroupIds.length > 0 || roleGroupsConfigured(cfg);
     const groups = needGroups
       ? await getUserGroups(tokens.access_token)
       : [];
@@ -405,12 +400,10 @@ app.get("/auth/me", async (c) => {
     return c.json({ authenticated: false }, 401);
   }
   const user = session.get("user");
-  if (!user) return c.json({ authenticated: false }, 401);
-  // Backfill role for sessions created before RBAC shipped.
-  if (!user.role) {
-    user.role = "admin";
-    session.set("user", user);
-    await session.save();
+  // getSession() already drops payloads without a valid role; re-check here so
+  // the admin backfill this replaced (Issue #82) cannot creep back in.
+  if (!user || !isAppRole(user.role)) {
+    return c.json({ authenticated: false }, 401);
   }
   return c.json({ authenticated: true, user });
 });
@@ -427,12 +420,12 @@ app.use("/api/*", async (c, next) => {
       return c.json({ error: "unauthenticated", login: "/auth/login" }, 401);
     }
     const u = session.get("user");
-    if (!u) {
+    // A session without a valid role is rejected outright (fail closed): the
+    // old behaviour promoted it to admin, so a pre-RBAC cookie granted full
+    // privileges (Issue #82). Re-login resolves the real role.
+    if (!u || !isAppRole(u.role)) {
       return c.json({ error: "unauthenticated", login: "/auth/login" }, 401);
     }
-    // Sessions sealed before RBAC may lack role; treat as admin so we do not
-    // lock existing operators out mid-deploy. Next login resolves the real role.
-    if (!u.role) u.role = "admin";
     user = u;
   }
   c.set("cfg", cfg);
@@ -474,15 +467,12 @@ serve(
           `dummy user (${localUser.email}, role=${localUser.role}) is used. NEVER use this in production.`,
       );
     }
-    const rbacConfigured =
-      cfg.entra.adminGroupIds.length +
-        cfg.entra.operatorGroupIds.length +
-        cfg.entra.viewerGroupIds.length >
-      0;
-    if (!rbacConfigured && cfg.authMode === "oidc") {
+    // Production without the mapping never boots (loadConfig throws), so this
+    // only fires for local / staging runs.
+    if (!roleGroupsConfigured(cfg) && cfg.authMode === "oidc") {
       console.warn(
         "[startup] ENTRA_GROUP_*_IDS are unset — every authenticated user is treated as admin. " +
-          "Set ENTRA_GROUP_ADMIN_IDS / OPERATOR / VIEWER to enable RBAC.",
+          "Set ENTRA_GROUP_ADMIN_IDS / OPERATOR / VIEWER to enable RBAC (required in production).",
       );
     }
     if (
