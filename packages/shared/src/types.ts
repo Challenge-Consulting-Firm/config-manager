@@ -233,6 +233,12 @@ export function hasMinRole(actual: AppRole, required: AppRole): boolean {
   return APP_ROLE_RANK[actual] >= APP_ROLE_RANK[required];
 }
 
+/** Runtime guard for values coming from env / sealed cookies, where the
+ *  compile-time `AppRole` type gives no protection. */
+export function isAppRole(value: unknown): value is AppRole {
+  return value === "viewer" || value === "operator" || value === "admin";
+}
+
 /** Shape of the authenticated user surfaced to the frontend. */
 export interface AuthUser {
   displayName: string;

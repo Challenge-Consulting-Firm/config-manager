@@ -31,7 +31,16 @@ ENTRA_GROUP_OPERATOR_IDS=...
 ENTRA_GROUP_VIEWER_IDS=...
 ```
 
-未設定時は認証ユーザー全員を **admin** 扱い（後方互換）。本番では必ず設定してください。起動時に warn が出ます。
+本番（`NODE_ENV=production` かつ `AUTH_MODE=oidc`）は **3 つとも未設定なら起動を拒否** します（Issue #82）。
+設定漏れで RBAC が黙って無効化され、全員 admin になる事故を防ぐためです。
+
+```
+Error: RBAC role groups are not configured. Set at least one of
+ENTRA_GROUP_ADMIN_IDS / ENTRA_GROUP_OPERATOR_IDS / ENTRA_GROUP_VIEWER_IDS ...
+```
+
+本番以外（ローカル・検証）では未設定時のみ認証ユーザー全員を admin 扱いとし、起動時に warn を出します。
+どのロールグループにも属さないユーザーはログイン時に 403 で拒否されます（fail closed）。
 
 ---
 
@@ -42,6 +51,31 @@ ENTRA_GROUP_VIEWER_IDS=...
 - Cookie: iron-session による sealed cookie（`HttpOnly` + `Secure` + 確立後 `SameSite=Lax`）
 - ログイン時に opaque な `sid` を発行
 - ログアウト時にプロセス内 denylist へ `sid` を登録 → 以降その cookie は 401
+- payload に schema version（`v`）を持ち、**現行バージョン以外の cookie は読み捨てる**
+
+### schema version と fail-closed 判定
+
+`apps/bff/src/session.ts` の `SESSION_SCHEMA_VERSION` が payload の互換性を表します。
+`getSession()` は unseal 後に以下を検証し、**いずれかに引っかかった cookie は丸ごと破棄**して未認証として扱います（再ログインが必要）。
+
+| 判定 | 例 | 結果 |
+| --- | --- | --- |
+| `v` が現行値でない | RBAC 導入前の旧 cookie（`v` なし） | 破棄 → 401 |
+| `user.role` が欠落 / 未知の値 | 旧 cookie、改造された payload | 破棄 → 401 |
+
+以前は role 欠落セッションを **admin へ補完** していたため、旧 cookie が管理者権限を得られました。
+現在は補完せず fail closed です（Issue #82）。バージョンを上げる際は `SESSION_SCHEMA_VERSION` をインクリメントすれば、旧 cookie は自動的に失効します。
+
+### 旧セッションの失効（移行手順）
+
+1. 通常デプロイで十分です。`SESSION_SCHEMA_VERSION` の変更を含むリリースでは、既存ログイン中のユーザーは次のリクエストで 401 となり、ログイン画面へ戻されます（再ログインすれば復帰）。
+2. cookie の seal 自体を無効化して**確実に全セッションを失効**させたい場合（鍵漏洩の疑い等）は `SESSION_SECRET` をローテートします。
+
+```bash
+fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
+```
+
+`fly secrets set` はマシンを再起動するため、これだけで全 sealed cookie が復号不能になります。
 
 ### 限界（単一 fly machine 前提）
 

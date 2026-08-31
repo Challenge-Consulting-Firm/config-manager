@@ -3,8 +3,9 @@
  * Throws on missing required values so the process fails fast on boot.
  */
 
-import type { AppRole } from "@config-manager/shared";
+import { isAppRole, type AppRole } from "@config-manager/shared";
 import { parseEncryptionKey } from "./secretCrypto.js";
+import { roleGroupsConfigured } from "./rbac.js";
 
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
@@ -48,7 +49,8 @@ export interface AppConfig {
     redirectUri: string;
     /** Admission gate: any of these group IDs is enough to log in. */
     requiredGroupIds: string[];
-    /** RBAC mapping (highest match wins). Empty = every user is admin. */
+    /** RBAC mapping (highest match wins). Empty is rejected on boot in
+     *  production OIDC; outside production it falls back to admin. */
     adminGroupIds: string[];
     operatorGroupIds: string[];
     viewerGroupIds: string[];
@@ -191,12 +193,33 @@ export function loadConfig(): AppConfig {
       sectionConcurrency: int("MERAKI_SECTION_CONCURRENCY", 5),
     },
   };
+  assertRoleGroupsConfigured(cfg);
   cached = cfg;
   return cfg;
 }
 
+/**
+ * Production OIDC must have an explicit RBAC mapping. Without it every
+ * authenticated user used to be promoted to admin, so a forgotten env var
+ * silently disabled RBAC. Fail closed at boot instead (Issue #82).
+ */
+function assertRoleGroupsConfigured(cfg: AppConfig): void {
+  if (cfg.authMode !== "oidc" || cfg.nodeEnv !== "production") return;
+  if (roleGroupsConfigured(cfg)) return;
+  throw new Error(
+    "RBAC role groups are not configured. Set at least one of " +
+      "ENTRA_GROUP_ADMIN_IDS / ENTRA_GROUP_OPERATOR_IDS / ENTRA_GROUP_VIEWER_IDS " +
+      "when NODE_ENV=production and AUTH_MODE=oidc.",
+  );
+}
+
+/** Test helper — drop the memoized config so env changes take effect. */
+export function _resetConfigCacheForTests(): void {
+  cached = null;
+}
+
 function parseAppRole(raw: string): AppRole {
-  if (raw === "viewer" || raw === "operator" || raw === "admin") return raw;
+  if (isAppRole(raw)) return raw;
   throw new Error(
     `LOCAL_DEV_USER_ROLE must be one of viewer|operator|admin (got "${raw}")`,
   );

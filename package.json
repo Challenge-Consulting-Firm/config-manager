@@ -9,6 +9,7 @@
     "build": "pnpm --filter @config-manager/web build && pnpm --filter @config-manager/bff build",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test",
     "audit:security": "node scripts/check-pnpm-audit.mjs",
     "test:audit-gate": "node --test scripts/check-pnpm-audit.test.mjs"
   },

@@ -8,6 +8,7 @@
     "build": "node scripts/build.mjs && pnpm build:copy",
     "build:copy": "node scripts/copy-assets.js",
     "start": "node dist/index.js",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
