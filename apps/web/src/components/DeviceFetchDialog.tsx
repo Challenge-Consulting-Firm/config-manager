@@ -12,6 +12,7 @@ import {
   type HelperFetchResponse,
   type HelperOsHint,
   type HelperProtocol,
+  type HelperStatusResponse,
   type NodeCredentialCandidate,
   type NodeCredentialListResponse,
   type NodeCredentialTokenResponse,
@@ -21,8 +22,11 @@ import { apiFetch, ApiError } from "../apiClient";
 import {
   detectHelper,
   fetchConfigViaHelper,
+  pairHelper,
+  pairedHelperFor,
   HELPER_DETECT_TIMEOUT_INTERACTIVE_MS,
   type HelperPort,
+  type PairedHelper,
 } from "../utils/helperClient";
 
 /**
@@ -47,7 +51,13 @@ export function DeviceFetchDialog({
   onCompleted: () => void;
 }) {
   // ヘルパー検出状態。
-  const [helperPort, setHelperPort] = useState<HelperPort | null>(null);
+  const [helper, setHelper] = useState<{
+    port: HelperPort;
+    status: HelperStatusResponse;
+  } | null>(null);
+  const [pairedHelper, setPairedHelper] = useState<PairedHelper | null>(null);
+  const [pairingCode, setPairingCode] = useState("");
+  const [pairingBusy, setPairingBusy] = useState(false);
   const [probing, setProbing] = useState(true);
 
   // 保存済み認証情報（顧客情報アプリ）の候補。
@@ -105,7 +115,8 @@ export function DeviceFetchDialog({
     setProbing(true);
     try {
       const found = await detectHelper(HELPER_DETECT_TIMEOUT_INTERACTIVE_MS);
-      setHelperPort(found?.port ?? null);
+      setHelper(found);
+      setPairedHelper(found ? pairedHelperFor(found.status) : null);
     } finally {
       setProbing(false);
     }
@@ -194,13 +205,50 @@ export function DeviceFetchDialog({
     credentials.candidates.find((x) => x.id === selectedCredId) ?? null;
   const usingStoredCredential = selectedCandidate !== null;
 
+  async function pairDetectedHelper() {
+    if (!helper || !pairingCode.trim()) return;
+    setPairingBusy(true);
+    setUploadMsg(null);
+    try {
+      const paired = await pairHelper(helper.port, pairingCode);
+      if (paired.helperId !== helper.status.helperId) {
+        throw new Error("検出中のヘルパーとペアリング結果が一致しません");
+      }
+      setPairedHelper(paired);
+      setPairingCode("");
+      setUploadMsg({ type: "ok", text: "ローカルヘルパーをペアリングしました" });
+    } catch (e) {
+      setUploadMsg({
+        type: "err",
+        text: "ローカルヘルパーをペアリングできませんでした",
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setPairingBusy(false);
+    }
+  }
+
   async function runFetch() {
-    if (!helperPort) return;
+    if (!helper) return;
     if (!host.trim()) {
       setUploadMsg({ type: "err", text: "ホストは必須です" });
       return;
     }
     if (usingStoredCredential) {
+      if (!pairedHelper || pairedHelper.helperId !== helper.status.helperId) {
+        setUploadMsg({
+          type: "err",
+          text: "保存済み認証情報を使うには、ローカルヘルパーのペアリングが必要です",
+        });
+        return;
+      }
+      if (host.trim() !== identifiers.ipAddress.trim()) {
+        setUploadMsg({
+          type: "err",
+          text: "保存済み認証情報は登録済みの対象 IP アドレスにのみ利用できます",
+        });
+        return;
+      }
       // 保存済み認証情報を Telnet で使うと、管理者パスワードが LAN 上を
       // 平文で流れる。明示的な同意を必須にする。
       if (protocol === "telnet" && !telnetAck) {
@@ -257,11 +305,19 @@ export function DeviceFetchDialog({
                 customer: identifiers.customer,
                 hostname: identifiers.hostname,
                 ipAddress: identifiers.ipAddress,
+                targetHost: host.trim(),
+                helperId: pairedHelper!.helperId,
                 stripInvisible,
               }),
             },
           );
           credentialToken = issued.token;
+          if (
+            issued.helperId !== pairedHelper!.helperId ||
+            issued.targetHost !== host.trim()
+          ) {
+            throw new Error("発行されたトークンの束縛情報が一致しません");
+          }
           setUsername(issued.username);
         } catch (e) {
           setUploadMsg({
@@ -274,7 +330,7 @@ export function DeviceFetchDialog({
         }
       }
 
-      const res = await fetchConfigViaHelper(helperPort, {
+      const res = await fetchConfigViaHelper(helper.port, {
         host: host.trim(),
         port,
         protocol,
@@ -282,6 +338,8 @@ export function DeviceFetchDialog({
         password: credentialToken ? undefined : password,
         enablePassword: enablePassword || undefined,
         credentialToken,
+        helperId: credentialToken ? pairedHelper!.helperId : undefined,
+        credentialTargetHost: credentialToken ? host.trim() : undefined,
         osHint,
         commandOverride: normalizedCommand,
         timeouts: HELPER_DEFAULT_TIMEOUTS,
@@ -410,10 +468,40 @@ export function DeviceFetchDialog({
         <div className="mb-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
           {probing ? (
             <span className="text-slate-600">ヘルパーを検出中…</span>
-          ) : helperPort ? (
-            <span className="text-emerald-700">
-              ✓ ヘルパー稼働中（ポート {helperPort}）
-            </span>
+          ) : helper ? (
+            <div className="flex w-full flex-col gap-2">
+              <span className="text-emerald-700">
+                ✓ ヘルパー稼働中（ポート {helper.port}）
+              </span>
+              {helper.status.helperId && pairedHelper ? (
+                <span className="text-xs text-emerald-700">
+                  ✓ ペアリング済み（ID {helper.status.helperId.slice(0, 10)}…）
+                </span>
+              ) : (
+                <div className="flex flex-wrap items-end gap-2 rounded border border-amber-200 bg-amber-50 p-2">
+                  <label className="block flex-1">
+                    <span className="mb-1 block text-xs text-amber-800">
+                      保存済み認証情報を使う場合は、ヘルパー画面のペアリングコードを入力
+                    </span>
+                    <input
+                      type="password"
+                      autoComplete="one-time-code"
+                      value={pairingCode}
+                      onChange={(e) => setPairingCode(e.target.value)}
+                      className="w-full rounded border border-amber-300 bg-white px-2 py-1 text-sm"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void pairDetectedHelper()}
+                    disabled={pairingBusy || !pairingCode.trim()}
+                    className="rounded bg-amber-700 px-2.5 py-1 text-xs text-white disabled:opacity-50"
+                  >
+                    {pairingBusy ? "確認中…" : "ペアリング"}
+                  </button>
+                </div>
+              )}
+            </div>
           ) : (
             <span className="flex flex-wrap items-center gap-2 text-amber-700">
               ⚠ ヘルパーが起動していません。
@@ -753,7 +841,7 @@ export function DeviceFetchDialog({
             <button
               onClick={() => void runFetch()}
               disabled={
-                busy || !helperPort || phase === "fetching" || phase === "uploading"
+                busy || !helper || phase === "fetching" || phase === "uploading"
               }
               className="rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
             >

@@ -12,7 +12,10 @@ const testOrigin = "http://localhost:5173"
 // postFetch は /api/fetch へ POST し、応答を返す。
 func postFetch(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	s := New(Config{AllowedOrigins: []string{testOrigin}})
+	s, err := New(Config{AllowedOrigins: []string{testOrigin}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/api/fetch", strings.NewReader(body))
 	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")

@@ -84,6 +84,12 @@ export interface HelperFetchRequest {
    * 固定される（SPA が任意の URL を指定することはできない）。
    */
   credentialToken?: string;
+  /** 認証情報トークンを利用する正規ヘルパーの永続 ID。 */
+  helperId?: string;
+  /** 発行時に指定した対象ホスト。ヘルパー側で接続先と照合する。 */
+  credentialTargetHost?: string;
+  /** helper private key による token + targetHost の Ed25519 署名。 */
+  credentialSignature?: string;
   /** 機種ヒント。コマンド選択に使う。 */
   osHint: HelperOsHint;
   /**
@@ -163,6 +169,12 @@ export interface HelperStatusResponse {
   ok: true;
   /** ヘルパーのバージョン（Semantic Versioning）。 */
   version: string;
+  /** ヘルパー 1 インストールを表す公開鍵由来の永続 ID。 */
+  helperId: string;
+  /** Ed25519 公開鍵（DER/SPKI の Base64URL）。 */
+  publicKey: string;
+  /** pairing nonce に対する HMAC proof。nonce 未指定の status では省略。 */
+  pairingProof?: string;
 }
 
 /** `POST /api/shutdown` のレスポンス。200 を返してからプロセスを終了する。 */

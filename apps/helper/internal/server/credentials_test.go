@@ -99,7 +99,9 @@ func TestRedeemCredentialSuccess(t *testing.T) {
 	defer srv.Close()
 
 	// httptest は http://127.0.0.1:<port> を返すのでループバック例外で通る。
-	got, err := redeemCredential(context.Background(), srv.URL, "test-token")
+	got, err := redeemCredential(
+		context.Background(), srv.URL, "test-token", "helper-id", "192.0.2.1", "signature",
+	)
 	if err != nil {
 		t.Fatalf("redeemCredential returned an error: %v", err)
 	}
@@ -108,6 +110,9 @@ func TestRedeemCredentialSuccess(t *testing.T) {
 	}
 	if gotBody["token"] != "test-token" {
 		t.Fatalf("token was not sent in the body, got %v", gotBody)
+	}
+	if gotBody["helperId"] != "helper-id" || gotBody["targetHost"] != "192.0.2.1" || gotBody["signature"] != "signature" {
+		t.Fatalf("helper binding was not sent in the body, got %v", gotBody)
 	}
 }
 
@@ -143,7 +148,9 @@ func TestRedeemCredentialRejectsFailures(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
 
-			got, err := redeemCredential(context.Background(), srv.URL, "test-token")
+			got, err := redeemCredential(
+				context.Background(), srv.URL, "test-token", "helper-id", "192.0.2.1", "signature",
+			)
 			if err == nil {
 				t.Fatalf("expected an error, got credential for %q", got.Username)
 			}

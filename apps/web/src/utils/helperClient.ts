@@ -15,6 +15,36 @@ import {
   type HelperShutdownResponse,
   type HelperStatusResponse,
 } from "@config-manager/shared";
+import { apiFetch } from "../apiClient";
+
+/** この browser session でペアリング済みの helper identity。 */
+const PAIRED_HELPER_STORAGE_KEY = "config-manager:paired-helper";
+
+export interface PairedHelper {
+  helperId: string;
+  publicKey: string;
+}
+
+function readPairedHelper(): PairedHelper | null {
+  try {
+    const raw = sessionStorage.getItem(PAIRED_HELPER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PairedHelper>;
+    return parsed.helperId && parsed.publicKey
+      ? { helperId: parsed.helperId, publicKey: parsed.publicKey }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePairedHelper(paired: PairedHelper): void {
+  try {
+    sessionStorage.setItem(PAIRED_HELPER_STORAGE_KEY, JSON.stringify(paired));
+  } catch {
+    // sessionStorage が使えなくても再ペアリングで利用できる。
+  }
+}
 
 /** ヘルパーが見つかったポート番号。見つからなければ null。 */
 export type HelperPort = number;
@@ -140,6 +170,50 @@ export async function checkHelperStatus(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function pairHelper(
+  port: HelperPort,
+  pairingCode: string,
+): Promise<PairedHelper> {
+  const challenge = await apiFetch<{ nonce: string }>(
+    "/api/helper/pairing/challenge",
+    { method: "POST" },
+  );
+
+  const statusRes = await fetch(
+    `http://127.0.0.1:${port}/api/status?pairingNonce=${encodeURIComponent(challenge.nonce)}`,
+  );
+  if (!statusRes.ok) throw new Error("ヘルパーの identity を取得できませんでした");
+  const status = (await statusRes.json()) as HelperStatusResponse;
+  if (!status.helperId || !status.publicKey || !status.pairingProof) {
+    throw new Error("このヘルパーはペアリングに対応していません。最新版へ更新してください");
+  }
+
+  await apiFetch<{ paired: true; helperId: string }>(
+    "/api/helper/pairing/verify",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        nonce: challenge.nonce,
+        helperId: status.helperId,
+        publicKey: status.publicKey,
+        pairingCode: pairingCode.trim(),
+        proof: status.pairingProof,
+      }),
+    },
+  );
+  const paired = { helperId: status.helperId, publicKey: status.publicKey };
+  writePairedHelper(paired);
+  return paired;
+}
+
+export function pairedHelperFor(status: HelperStatusResponse): PairedHelper | null {
+  const paired = readPairedHelper();
+  if (!paired || paired.helperId !== status.helperId || paired.publicKey !== status.publicKey) {
+    return null;
+  }
+  return paired;
 }
 
 /**

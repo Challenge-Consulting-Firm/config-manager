@@ -32,6 +32,8 @@ export interface SessionData {
   pkceVerifier?: string;
   oauthState?: string;
   returnTo?: string;
+  /** このブラウザセッションで所有確認済みのローカルヘルパー。 */
+  pairedHelper?: { helperId: string; publicKey: string };
 }
 
 export interface SessionOptions {

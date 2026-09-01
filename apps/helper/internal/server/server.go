@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/commands"
+	helperidentity "github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/identity"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/session"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/ssh"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/telnet"
@@ -81,10 +82,14 @@ type fetchRequest struct {
 	// CredentialToken は BFF が発行した一回限りの引き換えトークン（Issue #53）。
 	// 指定時は Username / Password の代わりに、検証済み Origin の BFF から
 	// 平文を引き換えて使う。SPA が平文を保持しないための経路。
-	CredentialToken string             `json:"credentialToken"`
-	OSHint          string             `json:"osHint"`
-	CommandOverride *string            `json:"commandOverride"` // null 許容
-	Timeouts        *fetchTimeoutsJSON `json:"timeouts,omitempty"`
+	CredentialToken string `json:"credentialToken"`
+	// HelperId / CredentialTargetHost は、BFF が発行した token をこの helper
+	// instance と接続先に束縛するための値。
+	HelperID             string             `json:"helperId"`
+	CredentialTargetHost string             `json:"credentialTargetHost"`
+	OSHint               string             `json:"osHint"`
+	CommandOverride      *string            `json:"commandOverride"` // null 許容
+	Timeouts             *fetchTimeoutsJSON `json:"timeouts,omitempty"`
 }
 
 type fetchTimeoutsJSON struct {
@@ -117,8 +122,11 @@ type fetchErrorResponse struct {
 
 // statusResponse は GET /api/status の応答。
 type statusResponse struct {
-	OK      bool   `json:"ok"`
-	Version string `json:"version"`
+	OK           bool   `json:"ok"`
+	Version      string `json:"version"`
+	HelperID     string `json:"helperId"`
+	PublicKey    string `json:"publicKey"`
+	PairingProof string `json:"pairingProof,omitempty"`
 }
 
 // shutdownResponse は POST /api/shutdown の応答。
@@ -130,6 +138,7 @@ type shutdownResponse struct {
 type Server struct {
 	httpServer *http.Server
 	allowed    map[string]struct{}
+	identity   *helperidentity.Identity
 	shutdownCh chan struct{}
 }
 
@@ -137,25 +146,36 @@ type Server struct {
 type Config struct {
 	// AllowedOrigins は許可する Origin のセット（スキーム://ホスト:ポート）。
 	AllowedOrigins []string
+	// Identity は永続 helper identity。nil の場合は一時 identity を生成する。
+	Identity *helperidentity.Identity
 	// OnShutdown はシャットダウン要求時に呼ばれる（プロセス終了用）。
 	OnShutdown func()
 }
 
 // New は Config で Server を構築する。
-func New(cfg Config) *Server {
+func New(cfg Config) (*Server, error) {
 	allowed := make(map[string]struct{}, len(cfg.AllowedOrigins))
 	for _, o := range cfg.AllowedOrigins {
 		allowed[normalizeOrigin(o)] = struct{}{}
 	}
+	identity := cfg.Identity
+	if identity == nil {
+		var err error
+		identity, err = helperidentity.GenerateEphemeral()
+		if err != nil {
+			return nil, fmt.Errorf("cannot generate helper identity: %w", err)
+		}
+	}
 	return &Server{
 		allowed:    allowed,
+		identity:   identity,
 		shutdownCh: make(chan struct{}),
 		httpServer: &http.Server{
 			// 状態変更系は Origin チェックを厳密に、Handler で分岐。
 			Handler:           nil, // Listen 内で設定
 			ReadHeaderTimeout: 10 * time.Second,
 		},
-	}
+	}, nil
 }
 
 // Listen はポート候補を順に試行し、最初に開いたポートで待ち受ける。
@@ -295,7 +315,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, statusResponse{OK: true, Version: Version})
+	proof := ""
+	if nonce := strings.TrimSpace(r.URL.Query().Get("pairingNonce")); nonce != "" {
+		proof = s.identity.PairingProof(nonce)
+	}
+	writeJSON(w, http.StatusOK, statusResponse{
+		OK:           true,
+		Version:      Version,
+		HelperID:     s.identity.ID(),
+		PublicKey:    s.identity.PublicKey(),
+		PairingProof: proof,
+	})
 }
 
 // handleFetch は POST /api/fetch のハンドラ。
@@ -414,8 +444,22 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// ログ・エラー応答へは出さない。関数終了時に参照を切る。
 	credentialSource := credentialKind(req.CredentialToken)
 	if req.CredentialToken != "" {
+		// トークンをこの helper instance と接続先へ束縛する。BFF が発行時に
+		// 同じ値で束縛しているため、ここで一致しなければ盗用・転用とみなす。
+		if req.HelperID != s.identity.ID() || req.CredentialTargetHost != req.Host {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "credential token is not bound to this helper or target"})
+			return
+		}
+		signature := s.identity.SignRedeem(req.CredentialToken, req.CredentialTargetHost)
 		// withCORS が POST に対して allowlist 照合済みの Origin。
-		redeemed, rerr := redeemCredential(ctx, r.Header.Get("Origin"), req.CredentialToken)
+		redeemed, rerr := redeemCredential(
+			ctx,
+			r.Header.Get("Origin"),
+			req.CredentialToken,
+			req.HelperID,
+			req.CredentialTargetHost,
+			signature,
+		)
 		if rerr != nil {
 			// 失敗理由（期限切れ・使用済み・到達不可）は区別せず 1 つのコードで返す。
 			log.Printf("[fetch] credential redeem failed: %v", rerr)

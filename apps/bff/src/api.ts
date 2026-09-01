@@ -78,6 +78,10 @@ import {
   formatDestructiveDetail,
   watchDestructiveBurst,
 } from "./auditGuard.js";
+import {
+  issueHelperPairingChallenge,
+  verifyHelperPairing,
+} from "./helperPairing.js";
 
 interface Env {
   Variables: {
@@ -93,6 +97,63 @@ export const api = new Hono<Env>();
 
 /** GET /api/me — current authenticated user (includes role). */
 api.get("/me", (c) => c.json(c.var.user));
+
+function operatorKey(user: AuthUser): string {
+  return user.objectId || user.email;
+}
+
+/** POST /api/helper/pairing/challenge — issue a one-time nonce for helper pairing. */
+api.post(
+  "/helper/pairing/challenge",
+  requireRole("operator"),
+  rateLimit({ name: "helper-pairing-challenge", limit: 10, windowMs: 60_000 }),
+  (c) => c.json(issueHelperPairingChallenge(operatorKey(c.var.user))),
+);
+
+/** POST /api/helper/pairing/verify — verify possession of the console pairing code. */
+api.post(
+  "/helper/pairing/verify",
+  requireRole("operator"),
+  rateLimit({ name: "helper-pairing-verify", limit: 10, windowMs: 60_000 }),
+  async (c) => {
+    const payload = await c.req
+      .json<{
+        nonce?: string;
+        helperId?: string;
+        publicKey?: string;
+        pairingCode?: string;
+        proof?: string;
+      }>()
+      .catch(() => null);
+    const nonce = payload?.nonce?.trim() ?? "";
+    const helperId = payload?.helperId?.trim() ?? "";
+    const publicKey = payload?.publicKey?.trim() ?? "";
+    const pairingCode = payload?.pairingCode?.trim() ?? "";
+    const proof = payload?.proof?.trim() ?? "";
+    const paired = verifyHelperPairing(
+      { helperId, publicKey, pairingCode, proof },
+      nonce,
+      operatorKey(c.var.user),
+    );
+    // pairing code は監査 detail に含めない。
+    await writeAudit(c.var.cfg, {
+      operator: c.var.user.displayName,
+      operatorEmail: c.var.user.email,
+      action: "credential",
+      detail: formatDestructiveDetail({
+        kind: "credential.reveal",
+        summary: paired
+          ? "ローカルヘルパーをペアリング"
+          : "ローカルヘルパーのペアリングを拒否",
+        attrs: { helper: helperId || "(missing)", result: paired ? "paired" : "denied" },
+      }),
+    });
+    if (!paired) return c.json({ error: "helper pairing failed" }, 401);
+    c.var.session.set("pairedHelper", { helperId, publicKey });
+    await c.var.session.save();
+    return c.json({ paired: true, helperId });
+  },
+);
 
 /** GET /api/devices — list logical devices (grouped from all versions).
  *  Query params: customer, hostname, role (optional filters). */
@@ -1089,6 +1150,7 @@ api.delete("/meraki/credentials/:id", requireRole("admin"), async (c) => {
  *  利用者に選ばせる）。 */
 api.get(
   "/node-credentials",
+  requireRole("operator"),
   rateLimit({ name: "node-credentials-list", limit: 60, windowMs: 60_000 }),
   async (c) => {
     const cfg = c.var.cfg;
@@ -1123,6 +1185,7 @@ api.get(
  *  POST /helper/credentials/redeem で引き換えてパスワードを受け取る。 */
 api.post(
   "/node-credentials/:id/issue-token",
+  requireRole("operator"),
   rateLimit({ name: "node-credentials-token", limit: 20, windowMs: 60_000 }),
   async (c) => {
     const cfg = c.var.cfg;
@@ -1136,9 +1199,25 @@ api.post(
       .catch(() => null);
     if (!payload) return c.json({ error: "invalid JSON body" }, 400);
     const ipAddress = (payload.ipAddress ?? "").trim();
-    if (!ipAddress) {
-      return c.json({ error: "ipAddress is required" }, 400);
+    const targetHost = (payload.targetHost ?? "").trim();
+    const helperId = (payload.helperId ?? "").trim();
+    if (!ipAddress || !targetHost || !helperId) {
+      return c.json(
+        { error: "ipAddress, targetHost, and helperId are required" },
+        400,
+      );
     }
+    if (targetHost !== ipAddress) {
+      return c.json(
+        { error: "保存済み認証情報は対象機器の IP アドレスにのみ利用できます" },
+        400,
+      );
+    }
+    const pairedHelper = c.var.session.get("pairedHelper");
+    if (!pairedHelper || pairedHelper.helperId !== helperId) {
+      return c.json({ error: "helper pairing is required" }, 401);
+    }
+    const helperPublicKey = pairedHelper.publicKey;
 
     try {
       // 対象機器のコンテキストで候補を引き直し、要求されたレコードが本当に
@@ -1179,6 +1258,9 @@ api.post(
           hostname: payload.hostname ?? "",
           ipAddress,
         },
+        helperId,
+        targetHost,
+        helperPublicKey,
       });
 
       const actor = c.var.user.email || c.var.user.displayName;
@@ -1222,7 +1304,13 @@ api.post(
         );
       }
 
-      return c.json({ token, expiresInMs, username: candidate.accountName });
+      return c.json({
+        token,
+        expiresInMs,
+        username: candidate.accountName,
+        helperId,
+        targetHost,
+      });
     } catch (e) {
       return c.json(
         { error: publicErrorMessage(e, cfg.nodeEnv, "トークン発行に失敗") },

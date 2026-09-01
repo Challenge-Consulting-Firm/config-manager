@@ -158,6 +158,26 @@ fly secrets set --app config-manager CREDENTIALS_ENCRYPTION_KEY=<上で生成し
 
 Kintone の顧客情報（ノード管理）アプリに登録された機器のアカウント名・パスワードを、ローカル取得ヘルパーのログインへ適用する機能（Issue #53）の設計根拠です。`KINTONE_CUSTOMER_INFO_APP_ID` / `KINTONE_CUSTOMER_INFO_APP_TOKEN` の両方が設定されたときだけ有効になります。
 
+### ヘルパー identity とペアリング（Issue #81）
+
+保存済み認証情報を使う場合、単回トークンだけではなく、ローカルヘルパーの
+永続 Ed25519 identity とコンソール表示のペアリングコードによる所有確認を必須にします。
+
+1. ヘルパーは初回起動時に Ed25519 鍵と 128-bit のペアリング secret を生成し、
+   ユーザー設定ディレクトリの `identity.json`（mode 0600）へ保存する
+2. SPA は BFF から一回限りの nonce を取得し、ヘルパーへ渡す
+3. 利用者がコンソール表示のペアリングコードを SPA へ入力する
+4. BFF は pairing secret による HMAC proof と、公開鍵から導出した helper ID を検証する
+5. 検証済み helper ID / public key を暗号化済みブラウザセッションに保存する
+6. credential token は helper ID と対象 IP に束縛し、redeem 時に helper の Ed25519 署名を検証する
+
+`viewer` は候補検索・ペアリング・トークン発行のすべてを拒否されます。`operator`
+以上でも、発行対象と異なるホスト、未ペアリング helper、署名不一致、replay は fail closed
+です。ペアリングコード・秘密鍵・credential token は監査 detail や通常ログへ出しません。
+
+ヘルパーを別 PC へ移した場合、`identity.json` が異なるため再ペアリングが必要です。
+`identity.json` を削除した場合も新しい identity が生成され、既存ペアリングは無効になります。
+
 ### なぜ平文をブラウザへ返さないのか
 
 機器へログインする以上、パスワードはどこかで平文になります。素直に作れば BFF → SPA → ヘルパーと流れますが、そうすると平文が React state・DevTools・ブラウザ拡張・画面共有の露出面に載ります。取得後に state を消しても、取得前の中断・通信レスポンス・JS ヒープへの残存は防げません。

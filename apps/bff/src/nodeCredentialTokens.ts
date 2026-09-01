@@ -33,6 +33,12 @@ export interface NodeCredentialTokenContext {
   operatorEmail: string;
   /** 対象機器。redeem 時の監査ログに残す。 */
   target: { customer: string; hostname: string; ipAddress: string };
+  /** pairing 済みヘルパーの公開鍵由来 ID。 */
+  helperId: string;
+  /** 実際にヘルパーが接続するホスト。対象 IP と一致確認済み。 */
+  targetHost: string;
+  /** paired helper の Ed25519 公開鍵（DER/SPKI Base64URL）。 */
+  helperPublicKey: string;
 }
 
 interface TokenEntry extends NodeCredentialTokenContext {
@@ -94,6 +100,7 @@ export function issueNodeCredentialToken(
  */
 export function consumeNodeCredentialToken(
   token: string,
+  opts: { consume?: boolean } = {},
 ): NodeCredentialTokenContext | null {
   // 形式チェックが先。ここで弾けば Buffer 化も Map 走査も起きない。
   if (!isWellFormedNodeCredentialToken(token)) return null;
@@ -113,11 +120,15 @@ export function consumeNodeCredentialToken(
   if (!matched) return null;
 
   const entry = tokens.get(matched);
-  tokens.delete(matched);
+  if (opts.consume !== false) tokens.delete(matched);
   if (!entry || entry.expiresAt <= now) return null;
 
   const { expiresAt: _expiresAt, ...ctx } = entry;
   return ctx;
+}
+
+export function revokeNodeCredentialToken(token: string): void {
+  tokens.delete(token);
 }
 
 /** テスト用。保持中のトークンをすべて破棄する。 */

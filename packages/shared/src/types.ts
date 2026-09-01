@@ -562,6 +562,10 @@ export interface NodeCredentialTokenRequest {
   customer: string;
   hostname: string;
   ipAddress: string;
+  /** 実際にローカルヘルパーが接続するホスト。対象 IP と一致必須。 */
+  targetHost: string;
+  /** pairing 済みヘルパーの公開鍵由来 ID。 */
+  helperId: string;
   /**
    * パスワードに含まれる不可視文字を除去してから機器へ送るか。
    * 既定は false（Kintone に入っている値をそのまま使う）。
@@ -577,6 +581,10 @@ export interface NodeCredentialTokenResponse {
   expiresInMs: number;
   /** ログインアカウント名。機密ではないので UI 表示に使ってよい。 */
   username: string;
+  /** 発行対象となったヘルパー ID。SPA は検出中ヘルパーと再照合する。 */
+  helperId: string;
+  /** 発行時に束縛された接続先ホスト。 */
+  targetHost: string;
 }
 
 /**
