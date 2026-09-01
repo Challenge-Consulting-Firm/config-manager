@@ -12,7 +12,6 @@
 
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { logger } from "hono/logger";
 import { bodyLimit } from "hono/body-limit";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { resolve, dirname } from "node:path";
@@ -29,6 +28,7 @@ import {
   getUserGroups,
   toAuthUser,
 } from "./entra.js";
+import { accessLogger } from "./accessLog.js";
 import { api, type AppEnv } from "./api.js";
 import { createHelperCredentialsApp } from "./helperCredentials.js";
 import {
@@ -79,7 +79,9 @@ const establishedSessionOpts = {
 };
 
 const app = new Hono<AppEnv>();
-app.use(logger());
+// query string を値ごと出す標準 logger は使わない。OIDC の code / state や
+// 検索語・顧客名が fly のログに残るため（Issue #78）。
+app.use(accessLogger());
 // Cap request bodies at 6 MB so a 5 MB config upload (plus JSON/headers)
 // is accepted but runaway payloads are rejected early with HTTP 413.
 app.use("*", bodyLimit({ maxSize: 6 * 1024 * 1024 }));

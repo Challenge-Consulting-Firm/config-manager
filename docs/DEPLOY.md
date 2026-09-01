@@ -421,6 +421,8 @@ fly logs --app config-manager
 fly logs --app config-manager | grep -i error
 ```
 
+アクセスログには query string の値を記録していません（OIDC の `code` / `state`、検索語、顧客名などを残さないため）。記録される項目・保持期間・閲覧権限は [SECURITY.md の「アクセスログの運用」](./SECURITY.md#アクセスログの運用) を参照してください。
+
 ### リソース使用量
 
 ```bash
