@@ -378,6 +378,31 @@ POST <検証済み Origin>/helper/credentials/redeem   { "token": "..." }
 `command_rejected` エラーで失敗させます（エラーメッセージがコンフィグとして
 登録されるのを防ぐため）。
 
+### `commandOverride` の制約（Issue #76）
+
+`commandOverride` はヘルパー側で検証し、機器へ接続する前に拒否します。SPA 側にも
+同じ検証がありますが、そちらは入力ミスを早く知らせるための UX 補助で、セキュリティ
+境界はヘルパーにあります。
+
+- CR / LF / NUL / タブなどの制御文字を含むコマンドは拒否（`sendLine` が末尾へ CR を
+  付けるため、混入すると 1 本の取得コマンドに複数コマンドを潜り込ませられる）
+- 使える文字は英数字と `- _ . / :` および半角空白のみ（`;` `|` `&` `$` などは不可）
+- 先頭語は読み取り専用コマンドに限定（`show` / `display` / `get` / `dir` / `more`）
+- 100 文字以内。前後の空白は除去し、連続する空白は 1 個へ畳む
+- **保存済み認証情報（`credentialToken`）を使う場合は、下表の定義済みコマンドのみ**
+  （高権限の credential と任意コマンドの組み合わせを断つため。自由入力が必要な機種は
+  都度入力の認証情報で実行する）
+
+| osHint | 保存済み認証情報で指定できるコマンド |
+| ------ | ------------------------------------ |
+| `cisco-ios` / `yamaha-swx` | `show running-config` / `show startup-config` / `show version` |
+| `yamaha-rt` | `show config` / `show config list` / `show environment` |
+| `generic` | 上記すべて |
+
+検証で拒否した場合は HTTP 400 を返し、入力されたコマンドはログにも応答にも出しません
+（誤って貼り付けられた認証情報が漏れないようにするため）。送信直前のセッション層でも
+同じ制御文字チェックを行い、通過した場合は `command_invalid` で fail closed にします。
+
 ---
 
 ## セキュリティ注意

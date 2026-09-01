@@ -134,6 +134,11 @@ export type HelperFetchErrorCode =
   | "empty_body"
   /** 機器が取得コマンドを拒否した（コマンド体系の不一致・権限不足など）。 */
   | "command_rejected"
+  /**
+   * 送信前の検証でヘルパーが取得コマンドを拒否した（制御文字の混入など）。
+   * 機器へは接続・送信していない（Issue #76）。
+   */
+  | "command_invalid"
   | "handshake_failed"
   | "host_key_mismatch"
   /** 認証情報トークンの引き換えに失敗した（期限切れ・使用済み・BFF 到達不可）。 */
@@ -201,6 +206,8 @@ export const HELPER_ERROR_LABELS: Record<HelperFetchErrorCode, string> = {
   empty_body: "コンフィグ本文を取得できませんでした（空または極端に短い応答です）",
   command_rejected:
     "機器が取得コマンドを受け付けませんでした（機種の選択、または特権モードへの昇格を確認してください）",
+  command_invalid:
+    "取得コマンドが安全でないため送信しませんでした（改行や記号を含まない、単一の読み取りコマンドを指定してください）",
   handshake_failed:
     "SSH の暗号方式が一致しませんでした（機器が対応する鍵交換方式・暗号を確認してください）",
   host_key_mismatch:
@@ -217,3 +224,110 @@ export const HELPER_CREDENTIAL_REDEEM_PATH = "/helper/credentials/redeem";
 
 /** 認証情報トークンの有効期限（ミリ秒）。発行から redeem までの猶予。 */
 export const NODE_CREDENTIAL_TOKEN_TTL_MS = 60_000;
+
+/**
+ * `commandOverride` の最大長（前後空白除去・連続空白畳み込み後）。
+ * ヘルパー側 `apps/helper/internal/commands/override.go` の MaxOverrideLen と一致させる。
+ */
+export const HELPER_MAX_COMMAND_OVERRIDE_LEN = 100;
+
+/**
+ * 自由入力を許可する取得コマンドの先頭語。いずれも表示系で機器の設定を変更しない。
+ * ヘルパー側 readOnlyVerbs と一致させる。
+ */
+export const HELPER_READONLY_COMMAND_VERBS = [
+  "show",
+  "display",
+  "get",
+  "dir",
+  "more",
+] as const;
+
+/**
+ * osHint ごとの定義済み読み取り専用コマンド。保存済み認証情報を使う場合は、
+ * この一覧に一致するコマンドしかヘルパーが受け付けない（Issue #76）。
+ * ヘルパー側 allowedOverrides と一致させる。
+ */
+export const HELPER_ALLOWED_COMMAND_OVERRIDES: Record<
+  HelperOsHint,
+  readonly string[]
+> = {
+  "cisco-ios": ["show running-config", "show startup-config", "show version"],
+  "yamaha-rt": ["show config", "show config list", "show environment"],
+  "yamaha-swx": ["show running-config", "show startup-config", "show version"],
+  generic: [
+    "show config",
+    "show config list",
+    "show environment",
+    "show running-config",
+    "show startup-config",
+    "show version",
+  ],
+};
+
+/** {@link validateHelperCommandOverride} の結果。 */
+export type HelperCommandOverrideValidation =
+  | { ok: true; command: string }
+  | { ok: false; message: string };
+
+/**
+ * `commandOverride` を SPA 側で検証する。
+ *
+ * 【重要】これは入力ミスを早く知らせるための UX 補助であり、セキュリティ境界は
+ * ヘルパー側の検証（`apps/helper/internal/commands/override.go`）にある。SPA を
+ * 経由しない要求でも同じ規則が適用される。
+ *
+ * @param osHint 機種ヒント
+ * @param raw 入力値
+ * @param usingStoredCredential 保存済み認証情報（一回限りトークン）を使うか。
+ *   true の場合は定義済み読み取り専用コマンドのみ許可する。
+ */
+export function validateHelperCommandOverride(
+  osHint: HelperOsHint,
+  raw: string,
+  usingStoredCredential: boolean,
+): HelperCommandOverrideValidation {
+  // 制御文字は対話シェルのコマンド境界を破るため、正規化より先に弾く。
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(raw)) {
+    return {
+      ok: false,
+      message:
+        "取得コマンドに改行・タブ・制御文字は使えません（コマンドは 1 行で指定してください）",
+    };
+  }
+  const command = raw.trim().replace(/\s+/g, " ");
+  if (command === "") {
+    return { ok: false, message: "取得コマンドを入力してください" };
+  }
+  if (command.length > HELPER_MAX_COMMAND_OVERRIDE_LEN) {
+    return {
+      ok: false,
+      message: `取得コマンドが長すぎます（${HELPER_MAX_COMMAND_OVERRIDE_LEN} 文字以内）`,
+    };
+  }
+  const allowed = HELPER_ALLOWED_COMMAND_OVERRIDES[osHint];
+  if (allowed.includes(command.toLowerCase())) {
+    return { ok: true, command };
+  }
+  if (usingStoredCredential) {
+    return {
+      ok: false,
+      message: `保存済みの認証情報を使う場合、取得コマンドは次のいずれかだけを指定できます: ${allowed.join(" / ")}`,
+    };
+  }
+  if (!/^[A-Za-z0-9 \-_./:]+$/.test(command)) {
+    return {
+      ok: false,
+      message:
+        "取得コマンドに使える文字は英数字と - _ . / : のみです（; | & $ などは使えません）",
+    };
+  }
+  const verb = command.split(" ")[0]?.toLowerCase() ?? "";
+  if (!HELPER_READONLY_COMMAND_VERBS.some((v) => v === verb)) {
+    return {
+      ok: false,
+      message: `取得コマンドは読み取り専用（${HELPER_READONLY_COMMAND_VERBS.join(" / ")} で始まるもの）だけを指定できます`,
+    };
+  }
+  return { ok: true, command };
+}

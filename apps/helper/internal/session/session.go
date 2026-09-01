@@ -29,6 +29,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/commands"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/encoding"
 )
 
@@ -97,6 +98,9 @@ const (
 	CodeEmptyBody       ErrorCode = "empty_body"
 	CodeHandshakeFailed ErrorCode = "handshake_failed"  // SSH: 暗号方式のネゴシエーション失敗
 	CodeHostKeyMismatch ErrorCode = "host_key_mismatch" // SSH: 記録済みホスト鍵と不一致
+	// CodeCommandInvalid は送信前の検証で取得コマンドを拒否した場合。
+	// 機器へは接続・送信しない（fail closed）。
+	CodeCommandInvalid ErrorCode = "command_invalid"
 	// CodeCommandRejected は機器が取得コマンド自体を受け付けなかった場合。
 	// osHint と実機のコマンド体系が食い違っているか、特権モードに昇格できて
 	// いないケースが典型。
@@ -146,6 +150,23 @@ func Run(ctx context.Context, s Stream, cfg *Config, mode Mode) (*Result, error)
 	// 事前チェック: 取得コマンドが空なら実行前に弾く。
 	if strings.TrimSpace(cfg.FetchCommand) == "" {
 		return nil, NewError(CodeEmptyBody, "fetch command is empty (generic requires commandOverride)", nil)
+	}
+	// 事前チェック: 送信するコマンドに CR / LF / NUL などが混ざっていないか。
+	// sendLine が末尾へ CR を付けて送るため、混入すると 1 本の取得コマンドに
+	// 複数コマンドを潜り込ませられる（Issue #76）。呼び出し側（HTTP / CLI）でも
+	// 検証しているが、送信経路の最終防衛線としてここでも fail closed にする。
+	//
+	// 【ログ出力】コマンド本文は Message に含めない。
+	if err := commands.ValidateCommandLine(cfg.FetchCommand); err != nil {
+		return nil, NewError(CodeCommandInvalid, "fetch command contains forbidden characters", err)
+	}
+	if err := commands.ValidateCommandLine(cfg.PagerSuppress); err != nil {
+		return nil, NewError(CodeCommandInvalid, "pager suppress command contains forbidden characters", err)
+	}
+	// 対話ログインではユーザー名も 1 行として送るため、同じ経路でコマンドを
+	// 潜り込ませられる。パスワードは正当な値を弾く恐れがあるため検証しない。
+	if err := commands.ValidateCommandLine(cfg.Username); err != nil {
+		return nil, NewError(CodeCommandInvalid, "username contains forbidden characters", err)
 	}
 
 	// 全体タイムアウト監視用に、ctx の残時間を各フェーズのタイムアウトと比較して

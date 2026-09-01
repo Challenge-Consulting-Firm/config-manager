@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   detectDeviceInfo,
+  HELPER_ALLOWED_COMMAND_OVERRIDES,
   HELPER_DEFAULT_PORTS,
   HELPER_DEFAULT_TIMEOUTS,
   HELPER_ERROR_LABELS,
+  validateHelperCommandOverride,
   type DeviceIdentifiers,
   type DeviceDetection,
   type HelperFetchResponse,
@@ -221,6 +223,21 @@ export function DeviceFetchDialog({
       });
       return;
     }
+    // コマンド上書きの検証（Issue #76）。改行注入や設定変更コマンドをここで
+    // 弾くのは入力ミスを早く知らせるためで、セキュリティ境界はヘルパー側にある。
+    let normalizedCommand: string | null = null;
+    if (commandOverride.trim()) {
+      const checked = validateHelperCommandOverride(
+        osHint,
+        commandOverride,
+        usingStoredCredential,
+      );
+      if (!checked.ok) {
+        setUploadMsg({ type: "err", text: checked.message });
+        return;
+      }
+      normalizedCommand = checked.command;
+    }
     setBusy(true);
     setPhase("fetching");
     setFetchResult(null);
@@ -266,7 +283,7 @@ export function DeviceFetchDialog({
         enablePassword: enablePassword || undefined,
         credentialToken,
         osHint,
-        commandOverride: commandOverride.trim() || null,
+        commandOverride: normalizedCommand,
         timeouts: HELPER_DEFAULT_TIMEOUTS,
       });
       setFetchResult(res);
@@ -672,8 +689,21 @@ export function DeviceFetchDialog({
               value={commandOverride}
               onChange={(e) => setCommandOverride(e.target.value)}
               placeholder="例: show running-config（空欄で osHint 既定値）"
+              list="command-override-candidates"
               className={inputCls}
             />
+            {/* ヘルパーは読み取り専用コマンドだけを受け付ける（Issue #76）。
+                保存済み認証情報を使う場合はさらに定義済みの一覧に限定される。 */}
+            <datalist id="command-override-candidates">
+              {HELPER_ALLOWED_COMMAND_OVERRIDES[osHint].map((cmd) => (
+                <option key={cmd} value={cmd} />
+              ))}
+            </datalist>
+            <span className="mt-1 block text-[11px] text-slate-500">
+              {usingStoredCredential
+                ? `保存済みの認証情報を使う場合は、次のコマンドのみ指定できます: ${HELPER_ALLOWED_COMMAND_OVERRIDES[osHint].join(" / ")}`
+                : "指定できるのは 1 行の読み取り専用コマンドだけです（改行・; | & $ などは使えません）。"}
+            </span>
           </label>
         </div>
 
