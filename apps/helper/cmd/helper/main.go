@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/commands"
+	helperidentity "github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/identity"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/session"
 	"github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/ssh"
@@ -57,9 +58,18 @@ func runServer(args []string) {
 	origins := server.DefaultAllowedOrigins()
 	origins = append(origins, allowOrigins...)
 
-	srv := server.New(server.Config{
+	identity, err := helperidentity.LoadOrCreate("")
+	if err != nil {
+		log.Fatalf("ヘルパー identity の準備に失敗しました: %v", err)
+	}
+
+	srv, err := server.New(server.Config{
 		AllowedOrigins: origins,
+		Identity:       identity,
 	})
+	if err != nil {
+		log.Fatalf("ヘルパーサーバーの準備に失敗しました: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -75,6 +85,8 @@ func runServer(args []string) {
 	fmt.Println("========================================================")
 	fmt.Printf("  待ち受けポート: %d (127.0.0.1)\n", port)
 	fmt.Printf("  バージョン    : %s\n", server.Version)
+	fmt.Printf("  ヘルパー ID   : %s\n", identity.ID())
+	fmt.Printf("  ペアリングコード: %s\n", identity.PairingCode())
 	fmt.Println("  停止方法      : Ctrl+C または SPA の「停止」ボタン")
 	fmt.Println("--------------------------------------------------------")
 	fmt.Println("  許可 Origin:")
@@ -85,6 +97,8 @@ func runServer(args []string) {
 	fmt.Println("  【セキュリティ注意】")
 	fmt.Println("  ・本ヘルパーは 127.0.0.1 のみで待ち受けます（外部公開なし）")
 	fmt.Println("  ・許可された Origin 以外からの要求は拒否します")
+	fmt.Println("  ・保存済み認証情報を使う際は、上記ペアリングコードを画面で入力します")
+	fmt.Println("  ・ペアリングコードはログインパスワードではなく、このヘルパーの所有確認用です")
 	fmt.Println("  ・Telnet は平文プロトコルです。機器との通信は暗号化されません")
 	fmt.Println("  ・SSH の場合はホスト鍵を初回接続時に記録し、以降の変更を検知します")
 	if p, err := ssh.DefaultKnownHostsPath(); err == nil {

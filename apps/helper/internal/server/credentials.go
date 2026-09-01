@@ -53,7 +53,10 @@ type redeemedCredential struct {
 //
 // origin は withCORS で allowlist 照合済みの値であること。呼び出し側が
 // 未検証の Origin を渡さないよう、この関数は http.Request を受け取らない。
-func redeemCredential(ctx context.Context, origin, token string) (*redeemedCredential, error) {
+func redeemCredential(
+	ctx context.Context,
+	origin, token, helperID, targetHost, signature string,
+) (*redeemedCredential, error) {
 	endpoint, err := redeemEndpoint(origin)
 	if err != nil {
 		return nil, err
@@ -61,7 +64,12 @@ func redeemCredential(ctx context.Context, origin, token string) (*redeemedCrede
 
 	// 【機密】トークンはボディにのみ載せる。URL に入れるとプロキシのアクセス
 	// ログや Referer に残りうる。
-	body, err := json.Marshal(map[string]string{"token": token})
+	body, err := json.Marshal(map[string]string{
+		"token":      token,
+		"helperId":   helperID,
+		"targetHost": targetHost,
+		"signature":  signature,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: marshal request", errRedeemFailed)
 	}

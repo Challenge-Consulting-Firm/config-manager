@@ -26,7 +26,9 @@ import { getNodeCredentialSecret, writeAudit } from "./kintone.js";
 import {
   consumeNodeCredentialToken,
   isWellFormedNodeCredentialToken,
+  revokeNodeCredentialToken,
 } from "./nodeCredentialTokens.js";
+import { verifyHelperRedeemSignature } from "./helperPairing.js";
 import { formatDestructiveDetail } from "./auditGuard.js";
 import { concurrencyLimit, rateLimit } from "./rateLimit.js";
 
@@ -87,16 +89,48 @@ export function createHelperCredentialsApp(
     }),
     async (c) => {
       c.header("Cache-Control", "no-store");
-      const payload = await c.req.json<{ token?: string }>().catch(() => null);
+      const payload = await c.req
+        .json<{
+          token?: string;
+          helperId?: string;
+          targetHost?: string;
+          signature?: string;
+        }>()
+        .catch(() => null);
       const token = payload?.token?.trim();
-      if (!token) {
-        return c.json({ error: "token is required" }, 400);
+      const helperId = payload?.helperId?.trim() ?? "";
+      const targetHost = payload?.targetHost?.trim() ?? "";
+      const signature = payload?.signature?.trim() ?? "";
+      if (!token || !helperId || !targetHost || !signature) {
+        return c.json({ error: "invalid credential redemption request" }, 400);
       }
 
       // 形式が正規トークンとして成立しない入力は、Map 走査にも監査にも進ませない。
       // 応答は未知・期限切れ・使用済みと同じにして手掛かりを与えない（Issue #77）。
       if (!isWellFormedNodeCredentialToken(token)) {
         console.warn("[node-credentials] redeem rejected: malformed token");
+        return c.json({ error: "token is invalid or expired" }, 401);
+      }
+
+      // 消費前に、トークンが発行時と同じ helper・接続先へ束縛されているか、
+      // かつ正規 helper の Ed25519 署名が付いているかを検証する（Issue #81）。
+      // 束縛・署名違反は当該トークンも失効させ、盗用トークンの試行後に正規
+      // helper が使えてしまう状況を防ぐ（fail closed）。
+      const peeked = consumeNodeCredentialToken(token, { consume: false });
+      if (
+        !peeked ||
+        peeked.helperId !== helperId ||
+        peeked.targetHost !== targetHost ||
+        !verifyHelperRedeemSignature(
+          helperId,
+          peeked.helperPublicKey,
+          token,
+          targetHost,
+          signature,
+        )
+      ) {
+        if (peeked) revokeNodeCredentialToken(token);
+        console.warn("[node-credentials] redeem rejected: invalid helper binding");
         return c.json({ error: "token is invalid or expired" }, 401);
       }
 
