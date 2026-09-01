@@ -29,6 +29,7 @@ import {
   toAuthUser,
 } from "./entra.js";
 import { accessLogger } from "./accessLog.js";
+import { createAuthLogoutApp } from "./authLogout.js";
 import { api, type AppEnv } from "./api.js";
 import { createHelperCredentialsApp } from "./helperCredentials.js";
 import {
@@ -36,11 +37,7 @@ import {
   securityHeaders,
 } from "./security.js";
 import { resolveRoleFromGroups, roleGroupsConfigured } from "./rbac.js";
-import {
-  isSessionRevoked,
-  newSessionId,
-  revokeSession,
-} from "./sessionRegistry.js";
+import { isSessionRevoked, newSessionId } from "./sessionRegistry.js";
 import { isAppRole, safeReturnPath, type AuthUser } from "@config-manager/shared";
 
 const cfg = loadConfig();
@@ -284,20 +281,9 @@ app.get("/auth/callback", async (c) => {
   }
 });
 
-app.get("/auth/logout", async (c) => {
-  if (cfg.authMode === "disabled") return c.redirect("/");
-  const session = await getSession(c, establishedSessionOpts);
-  // Revoke before destroy so a stolen copy of the cookie cannot outlive logout
-  // for the rest of this process lifetime.
-  const user = session.get("user");
-  revokeSession(session.get("sid"), { email: user?.email });
-  session.destroy();
-  const postLogoutUri = `${cfg.publicBaseUrl}/`;
-  const url =
-    `https://login.microsoftonline.com/${cfg.entra.tenantId}/oauth2/v2.0/logout` +
-    `?post_logout_redirect_uri=${encodeURIComponent(postLogoutUri)}`;
-  return c.redirect(url);
-});
+// ログアウトの状態変更は POST 限定（GET は確認ページのみ）。実体と理由は
+// authLogout.ts を参照（Issue #80）。
+app.route("/auth", createAuthLogoutApp(cfg, establishedSessionOpts));
 
 app.get("/auth/me", async (c) => {
   if (cfg.authMode === "disabled") {
