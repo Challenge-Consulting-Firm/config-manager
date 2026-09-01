@@ -4,8 +4,10 @@
 FROM node:24-slim AS build
 WORKDIR /app
 
-# Enable pnpm via corepack. Version must match package.json#packageManager.
-RUN corepack enable && corepack prepare pnpm@9.0.0 --activate
+# Install pnpm with the npm bundled in the Node image. corepack is deliberately
+# not used: Node 26 images no longer ship it, so the next LTS bump would break
+# this layer (#73). Version must match package.json#packageManager.
+RUN npm i -g pnpm@9.0.0
 
 # Install workspace manifests + lockfile first for better layer caching.
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
@@ -29,7 +31,8 @@ FROM node:24-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-RUN corepack enable && corepack prepare pnpm@9.0.0 --activate
+# Same as the build stage: no corepack. Version must match package.json#packageManager.
+RUN npm i -g pnpm@9.0.0
 
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY apps/bff/package.json apps/bff/
