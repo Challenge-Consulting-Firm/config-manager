@@ -132,15 +132,20 @@ Windows はダブルクリック、macOS / Linux は端末から起動します�
 ```
 
 > **macOS の注意**: ブラウザでダウンロードしたファイルは実行権限（`+x`）が落ちるため、
-> ダブルクリックするとテキストエディットで開いてしまいます。また未署名（ad-hoc 署名）の
-> ため Gatekeeper の隔離属性も外す必要があります。初回のみ以下を実行してください。
+> ダブルクリックするとテキストエディットで開いてしまいます。初回のみ端末から起動してください。
+> 配布物は Developer ID 署名 + Apple 公証済みのため、隔離属性を外す必要はありません。
+> 下記は SHA-256 を照合し、一致した場合だけ起動します（Issue #79）。
 >
 > ```bash
 > cd ~/Downloads
-> chmod +x config-manager-helper
-> xattr -d com.apple.quarantine config-manager-helper
-> ./config-manager-helper
+> echo "<latest.json の sha256>  config-manager-helper" | shasum -a 256 -c - \
+>   && chmod +x config-manager-helper \
+>   && ./config-manager-helper
 > ```
+>
+> Gatekeeper がブロックした場合は、迂回せずファイルを削除して管理者へ連絡してください
+> （配布物がすり替えられている可能性があります）。検証手順は
+> [`docs/HELPER-RELEASE.md`](../../docs/HELPER-RELEASE.md) を参照。
 
 起動時に許可 Origin を追加指定できます（staging 確認等）:
 
@@ -246,10 +251,16 @@ export HELPER_ENABLE_PASSWORD='***'   # 任意（Cisco enable 昇格用）
 
 ## 配布について
 
-- **第一候補: GitHub Releases** — バイナリ本体（`.exe` / macOS universal / Linux）と
-  `latest.json`（URL + sha256）を配置する。SPA のセットアップ画面が OS 判定で該当リンクを提示する。
+- **リリースは `Release Helper` ワークフローから行う** — `helper-v<バージョン>` タグの push で
+  ビルド → 署名（Windows: Authenticode / macOS: Developer ID + Apple 公証）→ checksum・provenance 付きで
+  GitHub Release へ公開する。署名・公証に失敗したビルドは公開されない（Issue #79）。
+  手順・鍵管理・失効時の対応は [`docs/HELPER-RELEASE.md`](../../docs/HELPER-RELEASE.md) を参照。
+- **第一候補: GitHub Releases** — バイナリ本体（`.exe` / macOS universal）と
+  `latest.json`（URL + sha256 + signature）を配置する。SPA のセットアップ画面が OS 判定で該当リンクを提示する。
 - **フォールバック: BFF 同梱** — 社内 PC から `github.com` へ到達不可の場合のみ、
   BFF の `public/downloads/helper/` に同梱して配信する。
+- **`scripts/build-helper.sh` は開発用** — 既定では未署名で、`latest.json` の `signature` が
+  `none` になる。SPA はこれを「未署名。使用しないでください」と表示する。
 
 ---
 

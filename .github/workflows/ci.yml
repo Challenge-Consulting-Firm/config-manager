@@ -49,6 +49,11 @@ jobs:
       - name: Test audit baseline gate
         run: pnpm test:audit-gate
 
+      # ヘルパー配布 manifest（checksum / 署名種別）の生成を検証する。
+      # 署名付きリリース（.github/workflows/release-helper.yml）が同じスクリプトを使う。
+      - name: Test helper release manifest
+        run: pnpm test:helper-manifest
+
   # ローカル取得ヘルパー（Go）のビルド・テスト。apps/helper のみを扱い、
   # pnpm workspace 外（package.json 無し）のため Node ジョブから独立させる。
   # Issue #43 最終コメントの確定設計に基づく。
@@ -67,6 +72,7 @@ jobs:
             helper:
               - "apps/helper/**"
               - "scripts/build-helper.sh"
+              - "scripts/helper-release-manifest.sh"
               - ".github/workflows/ci.yml"
 
   helper:

@@ -7,11 +7,21 @@ import {
   shutdownHelper,
   HELPER_DETECT_TIMEOUT_INTERACTIVE_MS,
   type HelperLatestManifest,
+  type HelperAssetEntry,
   type HelperAssetKey,
+  type HelperAssetSignature,
 } from "../utils/helperClient";
 
 /** 自動ポーリングの最大回数（4 秒間隔）。以降は手動の「接続テスト」に委ねる。 */
 const MAX_AUTO_POLLS = 5;
+
+/** latest.json の signature 値 → 画面表示（Issue #79）。 */
+const SIGNATURE_LABELS: Record<HelperAssetSignature, string> = {
+  none: "未署名",
+  authenticode: "Authenticode 署名済み",
+  "developer-id": "Developer ID 署名済み（notarization 未実施）",
+  "developer-id-notarized": "Developer ID 署名 + Apple 公証済み",
+};
 
 /**
  * 「ローカル取得のセットアップ」画面。
@@ -25,9 +35,9 @@ const MAX_AUTO_POLLS = 5;
 export function HelperSetupPage() {
   const [manifest, setManifest] = useState<HelperLatestManifest | null>(null);
   const [preferredKey, setPreferredKey] = useState<HelperAssetKey | null>(null);
-  const [resolvedAsset, setResolvedAsset] = useState<
-    { url: string; sha256?: string } | null
-  >(null);
+  const [resolvedAsset, setResolvedAsset] = useState<HelperAssetEntry | null>(
+    null,
+  );
   const [detectedPort, setDetectedPort] = useState<number | null>(null);
   const [helperVersion, setHelperVersion] = useState<string | null>(null);
   const [probing, setProbing] = useState(false);
@@ -179,17 +189,44 @@ export function HelperSetupPage() {
     ? (Object.keys(manifest.assets) as HelperAssetKey[])
     : [];
 
-  // macOS はブラウザ経由のダウンロードで実行権限（+x）が落ち、隔離属性が付く。
-  // そのままダブルクリックするとテキストエディットで開いてしまうため、
-  // ターミナルで実行してもらうコマンドを提示する。
+  // 配布物は署名済み（Windows: Authenticode / macOS: Developer ID + notarization）
+  // である前提。OS の保護機能を迂回する手順は案内しない（Issue #79）。警告が出る
+  // 場合は配布物のすり替えを疑うべき状況であり、実行させてはいけない。
   const isMac = preferredKey?.startsWith("darwin") ?? false;
-  const macBinaryName =
-    resolvedAsset?.url.split("/").pop() || "config-manager-helper";
+  const binaryName =
+    resolvedAsset?.url.split("/").pop() ||
+    (isMac ? "config-manager-helper" : "config-manager-helper.exe");
+  const expectedSha = resolvedAsset?.sha256 ?? "";
+  const signature = resolvedAsset?.signature;
+  // 未署名（signature 未記載の旧 latest.json を含む）は配布してはいけない状態。
+  const unsigned = signature === undefined || signature === "none";
+
+  // macOS: ハッシュ照合 → 実行権限付与 → 起動。`&&` で連結しているため、
+  // ハッシュが一致しない場合はその場で止まり、バイナリは実行されない。
   const macSetupCommands = [
     "cd ~/Downloads",
-    `chmod +x ${macBinaryName}`,
-    `xattr -d com.apple.quarantine ${macBinaryName}`,
-    `./${macBinaryName}`,
+    `echo "${expectedSha}  ${binaryName}" | shasum -a 256 -c - \\`,
+    `  && chmod +x ${binaryName} \\`,
+    `  && ./${binaryName}`,
+  ].join("\n");
+
+  // macOS: 署名と notarization の確認（警告が出た場合の切り分けに使う）。
+  const macVerifyCommands = [
+    `codesign --verify --verbose=2 ${binaryName}`,
+    `spctl -a -t exec -vv ${binaryName}`,
+  ].join("\n");
+
+  // Windows: ハッシュ不一致なら停止し、Authenticode 署名を表示してから起動する。
+  const winSetupCommands = [
+    "cd ~\\Downloads",
+    `$expected = "${expectedSha}"`,
+    `$actual = (Get-FileHash .\\${binaryName} -Algorithm SHA256).Hash`,
+    "if ($actual -ne $expected) {",
+    '  Write-Error "ハッシュが一致しません。実行せず削除し、管理者へ連絡してください。"',
+    "} else {",
+    `  Get-AuthenticodeSignature .\\${binaryName} | Format-List Status, SignerCertificate`,
+    `  .\\${binaryName}`,
+    "}",
   ].join("\n");
 
   return (
@@ -293,6 +330,30 @@ export function HelperSetupPage() {
                 SHA-256: <code className="mono">{resolvedAsset.sha256}</code>
               </p>
             )}
+            {/* 署名状態は latest.json の signature に由来する（Issue #79）。
+                未署名の配布物は利用者に実行させず、管理者へ差し戻す。 */}
+            <p className="text-xs text-slate-500">
+              署名:{" "}
+              {unsigned ? (
+                <span className="font-medium text-amber-700">
+                  未署名（この配布物は使用しないでください）
+                </span>
+              ) : (
+                <span className="font-medium text-slate-700">
+                  {SIGNATURE_LABELS[signature!]}
+                </span>
+              )}
+            </p>
+            {unsigned && (
+              <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                配布されているバイナリに署名がありません。ダウンロードせず、
+                管理者へ連絡してください。署名付きの配布物は
+                <code className="mx-1 rounded bg-amber-100 px-1">
+                  Release Helper
+                </code>
+                ワークフローから公開されます。
+              </p>
+            )}
             {manifest?.version && (
               <p className="text-xs text-slate-500">
                 バージョン: {manifest.version}
@@ -340,84 +401,120 @@ export function HelperSetupPage() {
         <h2 className="mb-2 text-sm font-semibold uppercase text-slate-500">
           手順 2. ヘルパーを起動
         </h2>
-        {isMac ? (
-          <>
-            <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-700">
-              <li>
-                ダウンロードしたファイルには実行権限が付いていないため、
-                そのままダブルクリックするとテキストエディットで開いてしまいます。
-                ターミナル（アプリケーション &gt; ユーティリティ）で下記を実行してください。
-              </li>
-              <li>
-                「待ち受けポート: 53712」と表示されたら準備完了です。
-                上記「ヘルパーの状態」が自動的に「稼働中」に切り替わります。
-              </li>
-            </ol>
-            <div className="mt-3">
-              <div className="mb-1 flex items-center justify-between">
-                <span className="text-xs font-medium text-slate-600">
-                  ターミナルに貼り付けて実行:
-                </span>
-                <button
-                  type="button"
-                  className="rounded border border-slate-300 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50"
-                  onClick={() => {
-                    void navigator.clipboard
-                      .writeText(macSetupCommands)
-                      .then(() =>
-                        setMsg({ type: "ok", text: "コマンドをコピーしました。" }),
-                      );
-                  }}
-                >
-                  コピー
-                </button>
-              </div>
-              <pre className="overflow-x-auto rounded-md bg-slate-800 px-3 py-2 text-xs leading-relaxed text-slate-100">
-                {macSetupCommands}
-              </pre>
-              <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-slate-600">
-                <li>
-                  <code className="rounded bg-slate-100 px-1">chmod +x</code> は実行権限の付与です。
-                </li>
-                <li>
-                  <code className="rounded bg-slate-100 px-1">xattr -d</code> は
-                  ダウンロード時に付く隔離属性の解除です（未署名バイナリのため
-                  Gatekeeper にブロックされます）。
-                </li>
-                <li>
-                  2 回目以降は
-                  <code className="rounded bg-slate-100 px-1">
-                    ~/Downloads/config-manager-helper
-                  </code>
-                  を実行するだけで起動できます。
-                </li>
-              </ul>
-            </div>
-          </>
+        <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-700">
+          <li>
+            下記のコマンドをそのまま貼り付けて実行してください。
+            <span className="font-medium">
+              ダウンロードしたファイルのハッシュを配布元の値と自動照合し、
+              一致した場合だけ起動します。
+            </span>
+            一致しない場合は起動せずに停止します（配布物のすり替えを検出するため）。
+          </li>
+          <li>
+            「待ち受けポート: 53712」と表示されたら準備完了です。
+            上記「ヘルパーの状態」が自動的に「稼働中」に切り替わります。
+          </li>
+        </ol>
+        {/* 配布物が未配置だと期待ハッシュが空になり、貼り付けても必ず失敗する。
+            その場合はコマンドを出さず、管理者への連絡を促す。 */}
+        {!resolvedAsset?.sha256 ? (
+          <p className="mt-3 text-sm text-slate-500">
+            配布物のチェックサムを取得できないため、起動コマンドを表示できません。
+            管理者に配布状況をご確認ください。
+          </p>
         ) : (
-          <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-700">
-            <li>ダウンロードしたバイナリをダブルクリックして起動してください。</li>
-            <li>
-              コンソールウィンドウが開き「待ち受けポート: 53712」と表示されたら
-              準備完了です。上記「ヘルパーの状態」が自動的に「稼働中」に切り替わります。
-            </li>
-          </ol>
+          <div className="mt-3">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-xs font-medium text-slate-600">
+                {isMac
+                  ? "ターミナル（アプリケーション > ユーティリティ）に貼り付けて実行:"
+                  : "PowerShell に貼り付けて実行:"}
+              </span>
+              <button
+                type="button"
+                className="rounded border border-slate-300 bg-white px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50"
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(isMac ? macSetupCommands : winSetupCommands)
+                    .then(() =>
+                      setMsg({ type: "ok", text: "コマンドをコピーしました。" }),
+                    );
+                }}
+              >
+                コピー
+              </button>
+            </div>
+            <pre className="overflow-x-auto rounded-md bg-slate-800 px-3 py-2 text-xs leading-relaxed text-slate-100">
+              {isMac ? macSetupCommands : winSetupCommands}
+            </pre>
+            <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-slate-600">
+              {isMac ? (
+                <>
+                  <li>
+                    <code className="rounded bg-slate-100 px-1">shasum -c</code>
+                    {" が期待値と照合します。「OK」以外が出た場合はファイルを削除し、管理者へ連絡してください。"}
+                  </li>
+                  <li>
+                    <code className="rounded bg-slate-100 px-1">chmod +x</code>
+                    {" は実行権限の付与です（ブラウザ経由のダウンロードでは権限が落ちます）。"}
+                  </li>
+                  <li>
+                    2 回目以降は
+                    <code className="mx-1 rounded bg-slate-100 px-1">
+                      ~/Downloads/{binaryName}
+                    </code>
+                    を実行するだけで起動できます。
+                  </li>
+                </>
+              ) : (
+                <>
+                  <li>
+                    <code className="rounded bg-slate-100 px-1">Get-FileHash</code>
+                    {" の結果が配布元の値と異なる場合は起動しません。その場合はファイルを削除し、管理者へ連絡してください。"}
+                  </li>
+                  <li>
+                    <code className="rounded bg-slate-100 px-1">
+                      Get-AuthenticodeSignature
+                    </code>
+                    {" の Status が Valid であること、署名者が自社であることを確認してください。"}
+                  </li>
+                </>
+              )}
+            </ul>
+          </div>
         )}
+        {isMac && resolvedAsset?.sha256 && (
+          <div className="mt-3">
+            <p className="mb-1 text-xs font-medium text-slate-600">
+              署名と notarization を確認する場合（任意）:
+            </p>
+            <pre className="overflow-x-auto rounded-md bg-slate-800 px-3 py-2 text-xs leading-relaxed text-slate-100">
+              {macVerifyCommands}
+            </pre>
+            <p className="mt-1 text-xs text-slate-600">
+              <code className="rounded bg-slate-100 px-1">spctl</code>
+              {" が "}
+              <code className="rounded bg-slate-100 px-1">
+                source=Notarized Developer ID
+              </code>
+              {" と表示すれば、Apple の公証を受けた正規の配布物です。"}
+            </p>
+          </div>
+        )}
+        {/* OS の保護機能（SmartScreen / Gatekeeper）を迂回する手順は案内しない。
+            警告が出るのは署名が無効・破損・すり替えのいずれかであり、
+            利用者が押し切ってよい状況ではない（Issue #79）。 */}
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          <p className="font-semibold">未署名バイナリの警告が出る場合:</p>
-          <ul className="mt-1 list-disc space-y-0.5 pl-5">
-            <li>
-              <span className="font-medium">Windows:</span> SmartScreen の
-              「Windows によって PC が保護されました」が出たら「詳細情報」→
-              「実行」を選んでください。
-            </li>
-            <li>
-              <span className="font-medium">macOS:</span> 上記の
-              <code className="rounded bg-amber-100 px-1">xattr -d</code>
-              を実行せずに開いた場合は Gatekeeper にブロックされます。
-              その場合は Finder でバイナリを右クリック →「開く」を選んでください。
-            </li>
-          </ul>
+          <p className="font-semibold">OS の警告が出た場合:</p>
+          <p className="mt-1">
+            この配布物は署名済みのため、通常は警告なく起動します。SmartScreen や
+            Gatekeeper がブロックした場合、
+            <span className="font-medium">
+              警告を迂回して実行しないでください。
+            </span>
+            ファイルを削除し、この画面の情報（バージョン・SHA-256）を添えて
+            管理者へ連絡してください。配布物がすり替えられている可能性があります。
+          </p>
         </div>
         <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
           <p className="font-semibold">

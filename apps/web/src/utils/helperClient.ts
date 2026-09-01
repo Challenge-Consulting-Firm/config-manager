@@ -243,7 +243,21 @@ export interface HelperAssetEntry {
   url: string;
   /** SHA-256 チェックサム（省略可）。 */
   sha256?: string;
+  /**
+   * 配布物の署名種別（Issue #79）。`scripts/helper-release-manifest.sh` が
+   * 署名後のファイルから生成する。古い latest.json には無いため省略可能。
+   *
+   * `none` は未署名で、利用者へ配ってはいけない状態を表す。
+   */
+  signature?: HelperAssetSignature;
 }
+
+/** 配布物の署名種別。ヘルパーのリリースワークフローが付与する。 */
+export type HelperAssetSignature =
+  | "none"
+  | "authenticode"
+  | "developer-id"
+  | "developer-id-notarized";
 
 /** BFF から latest.json を取得する。未配信時は null。 */
 export async function fetchHelperManifest(
