@@ -6,7 +6,7 @@
  * best-effort guard against accidental or abusive bursts on expensive routes.
  */
 
-import type { MiddlewareHandler } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import type { AppEnv } from "./api.js";
 
 interface Bucket {
@@ -23,6 +23,32 @@ export interface RateLimitOptions {
   limit: number;
   /** Window length in milliseconds. */
   windowMs: number;
+  /**
+   * Bucket key source. "user" (default) prefers the authenticated identity and
+   * falls back to the client IP. "ip" always keys on the IP — the only option
+   * for routes that run before/without auth.
+   */
+  keyBy?: "user" | "ip";
+}
+
+/**
+ * Best-effort client IP.
+ *
+ * `Fly-Client-IP` is written by the fly.io proxy and cannot be forged by the
+ * client, so it wins. The `X-Forwarded-For` fallback takes the RIGHTMOST entry:
+ * a client can prepend arbitrary values, but the closest trusted proxy appends
+ * the real address last.
+ */
+export function clientIp(c: Context): string {
+  const fly = c.req.header("fly-client-ip")?.trim();
+  if (fly) return fly;
+  const xff = c.req.header("x-forwarded-for");
+  if (xff) {
+    const parts = xff.split(",").map((p) => p.trim()).filter(Boolean);
+    const last = parts[parts.length - 1];
+    if (last) return last;
+  }
+  return "unknown";
 }
 
 function prune(bucket: Bucket, windowStart: number): void {
@@ -35,9 +61,8 @@ function prune(bucket: Bucket, windowStart: number): void {
  */
 export function rateLimit(opts: RateLimitOptions): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
-    const user = c.var.user;
-    const id =
-      user?.email || user?.objectId || c.req.header("x-forwarded-for") || "anon";
+    const user = opts.keyBy === "ip" ? undefined : c.var.user;
+    const id = user?.email || user?.objectId || clientIp(c);
     const key = `${opts.name}:${id}`;
     const now = Date.now();
     const windowStart = now - opts.windowMs;
@@ -76,5 +101,51 @@ export function rateLimit(opts: RateLimitOptions): MiddlewareHandler<AppEnv> {
       }
     }
     await next();
+  };
+}
+
+export interface ConcurrencyLimitOptions {
+  /** Unique name for the guarded surface (used in logs). */
+  name: string;
+  /** Max requests allowed to run the handler at the same time. */
+  max: number;
+  /** Seconds advertised in Retry-After when the gate is full. Default 1. */
+  retryAfterSec?: number;
+}
+
+/**
+ * Cap how many requests may occupy a route's handler simultaneously.
+ *
+ * The rate limiter alone does not bound a burst that arrives inside a single
+ * window, which is what exhausts the CPU/memory of the single fly machine.
+ * Excess requests are shed immediately with 503 instead of queueing
+ * (Issue #77).
+ */
+export function concurrencyLimit(
+  opts: ConcurrencyLimitOptions,
+): MiddlewareHandler<AppEnv> {
+  let inFlight = 0;
+  return async (c, next) => {
+    if (inFlight >= opts.max) {
+      const retryAfterSec = opts.retryAfterSec ?? 1;
+      c.header("Retry-After", String(retryAfterSec));
+      console.warn(
+        `[concurrency-limit] ${opts.name} full (${inFlight}/${opts.max}); shedding request`,
+      );
+      return c.json(
+        {
+          error: "too many concurrent requests",
+          detail: `${opts.name} is busy. Retry after ${retryAfterSec}s.`,
+          max: opts.max,
+        },
+        503,
+      );
+    }
+    inFlight += 1;
+    try {
+      await next();
+    } finally {
+      inFlight -= 1;
+    }
   };
 }
