@@ -52,8 +52,20 @@ ENTRA_GROUP_ADMIN_IDS / ENTRA_GROUP_OPERATOR_IDS / ENTRA_GROUP_VIEWER_IDS ...
 
 - Cookie: iron-session による sealed cookie（`HttpOnly` + `Secure` + 確立後 `SameSite=Lax`）
 - ログイン時に opaque な `sid` を発行
-- ログアウト時にプロセス内 denylist へ `sid` を登録 → 以降その cookie は 401
+- ログアウトは `POST /auth/logout` のみ。プロセス内 denylist へ `sid` を登録 → 以降その cookie は 401
 - payload に schema version（`v`）を持ち、**現行バージョン以外の cookie は読み捨てる**
+
+### ログアウトが POST 限定である理由
+
+かつては `GET /auth/logout` が revoke と cookie 破棄を行っていました。GET は CSRF Origin guard の対象外（`security.ts` の `STATE_CHANGING`）なので、外部サイトはリンク遷移ひとつでログイン中の利用者を強制ログアウトさせられます。実害は作業中断ですが、再認証を装ったフィッシングの起点になり得るうえ、GET は副作用を持たないという HTTP の前提にも反します（Issue #80）。
+
+| 経路 | 振る舞い |
+| --- | --- |
+| `GET /auth/logout` | 副作用なし。確認ページ（POST する `<form>`）を返すだけ |
+| `POST /auth/logout`（same-origin） | revoke + cookie 削除。応答本文で Entra のサインアウト URL を返す |
+| `POST /auth/logout`（外部 Origin / Origin 無し） | Origin guard が `403` |
+
+SPA は fetch で POST し、応答の `redirectTo` へ自分で遷移します。リダイレクトを返すと fetch が IdP を追いかけて CORS で失敗するためです。確認ページの `<form>` から来た要求（`application/x-www-form-urlencoded`）だけは通常のナビゲーションなので、そのまま `303` で IdP へ送ります。この経路のために CSP の `form-action` に Entra の origin を加えてあります（ブラウザによってはリダイレクト先にも `form-action` が適用されるため）。
 
 ### schema version と fail-closed 判定
 

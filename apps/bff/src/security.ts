@@ -178,7 +178,12 @@ export async function securityHeaders(c: Context, next: Next) {
       "base-uri 'self'",
       "object-src 'none'",
       "frame-ancestors 'none'",
-      "form-action 'self'",
+      // ログアウト確認ページの <form> は POST 後に Entra のサインアウト
+      // エンドポイントへ 303 で送られる。ブラウザによっては form-action が
+      // リダイレクト先にも適用されるため、IdP の origin だけ明示的に許可する
+      // （Issue #80）。ログイン用のリダイレクトは通常のナビゲーションなので
+      // この指定とは無関係。
+      "form-action 'self' https://login.microsoftonline.com",
       "img-src 'self' data: blob:",
       "font-src 'self' data:",
       // React/Tailwind may set style attributes; keep scripts strict.
