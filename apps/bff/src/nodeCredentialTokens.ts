@@ -41,6 +41,30 @@ interface TokenEntry extends NodeCredentialTokenContext {
 
 const tokens = new Map<string, TokenEntry>();
 
+/** 乱数のバイト数。文字列長はここから決まる。 */
+const TOKEN_BYTES = 32;
+
+/**
+ * 正規トークンの文字列長。32 バイトを Base64URL（パディング無し）にすると
+ * 常に 43 文字になる。
+ */
+export const NODE_CREDENTIAL_TOKEN_LENGTH = Math.ceil((TOKEN_BYTES * 4) / 3);
+
+/** Base64URL の文字種。 */
+const TOKEN_CHARS = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * 発行し得ないトークンかどうかを、Buffer 化や Map 走査より前に判定する。
+ *
+ * `/helper/credentials/redeem` は未認証で到達できるため、長さ・文字種が
+ * 明らかに不正な入力に対してメモリ確保や全件走査をさせない（Issue #77）。
+ */
+export function isWellFormedNodeCredentialToken(token: string): boolean {
+  return (
+    token.length === NODE_CREDENTIAL_TOKEN_LENGTH && TOKEN_CHARS.test(token)
+  );
+}
+
 /** 期限切れのトークンを掃除する。発行・引き換えのたびに呼ばれる。 */
 function sweepExpired(now: number): void {
   for (const [key, entry] of tokens) {
@@ -56,7 +80,7 @@ export function issueNodeCredentialToken(
 ): { token: string; expiresInMs: number } {
   const now = Date.now();
   sweepExpired(now);
-  const token = randomBytes(32).toString("base64url");
+  const token = randomBytes(TOKEN_BYTES).toString("base64url");
   tokens.set(token, { ...ctx, expiresAt: now + NODE_CREDENTIAL_TOKEN_TTL_MS });
   return { token, expiresInMs: NODE_CREDENTIAL_TOKEN_TTL_MS };
 }
@@ -71,9 +95,11 @@ export function issueNodeCredentialToken(
 export function consumeNodeCredentialToken(
   token: string,
 ): NodeCredentialTokenContext | null {
+  // 形式チェックが先。ここで弾けば Buffer 化も Map 走査も起きない。
+  if (!isWellFormedNodeCredentialToken(token)) return null;
+
   const now = Date.now();
   sweepExpired(now);
-  if (!token) return null;
 
   // Map のキー探索はハッシュ照合なので、長さの一致する候補に対して
   // 定数時間比較を行い、早期リターンによる差を作らない。
