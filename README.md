@@ -329,13 +329,14 @@ Meraki Dashboard API 経由で MR/MX/MS の設定を取得して世代管理に�
 
 > **ヘルパーのビルド・仕様は [`apps/helper/README.md`](apps/helper/README.md) にまとめています。**
 
-1. **配布バイナリのビルド**: リリース担当者が `scripts/build-helper.sh` を実行し、Windows / macOS universal バイナリと `latest.json` を生成します。
+1. **配布バイナリのリリース**: `helper-v<バージョン>` タグを push すると、`Release Helper` ワークフローが Windows / macOS バイナリをビルドし、**Authenticode 署名・Developer ID 署名 + Apple 公証**を行ったうえで、checksum・provenance 付きで GitHub Release へ公開します。署名に失敗したビルドは公開されません。
    ```bash
-   ./scripts/build-helper.sh 0.1.0
-   # 成果物は apps/bff/public/downloads/helper/ 配下へ（または GitHub Releases へ）
+   git tag helper-v0.5.0 && git push origin helper-v0.5.0
    ```
+   - 手順・鍵管理・ローテーション・失効時の対応は [`docs/HELPER-RELEASE.md`](docs/HELPER-RELEASE.md) にまとめています。
+   - `scripts/build-helper.sh` は開発・動作確認用です（既定で未署名。`latest.json` の `signature` が `none` になり、SPA は利用者へ配布しないよう警告します）。
    - `HELPER_RELEASE_BASE_URL` 環境変数で GitHub Releases の URL を指定すると、`latest.json` の URL を絶対 URL に切替えられます（社内 PC が github.com へ到達可能な場合）。
-2. **ユーザー側の初回セットアップ**: SPA の「ローカル取得」メニューからセットアップ画面を開き、お使いの OS 向けバイナリを DL → ダブルクリック起動 → 接続テストで検出を確認します。
+2. **ユーザー側の初回セットアップ**: SPA の「ローカル取得」メニューからセットアップ画面を開き、お使いの OS 向けバイナリを DL → 画面が提示するコマンド（**SHA-256 を自動照合し、一致した場合だけ起動**）を実行 → 接続テストで検出を確認します。OS の警告が出た場合は迂回せず、管理者へ連絡してください。
 3. **日常運用**: 機器詳細画面で「Telnet / SSH で取得」ボタンを押し、接続情報（プロトコル・ホスト・ポート・ユーザー名・パスワード・enable パスワード・機種）を入力して取得します。取得した本文は既存 `/api/upload` フロー（same-origin + cookie セッション）で世代登録され、同一 hash はスキップされます。
 4. **利用後**: SPA の「停止」ボタン、またはコンソールウィンドウを閉じてヘルパーを終了してください（ポータブル型のため、ファイル削除だけで完全に撤去できます）。
 
