@@ -375,10 +375,24 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// コマンド解決。
+	//
+	// commandOverride はここが権威。CR / LF などの制御文字による複数コマンド送信
+	// （Issue #76）を接続前に拒否し、保存済み認証情報を使う場合は定義済みの
+	// 読み取り専用コマンドだけを許可する。
 	cmdSet := commands.Lookup(req.OSHint)
 	fetchCmd := cmdSet.Fetch
 	if req.CommandOverride != nil && strings.TrimSpace(*req.CommandOverride) != "" {
-		fetchCmd = strings.TrimSpace(*req.CommandOverride)
+		// 保存済み認証情報（トークン経路）は高権限であり得るため、自由入力を許可しない。
+		allowFreeform := req.CredentialToken == ""
+		validated, verr := commands.ValidateOverride(req.OSHint, *req.CommandOverride, allowFreeform)
+		if verr != nil {
+			// 【ログ出力】入力コマンドは出さない（認証情報の貼り付け事故を漏らさないため）。
+			log.Printf("[fetch] commandOverride rejected: %v (osHint=%s credential=%s)",
+				verr, req.OSHint, credentialKind(req.CredentialToken))
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": verr.Error()})
+			return
+		}
+		fetchCmd = validated
 	}
 	if fetchCmd == "" {
 		// generic 等、commandOverride 必須。
@@ -398,9 +412,8 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	//
 	// 【機密取り扱い】引き換えた平文はこのスコープのローカル変数にのみ置き、
 	// ログ・エラー応答へは出さない。関数終了時に参照を切る。
-	credentialSource := "manual"
+	credentialSource := credentialKind(req.CredentialToken)
 	if req.CredentialToken != "" {
-		credentialSource = "token"
 		// withCORS が POST に対して allowlist 照合済みの Origin。
 		redeemed, rerr := redeemCredential(ctx, r.Header.Get("Origin"), req.CredentialToken)
 		if rerr != nil {
@@ -655,4 +668,13 @@ func ParsePort(s string) (int, error) {
 		return 0, errors.New("port out of range")
 	}
 	return p, nil
+}
+
+// credentialKind はログ用に認証情報の渡り方（都度入力 / 引き換えトークン）を返す。
+// トークン本文は絶対にログへ出さないため、有無だけを文字列化する。
+func credentialKind(token string) string {
+	if token != "" {
+		return "token"
+	}
+	return "manual"
 }

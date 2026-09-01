@@ -306,6 +306,60 @@ func TestRun_EmptyFetchCommand(t *testing.T) {
 	}
 }
 
+// TestRun_ControlCharInFetchCommand は、取得コマンドに CR / LF などが混ざった
+// 場合に接続後も一切送信せず fail closed になることを検証する（Issue #76）。
+// 呼び出し側（HTTP / CLI）で弾く前提だが、送信経路の最終防衛線を回帰から守る。
+func TestRun_ControlCharInFetchCommand(t *testing.T) {
+	for _, bad := range []string{
+		"show running-config\r\nreload",
+		"show running-config\nreload",
+		"show running-config\x00reload",
+	} {
+		dev := &fakeDevice{prompt: "r1#"}
+		cfg := testConfig(bad, "")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := Run(ctx, dev, cfg, ModePreAuthenticated)
+		cancel()
+		var se *Error
+		if err == nil || !asError(err, &se) || se.Code != CodeCommandInvalid {
+			t.Fatalf("%q: want command_invalid, got %v", bad, err)
+		}
+		// 拒否理由に入力コマンドを含めない（ログへ流れるため）。
+		if strings.Contains(se.Message, "reload") {
+			t.Fatalf("エラーメッセージに入力コマンドが含まれている: %s", se.Message)
+		}
+	}
+}
+
+// TestRun_ControlCharInUsername は、対話ログインのユーザー名も 1 行送信であり
+// 同じ注入経路になるため、送信前に fail closed になることを検証する。
+func TestRun_ControlCharInUsername(t *testing.T) {
+	dev := &fakeDevice{prompt: "r1#"}
+	cfg := testConfig("show running-config", "")
+	cfg.Username = "admin\r\nreload"
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := Run(ctx, dev, cfg, ModeInteractiveLogin)
+	var se *Error
+	if err == nil || !asError(err, &se) || se.Code != CodeCommandInvalid {
+		t.Fatalf("want command_invalid, got %v", err)
+	}
+}
+
+// TestRun_ControlCharInPagerSuppress はページング抑制コマンド側も同様に
+// fail closed になることを検証する。
+func TestRun_ControlCharInPagerSuppress(t *testing.T) {
+	dev := &fakeDevice{prompt: "r1#"}
+	cfg := testConfig("show running-config", "terminal length 0\r\nreload")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := Run(ctx, dev, cfg, ModePreAuthenticated)
+	var se *Error
+	if err == nil || !asError(err, &se) || se.Code != CodeCommandInvalid {
+		t.Fatalf("want command_invalid, got %v", err)
+	}
+}
+
 // asError は *Error への型アサーション（テスト用の小さなヘルパ）。
 func asError(err error, target **Error) bool {
 	se, ok := err.(*Error)

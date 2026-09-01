@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"time"
@@ -174,8 +175,17 @@ func runCLIFetch(args []string) {
 	// コマンド解決。
 	cmdSet := commands.Lookup(*osHint)
 	fetchCmd := cmdSet.Fetch
-	if *commandOverride != "" {
-		fetchCmd = *commandOverride
+	if strings.TrimSpace(*commandOverride) != "" {
+		// HTTP 経路と同じ検証を通す（Issue #76）。CLI は都度入力の認証情報のみを
+		// 使うため自由入力を許可するが、制御文字と非読み取りコマンドは拒否する。
+		// 【エラー出力】入力コマンドは出さない。
+		validated, verr := commands.ValidateOverride(*osHint, *commandOverride, true)
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "--command を受け付けられません: %v\n", verr)
+			os.Exit(2)
+		}
+		*commandOverride = validated
+		fetchCmd = validated
 	}
 	if fetchCmd == "" {
 		fmt.Fprintln(os.Stderr, "generic の場合は --command で取得コマンドを指定してください")
