@@ -87,6 +87,10 @@ const F = {
     routingRoutesJson: "routing_routes_json",
     // Cached wireless (SSID + AP) extraction result (JSON)
     wirelessJson: "wireless_json",
+    // 元ファイル（バイナリコンフィグ・Issue #93）。FILE 型フィールド。
+    // AirStation Pro の .bin のようにテキスト化できないコンフィグを
+    // そのまま添付し、ダウンロードのみ可能にする。
+    originalFile: "original_file",
   },
   // Audit app
   audit: {
@@ -172,6 +176,100 @@ export interface KintoneRecord {
   [fieldCode: string]: { value: string };
 }
 
+/** Kintone FILE 型フィールドの 1 ファイル分のメタデータ。レコード書き込み
+ *  時は fileKey のみ必須（name 等は読み取り時に Kintone が付与する）。 */
+export interface KintoneFileValue {
+  fileKey: string;
+  name?: string;
+  contentType?: string;
+  size?: string;
+}
+
+/** レコードの original_file 添付フィールドから先頭ファイルのメタデータを
+ *  取り出す。未添付・フィールド未定義 (デプロイ順序の前後) は null。 */
+export function attachmentFromRecord(
+  rec: KintoneRecord,
+): KintoneFileValue | null {
+  const raw = (rec as Record<string, unknown>)[F.config.originalFile];
+  const value = (raw as { value?: unknown } | undefined)?.value;
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const f = value[0] as Partial<KintoneFileValue> | null;
+  if (!f || typeof f.fileKey !== "string") return null;
+  return {
+    fileKey: f.fileKey,
+    name: typeof f.name === "string" ? f.name : "",
+    contentType: typeof f.contentType === "string" ? f.contentType : undefined,
+    size: typeof f.size === "string" ? f.size : undefined,
+  };
+}
+
+/** Kintone のファイルアップロード API にバイナリを送り fileKey を得る。
+ *  fileKey はレコード作成時の FILE フィールド値として使う（Issue #93）。
+ *  multipart 境界は fetch (undici) が自動設定するため Content-Type を
+ *  手で付けてはならない点に注意。 */
+export async function kintoneUploadFile(
+  cfg: AppConfig,
+  file: { data: Uint8Array; name: string; contentType: string },
+): Promise<string> {
+  const headers: Record<string, string> = {
+    "X-Cybozu-API-Token": cfg.kintone.configAppToken,
+  };
+  if (cfg.kintone.username && cfg.kintone.password) {
+    headers["X-Cybozu-Authorization"] = Buffer.from(
+      `${cfg.kintone.username}:${cfg.kintone.password}`,
+    ).toString("base64");
+  }
+  const form = new FormData();
+  form.append(
+    "file",
+    new File([file.data], file.name, { type: file.contentType }),
+  );
+  const res = await fetch(`${cfg.kintone.baseUrl}/k/v1/file.json`, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Kintone file upload failed (${res.status}): ${text}`);
+  }
+  const json = JSON.parse(text) as { fileKey?: string };
+  if (!json.fileKey) {
+    throw new Error(`Kintone file upload returned no fileKey: ${text}`);
+  }
+  return json.fileKey;
+}
+
+/** Kintone のファイルダウンロード API から添付バイナリを取得する。 */
+export async function kintoneDownloadFile(
+  cfg: AppConfig,
+  fileKey: string,
+): Promise<{ data: ArrayBuffer; contentType: string }> {
+  const headers: Record<string, string> = {
+    "X-Cybozu-API-Token": cfg.kintone.configAppToken,
+  };
+  if (cfg.kintone.username && cfg.kintone.password) {
+    headers["X-Cybozu-Authorization"] = Buffer.from(
+      `${cfg.kintone.username}:${cfg.kintone.password}`,
+    ).toString("base64");
+  }
+  const res = await fetch(
+    `${cfg.kintone.baseUrl}/k/v1/file.json?fileKey=${encodeURIComponent(fileKey)}`,
+    { headers },
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Kintone file download failed (${res.status}): ${text.slice(0, 300)}`,
+    );
+  }
+  return {
+    data: await res.arrayBuffer(),
+    contentType:
+      res.headers.get("content-type") ?? "application/octet-stream",
+  };
+}
+
 export function detectedFromRecord(rec: KintoneRecord): DeviceDetection | undefined {
   const val = (k: string) => rec[k]?.value ?? "";
   const vendor = val(F.config.vendor);
@@ -190,6 +288,7 @@ export function detectedFromRecord(rec: KintoneRecord): DeviceDetection | undefi
 
 function toConfigVersion(rec: KintoneRecord): ConfigVersion {
   const val = (k: string) => rec[k]?.value ?? "";
+  const attachment = attachmentFromRecord(rec);
   return {
     id: rec.$id.value,
     generation: Number.parseInt(val(F.config.generation), 10) || 0,
@@ -203,6 +302,13 @@ function toConfigVersion(rec: KintoneRecord): ConfigVersion {
     lines: Number.parseInt(val(F.config.lines), 10) || 0,
     role: kintoneToRole(val(F.config.role)),
     detected: detectedFromRecord(rec),
+    originalFile: attachment
+      ? {
+          name: attachment.name ?? "",
+          contentType: attachment.contentType ?? "application/octet-stream",
+          size: Number.parseInt(attachment.size ?? "0", 10) || 0,
+        }
+      : undefined,
   };
 }
 
@@ -415,10 +521,17 @@ export async function createVersion(
     fwRulesJson?: string;
     routingRoutesJson?: string;
     wirelessJson?: string;
+    /** バイナリコンフィグ（Issue #93）: kintoneUploadFile で得た fileKey。
+     *  指定時は元ファイルを original_file 添付フィールドに紐付ける。既存
+     *  レコードに添付済みの fileKey も再利用できる（promote での引継ぎ）。 */
+    originalFileKey?: string;
+    originalFileName?: string;
+    originalFileContentType?: string;
+    originalFileSize?: number;
   },
 ): Promise<ConfigVersion> {
   // Kintone requires each field value wrapped in { value: ... }.
-  const fields: Record<string, { value: string }> = {
+  const fields: Record<string, { value: string | KintoneFileValue[] }> = {
     [F.config.customer]: { value: args.identifiers.customer },
     [F.config.hostname]: { value: args.identifiers.hostname },
     [F.config.ipAddress]: { value: args.identifiers.ipAddress },
@@ -441,6 +554,10 @@ export async function createVersion(
     [F.config.wirelessJson]: { value: args.wirelessJson ?? "" },
   };
   if (args.note) fields[F.config.note] = { value: args.note };
+  if (args.originalFileKey) {
+    const files: KintoneFileValue[] = [{ fileKey: args.originalFileKey }];
+    fields[F.config.originalFile] = { value: files };
+  }
 
   const res = await kintoneFetch<{ id: string; revision: string }>(
     cfg,
@@ -465,6 +582,13 @@ export async function createVersion(
     lines: args.lines,
     role: args.identifiers.role,
     detected: args.detected,
+    originalFile: args.originalFileKey
+      ? {
+          name: args.originalFileName ?? "",
+          contentType: args.originalFileContentType ?? "application/octet-stream",
+          size: args.originalFileSize ?? 0,
+        }
+      : undefined,
   };
 }
 

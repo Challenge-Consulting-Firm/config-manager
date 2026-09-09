@@ -153,6 +153,15 @@ export interface ConfigVersion {
   role: Role;
   /** Auto-detected vendor/OS/model from the config body (informational). */
   detected?: DeviceDetection;
+  /** Metadata of the original binary file stored as a Kintone attachment.
+   *  Present only for binary uploads (e.g. AirStation Pro .bin exports) whose
+   *  content cannot be managed as text: body stays empty and the pristine file
+   *  is downloadable via GET /api/versions/:id/file (Issue #93). */
+  originalFile?: {
+    name: string;
+    contentType: string;
+    size: number;
+  };
 }
 
 /** A logical device groups all its config generations together.

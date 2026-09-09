@@ -110,6 +110,11 @@
       "code": "lines",
       "type": "NUMBER",
       "label": "行数"
+    },
+    "original_file": {
+      "code": "original_file",
+      "type": "FILE",
+      "label": "元ファイル（バイナリ）"
     }
   }
 }

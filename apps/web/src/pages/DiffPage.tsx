@@ -26,6 +26,9 @@ export function DiffPage() {
   const [fwDiff, setFwDiff] = useState<FirewallRuleDiff | null>(null);
   const [routeDiff, setRouteDiff] = useState<RoutingRouteDiff | null>(null);
   const [wirelessDiff, setWirelessDiff] = useState<WirelessDiff | null>(null);
+  // 比較対象のどちらかがバイナリ世代（元ファイル添付・Issue #93）の場合、
+  // 本文が空のため「変更なし」と表示されてしまう旨の注意を表示する。
+  const [binarySide, setBinarySide] = useState<"before" | "after" | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -41,10 +44,14 @@ export function DiffPage() {
       setLoading(true);
       setError(null);
       try {
-        const res = await apiFetch<{ diff: ConfigDiff }>(
+        const res = await apiFetch<{
+          diff: ConfigDiff;
+          binarySide?: "before" | "after";
+        }>(
           `/api/diff?before=${encodeURIComponent(before)}&after=${encodeURIComponent(after)}`,
         );
         setConfigDiff(res.diff);
+        setBinarySide(res.binarySide ?? null);
       } catch (e) {
         setError(e instanceof ApiError ? e.message : String(e));
       } finally {
@@ -116,6 +123,16 @@ export function DiffPage() {
         <p className="text-slate-500">差分を計算中…</p>
       )}
       {error && <p className="text-red-600">エラー: {error}</p>}
+
+      {binarySide && !error && (
+        <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span className="font-semibold">注意:</span>{" "}
+          {binarySide === "before" ? "比較元" : "比較先"}の世代はバイナリコンフィグ
+          （元ファイル添付）のため本文が空です。下の Diff はバイナリ同士・または
+          バイナリとテキストの比較では正確な差分を示しません。機器詳細画面から
+          元ファイルをダウンロードして比較してください。
+        </div>
+      )}
 
       {!loading && !error && tab === "config" && configDiff && (
         <DiffViewer lines={configDiff.lines} stats={configDiff.stats} />

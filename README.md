@@ -25,6 +25,7 @@ Kintone の API トークンをブラウザに晒さないため、fly.io 上の
 - Entra ID でログイン（SSO）。ログインユーザーを作業履歴に自動記録。
 - コンフィグの世代管理（同一デバイス・同一内容の重複アップロードはスキップ）。
 - ドラッグ & ドロップでアップロード（`.conf` / `.cfg` / `.txt` / `.log`）。
+- **バイナリコンフィグの保管**（`.bin` 等）: AirStation Pro の設定バックアップのようにテキスト化できないファイルも、内容を判定してバイナリとして世代登録できます。本文のプレビュー・Diff はできませんが、元ファイルはそのまま保存され機器詳細画面からダウンロードできます（同一バイナリの再アップロードは SHA-256 でスキップ）。利用には Kintone コンフィグ管理アプリへの `original_file`（添付ファイル）フィールド追加が必要です（`node scripts/setup-kintone.mjs --app config` で追加可）。
 - アップロード時に **コメント行・空白行・末尾空白** を除去して SHA-256 を計算し、実質的な変更だけを世代として残す。
 - Web 上で任意の 2 世代を Diff 表示（サイドバイサイド、`+/-` 表示、パッチ形式でダウンロード可）。
 - **FWポリシー / ACL マトリクス**：コンフィグからFWルール・ACLを抽出し、一覧表示・送信元×宛先マトリクス表示・Excel/CSV出力が可能（Cisco IOS/IOS-XE/NX-OS/ASA、Juniper、Fortinet、YAMAHA RT `ip filter` / SWX `access-list` に対応）。
@@ -122,6 +123,7 @@ node scripts/setup-kintone.mjs --app meraki
 | FWポリシー抽出結果（JSON） | 文字列(複数行) | `fw_rules_json` |
 | ルーティング抽出結果（JSON） | 文字列(複数行) | `routing_routes_json` |
 | 無線SSID/AP抽出結果（JSON） | 文字列(複数行) | `wireless_json` |
+| 元ファイル（バイナリ） | 添付ファイル | `original_file` |
 
 **作業履歴アプリ:**
 

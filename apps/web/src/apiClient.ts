@@ -12,9 +12,15 @@ export async function apiFetch<T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
+  // FormData を送る場合は Content-Type を指定しない（multipart 境界は
+  // ブラウザが自動設定する）。JSON 以外に手動で指定していた場合も尊重する。
+  const isFormData =
+    typeof FormData !== "undefined" && init?.body instanceof FormData;
   const res = await fetch(path, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: isFormData
+      ? { ...(init?.headers ?? {}) }
+      : { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     credentials: "same-origin",
   });
   if (res.status === 401) {

@@ -617,3 +617,27 @@ export function detectDeviceInfo(body: string): DeviceDetection {
   }
   return EMPTY_DETECTION;
 }
+
+/** Heuristic binary-content check for uploaded config files (Issue #93).
+ *
+ *  Text configs — regardless of vendor syntax — never contain NUL bytes, and
+ *  multi-byte encodings such as Shift-JIS neither. Binary exports (e.g.
+ *  AirStation Pro .bin) virtually always contain NUL early. As a fallback for
+ *  rare binary formats without NUL bytes, a high ratio of control characters
+ *  (excluding \t \n \r) also flags the content as binary.
+ *
+ *  Only the first `limit` bytes are inspected so huge files stay cheap; the
+ *  web client uses the same helper as the BFF so both sides classify a file
+ *  identically. */
+export function isLikelyBinary(bytes: Uint8Array, limit = 8192): boolean {
+  const n = Math.min(bytes.length, limit);
+  if (n === 0) return false;
+  let control = 0;
+  for (let i = 0; i < n; i++) {
+    const b = bytes[i];
+    if (b === 0) return true;
+    // Count control chars except TAB (0x09), LF (0x0a), CR (0x0d).
+    if (b < 0x09 || (b > 0x0d && b < 0x20)) control++;
+  }
+  return control / n > 0.1;
+}

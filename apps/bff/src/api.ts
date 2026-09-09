@@ -3,11 +3,13 @@
  * session established by the /auth/* routes.
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
+import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import type { KintoneRecord } from "./kintone.js";
 import type { Session } from "./session.js";
 import {
+  attachmentFromRecord,
   createVersion,
   detectedFromRecord,
   getVersionRecord,
@@ -15,6 +17,8 @@ import {
   getRoutingCacheRaw,
   getWirelessCacheRaw,
   identifiersFromRecord,
+  kintoneDownloadFile,
+  kintoneUploadFile,
   latestGenerationFor,
   listAudit,
   listConfigRecords,
@@ -42,6 +46,7 @@ import {
   diffRoutingRoutes,
   diffWireless,
   detectDeviceInfo,
+  isLikelyBinary,
   extractFirewallRules,
   extractRoutingRoutes,
   extractWireless,
@@ -224,6 +229,7 @@ api.get("/versions/:id", async (c) => {
   const val = (k: string) => rec[k]?.value ?? "";
   const body = val("body");
   const ids = identifiersFromRecord(rec);
+  const attachment = attachmentFromRecord(rec);
   const version: ConfigVersion = {
     id: rec.$id.value,
     generation: Number.parseInt(val("generation"), 10) || 0,
@@ -237,6 +243,13 @@ api.get("/versions/:id", async (c) => {
     lines: Number.parseInt(val("lines"), 10) || 0,
     role: ids.role,
     detected: detectedFromRecord(rec),
+    originalFile: attachment
+      ? {
+          name: attachment.name ?? "",
+          contentType: attachment.contentType ?? "application/octet-stream",
+          size: Number.parseInt(attachment.size ?? "0", 10) || 0,
+        }
+      : undefined,
   };
 
   // Audit: record a view event (best-effort).
@@ -375,9 +388,47 @@ interface UploadBody {
 const textField = (value: unknown): string =>
   typeof value === "string" ? value.trim() : "";
 
-/** POST /api/upload — normalize + persist a new config generation. */
+/** 許容する元ファイルの拡張子（multipart / バイナリパス・Issue #93）。 */
+const ORIGINAL_FILE_EXTENSIONS = new Set([
+  "bin",
+  "conf",
+  "cfg",
+  "txt",
+  "log",
+  "dat",
+]);
+
+/** アップロード可能な元ファイルの最大バイト数（UI の dropzone 上限に合わせ
+ *  る。bodyLimit(6MB) は multipart のオーバーヘッド込みの全体上限）。 */
+const MAX_ORIGINAL_FILE_BYTES = 5 * 1024 * 1024;
+
+/** ファイル名からディレクトリ部・制御文字を除いた安全なベース名。 */
+function sanitizeFilename(name: string): string {
+  const base = name.split(/[\\/]/).pop() ?? "";
+  const cleaned = base.replace(/[\u0000-\u001f\u007f"]/g, "_");
+  return cleaned.slice(0, 200);
+}
+
+/** RFC 6266: ASCII フォールバック付きの Content-Disposition 生成。
+ *  日本語ファイル名にも対応（filename* 構文）。 */
+function contentDispositionAttachment(filename: string): string {
+  const ascii = filename.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
+/** POST /api/upload — normalize + persist a new config generation.
+ *  Content-Type で分岐する:
+ *    - application/json        → 従来どおりテキスト本文を正規化して保存
+ *    - multipart/form-data     → バイナリコンフィグ（AirStation Pro .bin 等・
+ *                                Issue #93）を元ファイルごと添付して保存。
+ *                                本文は空になり、プレビュー/Diff 不可・
+ *                                ダウンロードのみ可能。 */
 api.post("/upload", requireRole("operator"), async (c) => {
   const cfg = c.var.cfg;
+  const contentType = c.req.header("Content-Type") ?? "";
+  if (contentType.toLowerCase().includes("multipart/form-data")) {
+    return uploadBinaryVersion(c);
+  }
   const payload = await c.req.json<UploadBody>().catch(() => null);
   if (!payload) return c.json({ error: "invalid JSON body" }, 400);
   const customer = textField(payload.customer);
@@ -479,6 +530,207 @@ api.post("/upload", requireRole("operator"), async (c) => {
   return c.json({ created, strippedLines: normalized.strippedLines }, 201);
 });
 
+/** multipart/form-data で受信したバイナリコンフィグ（Issue #93）を
+ *  Kintone の添付ファイルとして世代登録する。POST /api/upload の
+ *  multipart 分岐から呼ばれる。
+ *
+ *  - 本文 (body) は空文字、hash はファイルバイト列の SHA-256。
+ *    これによりテキストと同じ「同一内容ならスキップ」判定が機能する。
+ *  - プレビュー・Diff・FW/ルーティング抽出はバイナリ対象外（空になる）。 */
+async function uploadBinaryVersion(c: Context<Env>) {
+  const cfg = c.var.cfg;
+
+  let form: Record<string, string | File>;
+  try {
+    form = await c.req.parseBody();
+  } catch {
+    return c.json({ error: "invalid multipart body" }, 400);
+  }
+  const file = form.file;
+  if (!(file instanceof File)) {
+    return c.json({ error: "file field is required" }, 400);
+  }
+
+  const customer = textField(form.customer);
+  const inputHostname = textField(form.hostname);
+  const inputIpAddress = textField(form.ipAddress);
+  const purpose = textField(form.purpose);
+  const serialNumber = textField(form.serialNumber);
+  const role: Role = form.role === "spare" ? "spare" : "production";
+  const note = typeof form.note === "string" && form.note.trim() ? form.note : undefined;
+  const isSpare = role === "spare";
+
+  const filename = sanitizeFilename(file.name || "config.bin");
+  const ext = filename.includes(".")
+    ? filename.slice(filename.lastIndexOf(".") + 1).toLowerCase()
+    : "";
+  if (!ORIGINAL_FILE_EXTENSIONS.has(ext)) {
+    return c.json(
+      {
+        error: `unsupported file extension ".${ext}" (allowed: ${[...ORIGINAL_FILE_EXTENSIONS].join(", ")})`,
+      },
+      400,
+    );
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length === 0) {
+    return c.json({ error: "file is empty" }, 400);
+  }
+  if (bytes.length > MAX_ORIGINAL_FILE_BYTES) {
+    return c.json({ error: "file exceeds the 5MB limit" }, 413);
+  }
+  // multipart 経由のテキストファイルは本来 JSON パスで送るべき。サーバ側でも
+  // 内容でバイナリ判定し、テキストなら明確に拒否して二重管理を防ぐ。
+  if (!isLikelyBinary(bytes)) {
+    return c.json(
+      {
+        error:
+          "this file looks like text — upload it via the JSON (text) path so it can be normalized and diffed",
+      },
+      400,
+    );
+  }
+
+  // バイナリからはホスト名・IP を検出できないため、入力値のみで判定する。
+  if (isSpare) {
+    if (!customer || !serialNumber) {
+      return c.json(
+        { error: "customer and serialNumber are required for spare" },
+        400,
+      );
+    }
+  } else if (!customer || !inputHostname || !inputIpAddress) {
+    return c.json(
+      { error: "customer, hostname, ipAddress are required" },
+      400,
+    );
+  }
+  const hostname = inputHostname;
+  const ipAddress = inputIpAddress;
+
+  // ファイルバイト列の SHA-256 をハッシュに使う（テキストのスキップ判定と
+  // 同じ仕組みで「同一バイナリの再アップロード」を 1 世代にまとめる）。
+  const hash = createHash("sha256").update(bytes).digest("hex");
+
+  const prevGen = await latestGenerationFor(cfg, {
+    customer,
+    hostname,
+    ipAddress,
+    role,
+  });
+  const prevVersions = await listVersions(cfg, {
+    customer,
+    hostname,
+    ipAddress,
+    role,
+  });
+  const latest = prevVersions.find((v) => v.generation === prevGen);
+  if (latest && latest.hash === hash) {
+    return c.json({
+      skipped: true,
+      reason: "No changes since the latest generation.",
+      generation: latest.generation,
+      hash: latest.hash,
+    });
+  }
+
+  // 先に Kintone へファイルをアップロードして fileKey を得る。
+  const contentType = file.type || "application/octet-stream";
+  let fileKey: string;
+  try {
+    fileKey = await kintoneUploadFile(cfg, {
+      data: bytes,
+      name: filename,
+      contentType,
+    });
+  } catch (err) {
+    console.error("[upload] binary file upload to Kintone failed:", err);
+    return c.json(
+      {
+        error:
+          "failed to store the file in Kintone (is the original_file attachment field created? run scripts/setup-kintone.mjs --app config)",
+      },
+      502,
+    );
+  }
+
+  const nextGen = prevGen + 1;
+  const created = await createVersion(cfg, {
+    identifiers: { customer, hostname, ipAddress, purpose, serialNumber, role },
+    generation: nextGen,
+    body: "",
+    hash,
+    size: bytes.length,
+    lines: 0,
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    note,
+    detected: undefined,
+    fwRulesJson: "",
+    routingRoutesJson: "",
+    wirelessJson: "",
+    originalFileKey: fileKey,
+    originalFileName: filename,
+    originalFileContentType: contentType,
+    originalFileSize: bytes.length,
+  });
+
+  await writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "upload",
+    customer,
+    hostname,
+    generation: nextGen,
+    detail: `Uploaded binary config file "${filename}" (${bytes.length} bytes) as ${role === "spare" ? "spare" : "production"} generation ${nextGen}.`,
+  });
+
+  return c.json({ created, isBinary: true }, 201);
+}
+
+/** GET /api/versions/:id/file — 世代に添付された元ファイル（バイナリ
+ *  コンフィグ・Issue #93）をダウンロードする。添付がない世代は 404。 */
+api.get("/versions/:id/file", async (c) => {
+  const cfg = c.var.cfg;
+  const id = c.req.param("id");
+  const rec = await getVersionRecord(cfg, id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+
+  const attachment = attachmentFromRecord(rec);
+  if (!attachment) {
+    return c.json({ error: "this version has no attached file" }, 404);
+  }
+
+  let bin: { data: ArrayBuffer; contentType: string };
+  try {
+    bin = await kintoneDownloadFile(cfg, attachment.fileKey);
+  } catch (err) {
+    console.error("[download] Kintone file fetch failed:", err);
+    return c.json({ error: "failed to fetch the file from Kintone" }, 502);
+  }
+
+  const ids = identifiersFromRecord(rec);
+  const generation = Number.parseInt(rec["generation"]?.value ?? "0", 10) || 0;
+  await writeAudit(cfg, {
+    operator: c.var.user.displayName,
+    operatorEmail: c.var.user.email,
+    action: "download",
+    customer: ids.customer,
+    hostname: ids.hostname,
+    generation,
+    detail: `Downloaded the original binary file "${attachment.name}" of generation ${generation}.`,
+  });
+
+  c.header("Content-Type", bin.contentType);
+  c.header(
+    "Content-Disposition",
+    contentDispositionAttachment(attachment.name || "config.bin"),
+  );
+  c.header("X-Content-Type-Options", "nosniff");
+  return c.body(new Uint8Array(bin.data));
+});
+
 interface PromoteBody {
   sourceVersionId: string;
   ipAddress: string;
@@ -507,6 +759,9 @@ api.post("/promote", requireRole("operator"), async (c) => {
   const lines = Number.parseInt(val("lines"), 10) || 0;
   const size = Number.parseInt(val("size"), 10) || 0;
   const detected = detectedFromRecord(rec);
+  // バイナリ添付（予備機を .bin で登録した場合）も本番世代へ引き継ぐ。
+  // Kintone の添付 fileKey は別レコードの FILE フィールドに再利用できる。
+  const srcAttachment = attachmentFromRecord(rec);
 
   const target = {
     customer: src.customer,
@@ -544,6 +799,10 @@ api.post("/promote", requireRole("operator"), async (c) => {
     fwRulesJson: serializeFirewallRules(extractFirewallRules(body, detected), hash),
     routingRoutesJson: serializeRoutingRoutes(extractRoutingRoutes(body, detected), hash),
     wirelessJson: serializeWireless(extractWireless(body, detected), hash),
+    originalFileKey: srcAttachment?.fileKey,
+    originalFileName: srcAttachment?.name,
+    originalFileContentType: srcAttachment?.contentType,
+    originalFileSize: Number.parseInt(srcAttachment?.size ?? "0", 10) || 0,
   });
 
   await writeAudit(cfg, {
@@ -1352,6 +1611,13 @@ api.get("/diff", async (c) => {
   };
   const diff = diffConfigs(before, after);
 
+  // バイナリ世代（元ファイル添付・Issue #93）が含まれる場合は本文が空の
+  // ため「変更なし」と表示されてしまう。UI で注意を表示できるよう通知する。
+  const binarySide =
+    attachmentFromRecord(beforeRec) ? "before"
+      : attachmentFromRecord(afterRec) ? "after"
+        : null;
+
   await writeAudit(cfg, {
     operator: c.var.user.displayName,
     operatorEmail: c.var.user.email,
@@ -1361,7 +1627,7 @@ api.get("/diff", async (c) => {
     detail: `Diffed generation ${before.generation} -> ${after.generation}`,
   });
 
-  return c.json({ diff });
+  return c.json({ diff, ...(binarySide ? { binarySide } : {}) });
 });
 
 interface VersionMetaBody {
