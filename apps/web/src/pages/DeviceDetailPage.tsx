@@ -347,7 +347,7 @@ export function DeviceDetailPage() {
             故障時の差し替えなどで予備機を本番運用に移す際、現在の世代 #{body.generation}{" "}
             のコンフィグを本番機として新世代登録します。シリアル番号は引き継がれます。
           </p>
-          {body.lines === 0 && (
+          {body.lines === 0 && !body.originalFile && (
             <p className="mt-2 text-xs text-amber-700">
               ※ この予備機はまだコンフィグが登録されていません。「新世代をアップロード」で
               投入済みコンフィグを登録すると昇格できます。
@@ -367,7 +367,9 @@ export function DeviceDetailPage() {
             </label>
             <button
               onClick={doPromote}
-              disabled={promoting || !promoteIp.trim() || body.lines === 0}
+              disabled={
+                promoting || !promoteIp.trim() || (body.lines === 0 && !body.originalFile)
+              }
               className="rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
             >
               {promoting ? "登録中…" : "本番として登録"}
@@ -496,8 +498,20 @@ export function DeviceDetailPage() {
               )}
               <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2 text-xs text-slate-500">
                 <span>
-                  {body.lines}行 · {body.size}バイト · hash{" "}
-                  <span className="mono">{body.hash.slice(0, 12)}…</span>
+                  {body.originalFile ? (
+                    <>
+                      <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                        バイナリ
+                      </span>{" "}
+                      <span className="mono">{body.originalFile.name}</span> ·{" "}
+                      {body.originalFile.size.toLocaleString("ja-JP")}バイト
+                    </>
+                  ) : (
+                    <>
+                      {body.lines}行 · {body.size}バイト · hash{" "}
+                      <span className="mono">{body.hash.slice(0, 12)}…</span>
+                    </>
+                  )}
                 </span>
                 <div className="flex items-center gap-2">
                   <Link
@@ -524,12 +538,24 @@ export function DeviceDetailPage() {
                   >
                     VLAN構成
                   </Link>
-                  <button
-                    onClick={() => download(body)}
-                    className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
-                  >
-                    ダウンロード
-                  </button>
+                  {/* バイナリ世代（Issue #93）: 元ファイルをそのままダウンロード。 */}
+                  {body.originalFile && (
+                    <a
+                      href={`/api/versions/${body.id}/file`}
+                      className="rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-emerald-700 hover:bg-emerald-100"
+                    >
+                      元ファイルをダウンロード
+                    </a>
+                  )}
+                  {/* テキスト本文のある世代のみ .txt ダウンロードを表示。 */}
+                  {body.body && (
+                    <button
+                      onClick={() => download(body)}
+                      className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
+                    >
+                      ダウンロード
+                    </button>
+                  )}
                   <button
                     onClick={() => loadVersion(body.id)}
                     className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
@@ -538,9 +564,26 @@ export function DeviceDetailPage() {
                   </button>
                 </div>
               </div>
-              <pre className="mono max-h-[70vh] overflow-auto px-3 py-2 text-xs leading-5">
-                {body.body}
-              </pre>
+              {body.originalFile && !body.body ? (
+                <div className="flex flex-col items-center justify-center gap-2 px-3 py-12 text-center text-sm text-slate-500">
+                  <span className="text-3xl">📦</span>
+                  <p>
+                    この世代はバイナリコンフィグ{" "}
+                    （<span className="mono">{body.originalFile.name}</span>）のため、
+                    本文プレビュー・Diff はできません。
+                  </p>
+                  <a
+                    href={`/api/versions/${body.id}/file`}
+                    className="rounded-md border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-emerald-700 hover:bg-emerald-100"
+                  >
+                    元ファイル（{body.originalFile.size.toLocaleString("ja-JP")}バイト）をダウンロード
+                  </a>
+                </div>
+              ) : (
+                <pre className="mono max-h-[70vh] overflow-auto px-3 py-2 text-xs leading-5">
+                  {body.body}
+                </pre>
+              )}
             </div>
           ) : (
             <p className="text-slate-500">世代を選択してください。</p>

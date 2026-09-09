@@ -3,7 +3,12 @@ import { useDropzone, type FileRejection } from "react-dropzone";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { apiFetch, ApiError } from "../apiClient";
 import { safeReturnPath } from "../utils/safeReturnPath";
-import { detectDeviceInfo, type DeviceDetection, type Role } from "@config-manager/shared";
+import {
+  detectDeviceInfo,
+  isLikelyBinary,
+  type DeviceDetection,
+  type Role,
+} from "@config-manager/shared";
 
 interface UploadResult {
   created?: {
@@ -17,10 +22,18 @@ interface UploadResult {
       model: string;
       confidence: number;
     };
+    /** バイナリアップロード時の元ファイル情報（Issue #93）。 */
+    originalFile?: {
+      name: string;
+      contentType: string;
+      size: number;
+    };
   };
   skipped?: boolean;
   reason?: string;
   strippedLines?: number;
+  /** multipart（バイナリ）パスで登録された場合に true。 */
+  isBinary?: boolean;
 }
 
 export function UploadPage() {
@@ -38,6 +51,9 @@ export function UploadPage() {
   const [role, setRole] = useState<Role>(presetRole);
   const [note, setNote] = useState("");
   const [rawText, setRawText] = useState<string>("");
+  // バイナリコンフィグ（AirStation Pro .bin 等・Issue #93）は本文として扱え
+  // ないため File のまま保持し、multipart で送信する。
+  const [binaryFile, setBinaryFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string>("");
   const [detected, setDetected] = useState<DeviceDetection | null>(null);
   const [autoHost, setAutoHost] = useState(false);
@@ -66,8 +82,21 @@ export function UploadPage() {
       if (!file) return;
       setFileName(file.name);
       file
-        .text()
-        .then((text) => {
+        .arrayBuffer()
+        .then((buf) => {
+          const bytes = new Uint8Array(buf);
+          // バイナリ判定は BFF と同じ isLikelyBinary を使い、両側で一致させる
+          // （Issue #93）。バイナリは File のまま保持し multipart で送る。
+          if (isLikelyBinary(bytes)) {
+            setBinaryFile(file);
+            setRawText("");
+            setDetected(null);
+            setAutoHost(false);
+            setAutoIp(false);
+            return;
+          }
+          setBinaryFile(null);
+          const text = new TextDecoder().decode(bytes);
           setRawText(text);
           // Run detection client-side so we can auto-fill hostname / IP.
           const d = detectDeviceInfo(text);
@@ -120,34 +149,54 @@ export function UploadPage() {
         setError("顧客・ホスト名・IPアドレスは必須です");
         return;
       }
-      if (!rawText.trim()) {
+      if (!rawText.trim() && !binaryFile) {
         setError("ファイルをドロップまたは内容を入力してください");
         return;
       }
     }
     setSubmitting(true);
     try {
-      // The BFF normalizes (removes comment/blank lines) server-side; we send
-      // the raw text. Normalization happens once, server-side, so the stored
-      // hash is authoritative.
-      const res = await apiFetch<UploadResult>("/api/upload", {
-        method: "POST",
-        body: JSON.stringify({
-          customer,
-          hostname,
-          ipAddress,
-          purpose,
-          serialNumber,
-          role,
-          note,
-          body: rawText,
-        }),
-      });
+      let res: UploadResult;
+      if (binaryFile) {
+        // バイナリコンフィグ（Issue #93）: multipart で元ファイルをそのまま
+        // 送る。本文の正規化・プレビュー・Diff は行われない。
+        const fd = new FormData();
+        fd.append("file", binaryFile, binaryFile.name);
+        fd.append("customer", customer);
+        fd.append("hostname", hostname);
+        fd.append("ipAddress", ipAddress);
+        fd.append("purpose", purpose);
+        fd.append("serialNumber", serialNumber);
+        fd.append("role", role);
+        if (note) fd.append("note", note);
+        res = await apiFetch<UploadResult>("/api/upload", {
+          method: "POST",
+          body: fd,
+        });
+      } else {
+        // The BFF normalizes (removes comment/blank lines) server-side; we send
+        // the raw text. Normalization happens once, server-side, so the stored
+        // hash is authoritative.
+        res = await apiFetch<UploadResult>("/api/upload", {
+          method: "POST",
+          body: JSON.stringify({
+            customer,
+            hostname,
+            ipAddress,
+            purpose,
+            serialNumber,
+            role,
+            note,
+            body: rawText,
+          }),
+        });
+      }
       setResult(res);
       if (res.created) {
         // Reset for next upload.
         setRawText("");
         setFileName("");
+        setBinaryFile(null);
       }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
@@ -211,6 +260,19 @@ export function UploadPage() {
           {detected.osVersion && ` v${detected.osVersion}`}
           {detected.model && ` · 機種 ${detected.model}`}
           （ホスト名・IPアドレスも自動入力しました。必要に応じて修正してください）
+        </div>
+      )}
+
+      {/* バイナリファイル検出パネル（Issue #93: AirStation Pro .bin 等） */}
+      {binaryFile && (
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span className="font-semibold">バイナリファイルとして登録します:</span>{" "}
+          <span className="mono">{binaryFile.name}</span>（
+          {binaryFile.size.toLocaleString("ja-JP")} バイト）
+          <br />
+          バイナリは本文として管理できないため、プレビュー・Diff・正規化の対象外です。
+          元ファイルはそのまま保存され、機器詳細画面からダウンロードできます。
+          ホスト名・IPアドレスの自動検出もできないため手動入力してください。
         </div>
       )}
 
@@ -297,7 +359,10 @@ export function UploadPage() {
         <input {...getInputProps()} />
         {fileName ? (
           <p className="text-sm text-slate-700">
-            <span className="font-medium">{fileName}</span> · {rawText.length}文字
+            <span className="font-medium">{fileName}</span> ·{" "}
+            {binaryFile
+              ? `${binaryFile.size.toLocaleString("ja-JP")}バイト（バイナリ）`
+              : `${rawText.length}文字`}
           </p>
         ) : isDragActive ? (
           <p className="text-sm text-blue-600">ドロップしてください</p>
@@ -343,8 +408,10 @@ export function UploadPage() {
             </>
           ) : (
             <>
-              世代 #{result.created?.generation} を登録しました（
-              {result.strippedLines ?? 0} 行のコメント/空白行を除去）。
+              世代 #{result.created?.generation} を登録しました
+              {result.isBinary
+                ? `（バイナリファイル: ${result.created?.originalFile?.name ?? fileName}）。機器詳細画面からダウンロードできます。`
+                : `（${result.strippedLines ?? 0} 行のコメント/空白行を除去）。`}
               {result.created?.detected &&
                 (result.created.detected.vendor || result.created.detected.os) && (
                   <div className="mt-2 flex flex-wrap items-center gap-2">
