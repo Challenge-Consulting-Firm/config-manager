@@ -20,22 +20,172 @@
 
 import type { VlanDefinition, VlanExtraction, VlanPort } from "./types.js";
 
+/** 有効な VLAN ID の範囲（0 と 4095 は予約）。 */
+const VLAN_ID_MIN = 1;
+const VLAN_ID_MAX = 4094;
+
+// 範囲外の値を弾かないと、2^53 以上の値で `v++` が値を進めずループが終わらない
+// （登録されたコンフィグを閲覧するだけで BFF が停止する DoS になる）。
+function isValidVlanId(n: number): boolean {
+  return Number.isSafeInteger(n) && n >= VLAN_ID_MIN && n <= VLAN_ID_MAX;
+}
+
+/**
+ * 1 回の抽出で範囲指定を走査する総回数の上限。`member 1-4094` のような短い
+ * 行を大量に並べると、入力の千倍以上の処理が生まれる（増幅型の DoS）。
+ * 重複して捨てる ID の走査も数えるので、CPU 時間の上限として効く。
+ */
+export const MAX_VLAN_EXPANSION = 2_000_000;
+
+/**
+ * 抽出結果（JSON 応答）のバイト数の上限。所属件数だけでは、長いポート名を
+ * 全 VLAN に複製する入力などで応答が膨らむため、JSON に書き出した際の UTF-8
+ * バイト数（エスケープ込み）で見積もる。
+ */
+export const MAX_VLAN_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/** VLAN 定義・ポート 1 件あたりのキー名・区切り記号の上界。 */
+const RECORD_OVERHEAD_BYTES = 160;
+/** 数値 1 つを JSON に書く際の上界（安全な整数の最大桁数 + 区切り）。 */
+const NUMBER_BYTES = 24;
+/** 検証済み VLAN ID（1〜4094）を配列に書く際のバイト数（"4094,"）。 */
+const VLAN_ID_BYTES = 5;
+
+/** 抽出の残り予算。どちらかが尽きたら truncated を立て、以降は追加しない。 */
+interface ExpansionBudget {
+  work: number;
+  outputBytes: number;
+  truncated: boolean;
+  /** 文字列を JSON に書いた際の UTF-8 バイト数（引用符・区切り込み）。 */
+  stringBytes: (s: string) => number;
+}
+
+function newExpansionBudget(): ExpansionBudget {
+  // 同じポート名が VLAN の数だけ参照されるため、文字列ごとに一度だけ数える。
+  const cache = new Map<string, number>();
+  return {
+    work: MAX_VLAN_EXPANSION,
+    outputBytes: MAX_VLAN_OUTPUT_BYTES,
+    truncated: false,
+    stringBytes: (str) => {
+      let bytes = cache.get(str);
+      if (bytes === undefined) {
+        bytes = jsonStringUtf8Bytes(str) + 1;
+        cache.set(str, bytes);
+      }
+      return bytes;
+    },
+  };
+}
+
+/**
+ * JSON.stringify(str) の UTF-8 バイト数。文字数で数えると、制御文字の
+ * エスケープ（最大 6 倍）や日本語（3 倍）で実際の応答サイズを過小評価する。
+ */
+function jsonStringUtf8Bytes(str: string): number {
+  let bytes = 2; // 前後の引用符
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c === 0x22 || c === 0x5c) bytes += 2;
+    else if (c < 0x20) bytes += 6;
+    else if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    // 単独サロゲートは \uXXXX（6 バイト）にエスケープされる。ペアかどうかを
+    // 判定せず、サロゲートは常に 6 バイトとして上界を取る。
+    else if (c >= 0xd800 && c <= 0xdfff) bytes += 6;
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+/** 出力予算から bytes を差し引く。足りなければ truncated を立てて false。 */
+function chargeOutput(budget: ExpansionBudget, bytes: number): boolean {
+  if (budget.outputBytes < bytes) {
+    budget.truncated = true;
+    return false;
+  }
+  budget.outputBytes -= bytes;
+  return true;
+}
+
+/** 予算内に収まる先頭部分だけを返す。 */
+function takeWithinBudget<T>(
+  items: Iterable<T>,
+  cost: (item: T) => number,
+  budget: ExpansionBudget,
+): T[] {
+  const out: T[] = [];
+  for (const item of items) {
+    if (!chargeOutput(budget, cost(item))) break;
+    out.push(item);
+  }
+  return out;
+}
+
+const idCost = () => VLAN_ID_BYTES;
+
+/** VLAN 定義 1 件（所属一覧を除く）の出力バイト数の上界。 */
+function vlanRecordBytes(
+  budget: ExpansionBudget,
+  vendor: string,
+  name: string,
+): number {
+  return (
+    RECORD_OVERHEAD_BYTES +
+    NUMBER_BYTES +
+    budget.stringBytes(vendor) +
+    budget.stringBytes(name)
+  );
+}
+
+/** ポート 1 件（allowedVlans を除く）の出力バイト数の上界。 */
+function portRecordBytes(budget: ExpansionBudget, p: VlanPort): number {
+  return (
+    RECORD_OVERHEAD_BYTES +
+    NUMBER_BYTES * 3 +
+    budget.stringBytes(p.vendor) +
+    budget.stringBytes(p.name) +
+    budget.stringBytes(p.mode) +
+    budget.stringBytes(p.description)
+  );
+}
+
 /** Expand a VLAN list token like "200-202,210,254" into [200,201,202,210,254].
- *  Ignores non-numeric junk defensively. */
-function expandVlanList(spec: string): number[] {
+ *  Ignores non-numeric junk and out-of-range IDs defensively. Duplicates are
+ *  dropped so one call never yields more than VLAN_ID_MAX entries. */
+function expandVlanList(spec: string, budget: ExpansionBudget): number[] {
   const out: number[] = [];
+  const seen = new Uint8Array(VLAN_ID_MAX + 1);
+  const add = (id: number): boolean => {
+    // 重複で捨てる ID の走査も予算に数える（`1-4093` の反復のように、全 ID が
+    // 出揃わず早期終了しない入力で CPU を占有させないため）。
+    if (budget.work <= 0) {
+      budget.truncated = true;
+      return false;
+    }
+    budget.work--;
+    if (seen[id]) return true;
+    seen[id] = 1;
+    out.push(id);
+    return true;
+  };
   for (const part of spec.split(",")) {
+    // 全 ID が出揃ったら残りの指定は何も増やさないので打ち切る。
+    if (out.length >= VLAN_ID_MAX) break;
     const range = part.trim().match(/^(\d+)\s*-\s*(\d+)$/);
     if (range) {
       const lo = Number.parseInt(range[1], 10);
       const hi = Number.parseInt(range[2], 10);
-      if (lo <= hi && hi - lo < 4096) {
-        for (let v = lo; v <= hi; v++) out.push(v);
+      if (isValidVlanId(lo) && isValidVlanId(hi) && lo <= hi) {
+        for (let v = lo; v <= hi; v++) if (!add(v)) return out;
       }
       continue;
     }
     const single = part.trim().match(/^(\d+)$/);
-    if (single) out.push(Number.parseInt(single[1], 10));
+    if (single) {
+      const id = Number.parseInt(single[1], 10);
+      if (isValidVlanId(id) && !add(id)) return out;
+    }
   }
   return out;
 }
@@ -45,7 +195,10 @@ function expandVlanList(spec: string): number[] {
  *   - `vlan database` block with `vlan <id> name <name>` (YAMAHA SWX) or IOS
  *     `vlan <id>` followed by an indented `name <name>` line.
  *  Returns a map of id -> name so port assignments can be merged in later. */
-function parseVlanDefinitions(lines: string[]): Map<number, string> {
+function parseVlanDefinitions(
+  lines: string[],
+  budget: ExpansionBudget,
+): Map<number, string> {
   const defs = new Map<number, string>();
   let lastId = -1; // for IOS `vlan N` \n ` name X` two-line form
 
@@ -53,7 +206,7 @@ function parseVlanDefinitions(lines: string[]): Map<number, string> {
     const line = raw.trim();
 
     // `vlan 100 name VLAN100` (YAMAHA SWX, single line).
-    const named = line.match(/^vlan\s+(\d+)\s+name\s+(.+)$/i);
+    const named = line.match(/^vlan\s+(\d+)\s+name\s+(.+)$/is);
     if (named) {
       const id = Number.parseInt(named[1], 10);
       defs.set(id, named[2].trim());
@@ -62,16 +215,18 @@ function parseVlanDefinitions(lines: string[]): Map<number, string> {
     }
 
     // `vlan 201-202` / `vlan 100,200` / `vlan 100` (IDs, possibly a range/list).
-    const decl = line.match(/^vlan\s+([\d,\s-]+)$/i);
+    // 引数を数字始まりにして、`\s+` と一覧の文字クラスが空白を奪い合う
+    // 二乗のバックトラッキング（`vlan` + 大量の空白 + 記号）を防ぐ。
+    const decl = line.match(/^vlan\s+(\d[\d,\s-]*)$/i);
     if (decl) {
-      const ids = expandVlanList(decl[1]);
+      const ids = expandVlanList(decl[1], budget);
       for (const id of ids) if (!defs.has(id)) defs.set(id, "");
       lastId = ids.length === 1 ? ids[0] : -1;
       continue;
     }
 
     // IOS indented `name <name>` immediately after a `vlan <id>` line.
-    const nameOnly = raw.match(/^\s+name\s+(.+)$/i);
+    const nameOnly = raw.match(/^\s+name\s+(.+)$/is);
     if (nameOnly && lastId >= 0) {
       defs.set(lastId, nameOnly[1].trim());
       continue;
@@ -100,9 +255,12 @@ function isPortInterface(name: string): boolean {
 
 /** Parse `interface <port>` blocks into {@link VlanPort} entries. Recognizes
  *  the common `switchport` grammar shared by Cisco / YAMAHA / ELECOM. */
-function parsePorts(lines: string[]): VlanPort[] {
+function parsePorts(lines: string[], budget: ExpansionBudget): VlanPort[] {
   const ports: VlanPort[] = [];
   let current: VlanPort | null = null;
+  // allowedVlans の重複判定用。配列の includes だと 1 行ごとに最大
+  // 4094×4094 回の比較になり、`allowed vlan add` の多い行で CPU を占有する。
+  let currentAllowed = new Set<number>();
 
   const flush = () => {
     if (current) ports.push(current);
@@ -115,6 +273,7 @@ function parsePorts(lines: string[]): VlanPort[] {
       flush();
       const name = ifM[1];
       if (isPortInterface(name)) {
+        currentAllowed = new Set();
         current = {
           vendor: "",
           name,
@@ -129,7 +288,7 @@ function parsePorts(lines: string[]): VlanPort[] {
     if (!current) return;
     const line = raw.trim();
 
-    const descM = line.match(/^description\s+(.+)$/i);
+    const descM = line.match(/^description\s+(.+)$/is);
     if (descM) {
       current.description = descM[1].trim();
       return;
@@ -154,11 +313,14 @@ function parsePorts(lines: string[]): VlanPort[] {
     // `switchport trunk allowed vlan [add] 200-202,210` (Cisco/YAMAHA) — the
     // `add` keyword is optional; multiple lines accumulate.
     const allowedM = line.match(
-      /^switchport\s+trunk\s+allowed\s+vlan\s+(?:add\s+)?([\d,\s-]+)/i,
+      /^switchport\s+trunk\s+allowed\s+vlan\s+(?:add\s+)?(\d[\d,\s-]*)/i,
     );
     if (allowedM) {
-      for (const v of expandVlanList(allowedM[1])) {
-        if (!current.allowedVlans.includes(v)) current.allowedVlans.push(v);
+      for (const v of expandVlanList(allowedM[1], budget)) {
+        if (!currentAllowed.has(v)) {
+          currentAllowed.add(v);
+          current.allowedVlans.push(v);
+        }
       }
       if (!current.mode) current.mode = "trunk";
     }
@@ -185,13 +347,17 @@ function isBuffaloVlanConfig(lines: string[]): boolean {
       continue;
     }
     if (/^\s*interface\s+\S+/i.test(raw)) inVlanIf = false;
-    if (inVlanIf && /^\s*member\s+[\d,\s-]+$/i.test(raw)) return true;
+    if (inVlanIf && /^\s*member\s+\d[\d,\s-]*$/i.test(raw)) return true;
     if (/^\s*PVID\s+\d+/i.test(raw)) return true;
   }
   return false;
 }
 
-function extractBuffalo(lines: string[], vendor: string): VlanExtraction {
+function extractBuffalo(
+  lines: string[],
+  vendor: string,
+  budget: ExpansionBudget,
+): VlanExtraction {
   // Physical ports keyed by port number (GigabitEthernet0/N -> N).
   interface Phys {
     name: string;
@@ -241,17 +407,17 @@ function extractBuffalo(lines: string[], vendor: string): VlanExtraction {
 
     const line = raw.trim();
     if (curVlan) {
-      const memberM = line.match(/^member\s+([\d,\s-]+)$/i);
+      const memberM = line.match(/^member\s+(\d[\d,\s-]*)$/i);
       if (memberM) {
-        for (const n of expandVlanList(memberM[1])) curVlan.members.add(n);
+        for (const n of expandVlanList(memberM[1], budget)) curVlan.members.add(n);
         return;
       }
-      const untagM = line.match(/^untagged\s+([\d,\s-]+)$/i);
+      const untagM = line.match(/^untagged\s+(\d[\d,\s-]*)$/i);
       if (untagM) {
-        for (const n of expandVlanList(untagM[1])) curVlan.untagged.add(n);
+        for (const n of expandVlanList(untagM[1], budget)) curVlan.untagged.add(n);
         return;
       }
-      const nameM = line.match(/^name\s+(.+)$/i);
+      const nameM = line.match(/^name\s+(.+)$/is);
       if (nameM) curVlan.name = nameM[1].trim().replace(/^["']|["']$/g, "");
       return;
     }
@@ -261,7 +427,7 @@ function extractBuffalo(lines: string[], vendor: string): VlanExtraction {
         curPhys.pvid = Number.parseInt(pvidM[1], 10);
         return;
       }
-      const nameM = line.match(/^name\s+(.+)$/i);
+      const nameM = line.match(/^name\s+(.+)$/is);
       if (nameM) curPhys.description = nameM[1].trim().replace(/^["']|["']$/g, "");
     }
   });
@@ -269,52 +435,107 @@ function extractBuffalo(lines: string[], vendor: string): VlanExtraction {
   const nameOf = (num: number) =>
     physByNum.get(num)?.name ?? `port${num}`;
 
+  // VLAN ブロック × 物理ポートの総当たりは両者が多いと二乗で膨らむため、
+  // メンバー集合を 1 回だけ走査してポート番号ごとに振り分けておく。
+  // 予算が尽きた場合も VLAN 定義そのものは残るよう、所属より先に確保する。
+  const keptBlocks = takeWithinBudget(
+    vlanBlocks,
+    (vb) => vlanRecordBytes(budget, vendor, vb.name),
+    budget,
+  );
+  // ポート本体（名前・description）も、所属より先に予算を確保する。
+  const keptPhys = takeWithinBudget(
+    [...physByNum.values()].sort((a, b) => a.num - b.num),
+    (p) =>
+      RECORD_OVERHEAD_BYTES +
+      NUMBER_BYTES * 3 +
+      budget.stringBytes(vendor) +
+      budget.stringBytes(p.name) +
+      budget.stringBytes(p.description) +
+      budget.stringBytes("access"),
+    budget,
+  );
+  const keptNums = new Set(keptPhys.map((p) => p.num));
+
+  const taggedByNum = new Map<number, number[]>();
+  const untaggedByNum = new Map<number, number[]>();
+  for (const vb of keptBlocks) {
+    for (const n of vb.members) {
+      if (!keptNums.has(n)) continue;
+      // Buffalo の vb.id は範囲検証していない（`interface vlanN` の N をそのまま
+      // 使う）ため、検証済み ID 用の 5 バイトではなく数値の上界で数える。
+      if (!chargeOutput(budget, NUMBER_BYTES)) break;
+      pushTo(vb.untagged.has(n) ? untaggedByNum : taggedByNum, n, vb.id);
+    }
+  }
+  const nativeByPvid = new Map<number, string[]>();
+  for (const p of physByNum.values()) {
+    if (p.pvid !== undefined) pushTo(nativeByPvid, p.pvid, p.name);
+  }
+
   // Build ports: tagged = member-not-untagged of each VLAN; untagged drives
   // the access/native VLAN; PVID (when set) is the authoritative native VLAN.
-  const ports: VlanPort[] = [...physByNum.values()]
-    .sort((a, b) => a.num - b.num)
-    .map((p) => {
-      const tagged: number[] = [];
-      const untaggedIn: number[] = [];
-      for (const vb of vlanBlocks) {
-        if (!vb.members.has(p.num)) continue;
-        if (vb.untagged.has(p.num)) untaggedIn.push(vb.id);
-        else tagged.push(vb.id);
-      }
-      tagged.sort((a, b) => a - b);
-      const nativeVlan =
-        p.pvid ?? (untaggedIn.length === 1 ? untaggedIn[0] : undefined);
-      const isTrunk = tagged.length > 0;
-      return {
-        vendor,
-        name: p.name,
-        mode: isTrunk ? "trunk" : untaggedIn.length ? "access" : "",
-        accessVlan: !isTrunk && untaggedIn.length === 1 ? untaggedIn[0] : undefined,
-        nativeVlan: isTrunk ? nativeVlan : undefined,
-        allowedVlans: tagged,
-        description: p.description,
-        line: p.line,
-      } satisfies VlanPort;
-    });
+  const ports: VlanPort[] = keptPhys.map((p) => {
+    const tagged = taggedByNum.get(p.num) ?? [];
+    const untaggedIn = untaggedByNum.get(p.num) ?? [];
+    tagged.sort((a, b) => a - b);
+    const nativeVlan =
+      p.pvid ?? (untaggedIn.length === 1 ? untaggedIn[0] : undefined);
+    const isTrunk = tagged.length > 0;
+    return {
+      vendor,
+      name: p.name,
+      mode: isTrunk ? "trunk" : untaggedIn.length ? "access" : "",
+      accessVlan: !isTrunk && untaggedIn.length === 1 ? untaggedIn[0] : undefined,
+      nativeVlan: isTrunk ? nativeVlan : undefined,
+      allowedVlans: tagged,
+      description: p.description,
+      line: p.line,
+    } satisfies VlanPort;
+  });
 
-  const vlans: VlanDefinition[] = vlanBlocks
+  // 同じ `interface vlanN` が繰り返されると、ブロックごとに PVID ポート等が
+  // 複製されて出力が増幅するため、名前の複製も出力予算に数える。
+  const vlans: VlanDefinition[] = keptBlocks
     .map((vb) => {
       const tagged = [...vb.members].filter((n) => !vb.untagged.has(n));
-      const nativePorts = [...physByNum.values()]
-        .filter((p) => p.pvid === vb.id)
-        .map((p) => p.name);
       return {
         vendor,
         id: vb.id,
         name: vb.name,
-        accessPorts: [...vb.untagged].sort((a, b) => a - b).map(nameOf),
-        taggedPorts: tagged.sort((a, b) => a - b).map(nameOf),
-        nativePorts,
+        accessPorts: takeWithinBudget(
+          [...vb.untagged].sort((a, b) => a - b).map(nameOf),
+          budget.stringBytes,
+          budget,
+        ),
+        taggedPorts: takeWithinBudget(
+          tagged.sort((a, b) => a - b).map(nameOf),
+          budget.stringBytes,
+          budget,
+        ),
+        nativePorts: takeWithinBudget(
+          nativeByPvid.get(vb.id) ?? [],
+          budget.stringBytes,
+          budget,
+        ),
       } satisfies VlanDefinition;
     })
     .sort((a, b) => a.id - b.id);
 
-  return { vlans, ports };
+  return withTruncation({ vlans, ports }, budget);
+}
+
+function pushTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const list = map.get(key);
+  if (list) list.push(value);
+  else map.set(key, [value]);
+}
+
+function withTruncation(
+  extraction: VlanExtraction,
+  budget: ExpansionBudget,
+): VlanExtraction {
+  return budget.truncated ? { ...extraction, truncated: true } : extraction;
 }
 
 /** Extract VLAN definitions + port membership from a switch config body.
@@ -329,44 +550,67 @@ export function extractVlans(body: string, vendor: string): VlanExtraction {
 
   // Buffalo uses a distinct member/untagged/PVID grammar; dispatch to it when
   // detected (either by vendor or structurally).
+  const budget = newExpansionBudget();
   if (v === "Buffalo" || isBuffaloVlanConfig(lines)) {
-    return extractBuffalo(lines, v || "Buffalo");
+    return extractBuffalo(lines, v || "Buffalo", budget);
   }
 
-  const defMap = parseVlanDefinitions(lines);
-  const ports = parsePorts(lines);
-  for (const p of ports) p.vendor = v;
+  const defMap = parseVlanDefinitions(lines, budget);
+  const parsedPorts = parsePorts(lines, budget);
+  for (const p of parsedPorts) p.vendor = v;
 
   // Ensure VLANs referenced only by ports (never declared) still appear.
   const ensureVlan = (id: number) => {
     if (!defMap.has(id)) defMap.set(id, "");
   };
-  for (const p of ports) {
+  for (const p of parsedPorts) {
     if (p.accessVlan !== undefined) ensureVlan(p.accessVlan);
     if (p.nativeVlan !== undefined) ensureVlan(p.nativeVlan);
     for (const a of p.allowedVlans) ensureVlan(a);
   }
 
-  const vlans: VlanDefinition[] = [...defMap.entries()]
-    .map(([id, name]) => {
-      const accessPorts: string[] = [];
-      const taggedPorts: string[] = [];
-      const nativePorts: string[] = [];
-      for (const p of ports) {
-        if (p.accessVlan === id) accessPorts.push(p.name);
-        if (p.nativeVlan === id) nativePorts.push(p.name);
-        if (p.allowedVlans.includes(id)) taggedPorts.push(p.name);
-      }
-      return {
-        vendor: v,
-        id,
-        name,
-        accessPorts,
-        taggedPorts,
-        nativePorts,
-      };
-    })
+  // VLAN × ポートの総当たり（さらに allowedVlans.includes）は二乗以上で
+  // 膨らむため、ポート側から 1 回だけ走査して VLAN ごとに振り分ける。
+  const accessById = new Map<number, string[]>();
+  const nativeById = new Map<number, string[]>();
+  const taggedById = new Map<number, string[]>();
+  // 予算が尽きた場合も VLAN 定義そのものは残るよう、所属より先に確保する。
+  const keptDefs = takeWithinBudget(
+    defMap.entries(),
+    ([, name]) => vlanRecordBytes(budget, v, name),
+    budget,
+  );
+  // ポート本体（名前・description）も、所属より先に予算を確保する。
+  const ports = takeWithinBudget(
+    parsedPorts,
+    (p) => portRecordBytes(budget, p),
+    budget,
+  );
+  for (const p of ports) {
+    p.allowedVlans = takeWithinBudget(p.allowedVlans, idCost, budget);
+  }
+
+  // ポート名は VLAN ごとに複製されるので、長い名前 × 全 VLAN で応答が
+  // 膨らまないよう出力予算に数える。
+  const pushName = (map: Map<number, string[]>, id: number, name: string) => {
+    if (chargeOutput(budget, budget.stringBytes(name))) pushTo(map, id, name);
+  };
+  for (const p of ports) {
+    if (p.accessVlan !== undefined) pushName(accessById, p.accessVlan, p.name);
+    if (p.nativeVlan !== undefined) pushName(nativeById, p.nativeVlan, p.name);
+    for (const a of p.allowedVlans) pushName(taggedById, a, p.name);
+  }
+
+  const vlans: VlanDefinition[] = keptDefs
+    .map(([id, name]) => ({
+      vendor: v,
+      id,
+      name,
+      accessPorts: accessById.get(id) ?? [],
+      taggedPorts: taggedById.get(id) ?? [],
+      nativePorts: nativeById.get(id) ?? [],
+    }))
     .sort((a, b) => a.id - b.id);
 
-  return { vlans, ports };
+  return withTruncation({ vlans, ports }, budget);
 }

@@ -188,6 +188,9 @@ export interface ConfigDiff {
   lines: DiffLine[];
   /** Aggregate counts. */
   stats: { added: number; removed: number; unchanged: number };
+  /** true のとき、行数が多すぎるため変更箇所を「全削除 → 全追加」で示す
+   *  簡易差分にしている（行単位の正確な対応付けはしていない）。 */
+  approximate?: boolean;
 }
 
 export interface DiffLine {
@@ -469,6 +472,8 @@ export interface VlanPort {
 export interface VlanExtraction {
   vlans: VlanDefinition[];
   ports: VlanPort[];
+  /** true のとき、範囲指定の展開数が上限に達したため一部の所属を省略している。 */
+  truncated?: boolean;
 }
 
 // ===== Meraki credentials =====

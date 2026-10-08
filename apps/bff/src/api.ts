@@ -3,6 +3,7 @@
  * session established by the /auth/* routes.
  */
 
+import type { HttpBindings } from "@hono/node-server";
 import { Hono, type Context } from "hono";
 import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.js";
@@ -18,6 +19,7 @@ import {
   getWirelessCacheRaw,
   identifiersFromRecord,
   kintoneDownloadFile,
+  KintoneFileTooLargeError,
   kintoneUploadFile,
   latestGenerationFor,
   listAudit,
@@ -41,7 +43,9 @@ import {
   updateVersionMeta,
 } from "./kintone.js";
 import {
+  countLines,
   diffConfigs,
+  MAX_DIFF_LINES,
   diffFirewallRules,
   diffRoutingRoutes,
   diffWireless,
@@ -77,7 +81,11 @@ import type {
 import { issueNodeCredentialToken } from "./nodeCredentialTokens.js";
 import { fetchMerakiConfig } from "./meraki.js";
 import { requireRole } from "./rbac.js";
-import { rateLimit } from "./rateLimit.js";
+import {
+  concurrencyLimit,
+  createConcurrencySlots,
+  rateLimit,
+} from "./rateLimit.js";
 import { publicErrorMessage } from "./httpErrors.js";
 import {
   formatDestructiveDetail,
@@ -371,6 +379,7 @@ api.get("/versions/:id/vlan", async (c) => {
     vlans: extraction.vlans,
     ports: extraction.ports,
     count: extraction.vlans.length,
+    ...(extraction.truncated ? { truncated: true } : {}),
   });
 });
 
@@ -401,6 +410,10 @@ const ORIGINAL_FILE_EXTENSIONS = new Set([
 /** アップロード可能な元ファイルの最大バイト数（UI の dropzone 上限に合わせ
  *  る。bodyLimit(6MB) は multipart のオーバーヘッド込みの全体上限）。 */
 const MAX_ORIGINAL_FILE_BYTES = 5 * 1024 * 1024;
+
+/** ダウンロード時に Kintone から受け取る元ファイルの最大バイト数。Kintone 上で
+ *  直接添付された少し大きなファイルも扱えるよう、アップロード上限より緩める。 */
+const MAX_ORIGINAL_FILE_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 
 /** ファイル名からディレクトリ部・制御文字を除いた安全なベース名。 */
 function sanitizeFilename(name: string): string {
@@ -702,34 +715,157 @@ api.get("/versions/:id/file", async (c) => {
     return c.json({ error: "this version has no attached file" }, 404);
   }
 
-  let bin: { data: ArrayBuffer; contentType: string };
-  try {
-    bin = await kintoneDownloadFile(cfg, attachment.fileKey);
-  } catch (err) {
-    console.error("[download] Kintone file fetch failed:", err);
-    return c.json({ error: "failed to fetch the file from Kintone" }, 502);
+  // Hono は HEAD でも GET ハンドラを呼び、返した本文を読まずに捨てる。本文
+  // ストリームを作ると送信期限まで枠とメモリが残るので、ファイルは取得しない。
+  if (c.req.method === "HEAD") {
+    c.header(
+      "Content-Disposition",
+      contentDispositionAttachment(attachment.name || "config.bin"),
+    );
+    c.header("X-Content-Type-Options", "nosniff");
+    return c.body(null, 200);
   }
 
-  const ids = identifiersFromRecord(rec);
-  const generation = Number.parseInt(rec["generation"]?.value ?? "0", 10) || 0;
-  await writeAudit(cfg, {
-    operator: c.var.user.displayName,
-    operatorEmail: c.var.user.email,
-    action: "download",
-    customer: ids.customer,
-    hostname: ids.hostname,
-    generation,
-    detail: `Downloaded the original binary file "${attachment.name}" of generation ${generation}.`,
-  });
+  // 1 件あたり最大 20 MB をメモリに載せるため、並列数で総量を抑える。枠は
+  // ファイル本体を握っている間（取得〜送信完了・切断）だけ保持する。
+  const release = originalFileDownloadSlots.tryAcquire();
+  if (!release) {
+    c.header("Retry-After", "1");
+    return c.json(
+      { error: "ダウンロードが混み合っています。しばらくしてから再試行してください。" },
+      503,
+    );
+  }
+  // 解放の責任をストリームへ渡すまでは、どの経路で抜けても枠を返す。
+  let handedOff = false;
+  try {
+    let bin: { chunks: Uint8Array[]; size: number; contentType: string };
+    try {
+      bin = await kintoneDownloadFile(cfg, attachment.fileKey, {
+        maxBytes: MAX_ORIGINAL_FILE_DOWNLOAD_BYTES,
+        // 取得中にクライアントが切断したら、Kintone からの受信も止める。
+        signal: c.req.raw.signal,
+      });
+    } catch (err) {
+      if (err instanceof KintoneFileTooLargeError) {
+        return c.json(
+          {
+            error: `添付ファイルが大きすぎるためダウンロードできません（上限 ${MAX_ORIGINAL_FILE_DOWNLOAD_BYTES / 1024 / 1024} MB）。Kintone から直接取得してください。`,
+            code: "FILE_TOO_LARGE",
+          },
+          // 413 はリクエスト本文の過大を表すので使わない。保存済みデータ側の制限。
+          400,
+        );
+      }
+      console.error("[download] Kintone file fetch failed:", err);
+      return c.json({ error: "failed to fetch the file from Kintone" }, 502);
+    }
 
-  c.header("Content-Type", bin.contentType);
-  c.header(
-    "Content-Disposition",
-    contentDispositionAttachment(attachment.name || "config.bin"),
-  );
-  c.header("X-Content-Type-Options", "nosniff");
-  return c.body(new Uint8Array(bin.data));
+    // 監査はベストエフォート（失敗しても例外を投げない）なので完了を待たない。
+    // 待つと、Kintone が遅い間ファイル本体と同時実行枠を握り続けるため。
+    const ids = identifiersFromRecord(rec);
+    const generation = Number.parseInt(rec["generation"]?.value ?? "0", 10) || 0;
+    void writeAudit(cfg, {
+      operator: c.var.user.displayName,
+      operatorEmail: c.var.user.email,
+      action: "download",
+      customer: ids.customer,
+      hostname: ids.hostname,
+      generation,
+      detail: `Downloaded the original binary file "${attachment.name}" of generation ${generation}.`,
+    }).catch(() => {});
+
+    c.header("Content-Type", bin.contentType);
+    c.header(
+      "Content-Disposition",
+      contentDispositionAttachment(attachment.name || "config.bin"),
+    );
+    c.header("Content-Length", String(bin.size));
+    c.header("X-Content-Type-Options", "nosniff");
+    // 本番（@hono/node-server）では Node のレスポンスが c.env に入る。テストの
+    // app.request() では無いので、その場合はストリームの終端で解放する。
+    const outgoing = (c.env as Partial<HttpBindings> | undefined)?.outgoing;
+    const body = streamChunksWithRelease(
+      bin.chunks,
+      release,
+      c.req.raw.signal,
+      outgoing,
+    );
+    handedOff = true;
+    return c.body(body);
+  } finally {
+    if (!handedOff) release();
+  }
 });
+
+/** 元ファイル送信の期限。受信の遅いクライアントが枠とメモリを握り続けないため。 */
+const ORIGINAL_FILE_SEND_TIMEOUT_MS = 120_000;
+
+const originalFileDownloadSlots = createConcurrencySlots({
+  name: "original-file-download",
+  max: 4,
+});
+
+/**
+ * 受信済みチャンクをそのまま流すストリーム。送信完了・クライアント切断・
+ * 送信期限切れのいずれかで release を呼び、同時実行枠を返す。
+ *
+ * ストリームの終端（close）は「Node の送信バッファへ渡し終えた」だけで、
+ * 受信の遅いクライアントにはまだ届いていない。outgoing があれば、その
+ * close（送信完了・切断・破棄のいずれでも発火）まで枠と期限を保持する。
+ */
+function streamChunksWithRelease(
+  chunks: Uint8Array[],
+  release: () => void,
+  signal: AbortSignal,
+  outgoing?: HttpBindings["outgoing"],
+): ReadableStream<Uint8Array> {
+  let index = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const finish = () => {
+    if (timer) clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+    outgoing?.off("close", finish);
+    chunks.length = 0;
+    release();
+  };
+  // 送信開始前に切断されると、node-server は本文を読みもキャンセルもしない
+  // ため、リクエストの中断でも解放する。
+  const onAbort = () => finish();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (signal.aborted || outgoing?.destroyed) {
+        finish();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+      outgoing?.once("close", finish);
+      timer = setTimeout(() => {
+        // 送信バッファに滞留している分も含めて打ち切る。close が発火して
+        // finish が呼ばれるが、念のため直接も呼ぶ（release は冪等）。
+        if (outgoing) outgoing.destroy();
+        else controller.error(new Error("original file send timed out"));
+        finish();
+      }, ORIGINAL_FILE_SEND_TIMEOUT_MS);
+    },
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]);
+        return;
+      }
+      controller.close();
+      if (outgoing) {
+        // 枠と期限は outgoing の close まで保持し、本体の参照だけ先に手放す。
+        chunks.length = 0;
+      } else {
+        finish();
+      }
+    },
+    cancel() {
+      finish();
+    },
+  });
+}
 
 interface PromoteBody {
   sourceVersionId: string;
@@ -1587,48 +1723,67 @@ function maskApiKey(key: string): string {
 }
 
 /** GET /api/diff?before=<id>&after=<id> — diff two versions. */
-api.get("/diff", async (c) => {
-  const cfg = c.var.cfg;
-  const beforeId = c.req.query("before");
-  const afterId = c.req.query("after");
-  if (!beforeId || !afterId) {
-    return c.json({ error: "before and after query params are required" }, 400);
-  }
-  const beforeRec = await getVersionRecord(cfg, beforeId);
-  const afterRec = await getVersionRecord(cfg, afterId);
-  if (!beforeRec || !afterRec) return c.json({ error: "not found" }, 404);
+api.get(
+  "/diff",
+  // 差分計算は同期処理で、行数上限内でも数十〜百 MB 規模のメモリを使い得る。
+  // 1 GB の単一マシンで並列に積み上がらないよう同時実行数を絞る。
+  concurrencyLimit({ name: "diff", max: 2 }),
+  async (c) => {
+    const cfg = c.var.cfg;
+    const beforeId = c.req.query("before");
+    const afterId = c.req.query("after");
+    if (!beforeId || !afterId) {
+      return c.json({ error: "before and after query params are required" }, 400);
+    }
+    const beforeRec = await getVersionRecord(cfg, beforeId);
+    const afterRec = await getVersionRecord(cfg, afterId);
+    if (!beforeRec || !afterRec) return c.json({ error: "not found" }, 404);
 
-  const v = (rec: typeof beforeRec, k: string) => rec[k]?.value ?? "";
-  const before = {
-    generation: Number.parseInt(v(beforeRec, "generation"), 10) || 0,
-    body: v(beforeRec, "body"),
-    hash: v(beforeRec, "hash"),
-  };
-  const after = {
-    generation: Number.parseInt(v(afterRec, "generation"), 10) || 0,
-    body: v(afterRec, "body"),
-    hash: v(afterRec, "hash"),
-  };
-  const diff = diffConfigs(before, after);
+    const v = (rec: typeof beforeRec, k: string) => rec[k]?.value ?? "";
+    const before = {
+      generation: Number.parseInt(v(beforeRec, "generation"), 10) || 0,
+      body: v(beforeRec, "body"),
+      hash: v(beforeRec, "hash"),
+    };
+    const after = {
+      generation: Number.parseInt(v(afterRec, "generation"), 10) || 0,
+      body: v(afterRec, "body"),
+      hash: v(afterRec, "hash"),
+    };
+    if (
+      countLines(before.body) > MAX_DIFF_LINES ||
+      countLines(after.body) > MAX_DIFF_LINES
+    ) {
+      return c.json(
+        {
+          error: `コンフィグの行数が多すぎるため差分を表示できません（上限 ${MAX_DIFF_LINES.toLocaleString("ja-JP")} 行）。元のコンフィグをダウンロードして比較してください。`,
+          code: "DIFF_TOO_LARGE",
+        },
+        // 413 はリクエスト本文の過大を表すので使わない。保存済みデータ側の制限。
+        400,
+      );
+    }
+    const diff = diffConfigs(before, after);
 
-  // バイナリ世代（元ファイル添付・Issue #93）が含まれる場合は本文が空の
-  // ため「変更なし」と表示されてしまう。UI で注意を表示できるよう通知する。
-  const binarySide =
-    attachmentFromRecord(beforeRec) ? "before"
-      : attachmentFromRecord(afterRec) ? "after"
-        : null;
+    // バイナリ世代（元ファイル添付・Issue #93）が含まれる場合は本文が空の
+    // ため「変更なし」と表示されてしまう。UI で注意を表示できるよう通知する。
+    const binarySide =
+      attachmentFromRecord(beforeRec) ? "before"
+        : attachmentFromRecord(afterRec) ? "after"
+          : null;
 
-  await writeAudit(cfg, {
-    operator: c.var.user.displayName,
-    operatorEmail: c.var.user.email,
-    action: "diff",
-    customer: v(beforeRec, "customer"),
-    hostname: v(beforeRec, "hostname"),
-    detail: `Diffed generation ${before.generation} -> ${after.generation}`,
-  });
+    await writeAudit(cfg, {
+      operator: c.var.user.displayName,
+      operatorEmail: c.var.user.email,
+      action: "diff",
+      customer: v(beforeRec, "customer"),
+      hostname: v(beforeRec, "hostname"),
+      detail: `Diffed generation ${before.generation} -> ${after.generation}`,
+    });
 
-  return c.json({ diff, ...(binarySide ? { binarySide } : {}) });
-});
+    return c.json({ diff, ...(binarySide ? { binarySide } : {}) });
+  },
+);
 
 interface VersionMetaBody {
   purpose?: string;

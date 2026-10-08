@@ -149,3 +149,34 @@ export function concurrencyLimit(
     }
   };
 }
+
+/**
+ * 手動で解放する同時実行枠。concurrencyLimit はハンドラが返った時点で枠を
+ * 解放するが、大きなバッファを返すルートではレスポンスの送信中もメモリを
+ * 握り続けるため、送信完了・切断まで枠を保持したい場合に使う。
+ *
+ * tryAcquire() は枠が空いていれば解放関数（複数回呼んでも 1 回だけ効く）を、
+ * 満杯なら null を返す。
+ */
+export function createConcurrencySlots(opts: { name: string; max: number }): {
+  tryAcquire(): (() => void) | null;
+} {
+  let inFlight = 0;
+  return {
+    tryAcquire() {
+      if (inFlight >= opts.max) {
+        console.warn(
+          `[concurrency-limit] ${opts.name} full (${inFlight}/${opts.max}); shedding request`,
+        );
+        return null;
+      }
+      inFlight += 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        inFlight -= 1;
+      };
+    },
+  };
+}
