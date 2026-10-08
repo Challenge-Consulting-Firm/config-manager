@@ -9,6 +9,8 @@
  *      一連の流れを Kintone HTTP をモックして検証する。
  */
 import { strict as assert } from "node:assert";
+import { connect, type Socket } from "node:net";
+import { serve } from "@hono/node-server";
 import { test } from "node:test";
 import { Hono } from "hono";
 import { isLikelyBinary, type AuthUser } from "@config-manager/shared";
@@ -133,6 +135,7 @@ function installKintoneMock(options: {
   existingRecords?: unknown[];
   createdId?: string;
   fileBytes?: Uint8Array;
+  fileHeaders?: Record<string, string>;
 }) {
   const calls: MockCall[] = [];
   const originalFetch = globalThis.fetch;
@@ -158,7 +161,10 @@ function installKintoneMock(options: {
     // ファイルダウンロード。
     if (url.includes("/k/v1/file.json?fileKey=")) {
       return new Response(options.fileBytes ?? new Uint8Array([1, 2, 3]), {
-        headers: { "Content-Type": "application/octet-stream" },
+        headers: {
+          "Content-Type": "application/octet-stream",
+          ...options.fileHeaders,
+        },
       });
     }
     // レコード系。
@@ -397,6 +403,160 @@ test("GET /api/versions/:id/file は添付バイナリを Content-Disposition �
     const buf = new Uint8Array(await res.arrayBuffer());
     assert.deepEqual([...buf], [...fileBytes]);
   } finally {
+    mock.restore();
+  }
+});
+
+test("上限を超える添付ファイルは読み切らずに 400 (FILE_TOO_LARGE) を返す", async () => {
+  // Content-Length の無いストリームでも、受信バイト数で打ち切ること。
+  const mock = installKintoneMock({
+    fileBytes: new Uint8Array(20 * 1024 * 1024 + 1),
+  });
+  const app = testApp();
+  try {
+    const res = await app.request("/api/versions/77/file");
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { error: string; code: string };
+    assert.equal(body.code, "FILE_TOO_LARGE");
+    assert.match(body.error, /大きすぎる/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("Content-Length が上限を超える添付ファイルは本文を読まずに 400 を返す", async () => {
+  const mock = installKintoneMock({
+    fileBytes: new Uint8Array([1, 2, 3]),
+    fileHeaders: { "Content-Length": String(100 * 1024 * 1024) },
+  });
+  const app = testApp();
+  try {
+    const res = await app.request("/api/versions/77/file");
+    assert.equal(res.status, 400);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("送信中のダウンロードは同時実行枠を保持し、送信完了・切断で解放する", async () => {
+  const mock = installKintoneMock({ fileBytes: new Uint8Array([1, 2, 3]) });
+  const app = testApp();
+  try {
+    // 本文を読まない（送信が終わらない）レスポンスを上限の 4 件まで溜める。
+    const pending: Response[] = [];
+    for (let i = 0; i < 4; i++) {
+      const res = await app.request("/api/versions/77/file");
+      assert.equal(res.status, 200);
+      pending.push(res);
+    }
+    const full = await app.request("/api/versions/77/file");
+    assert.equal(full.status, 503);
+
+    // 1 件は読み切り（送信完了）、1 件は切断（cancel）すると 2 枠空く。
+    assert.deepEqual([...new Uint8Array(await pending[0].arrayBuffer())], [1, 2, 3]);
+    await pending[1].body?.cancel();
+    for (let i = 0; i < 2; i++) {
+      const res = await app.request("/api/versions/77/file");
+      assert.equal(res.status, 200);
+      pending.push(res);
+    }
+    assert.equal((await app.request("/api/versions/77/file")).status, 503);
+
+    for (const res of pending.slice(2)) await res.body?.cancel();
+    const after = await app.request("/api/versions/77/file");
+    assert.equal(after.status, 200);
+    await after.arrayBuffer();
+  } finally {
+    mock.restore();
+  }
+});
+
+test("HEAD はファイルを取得せず、同時実行枠も消費しない", async () => {
+  const mock = installKintoneMock({ fileBytes: new Uint8Array([1, 2, 3]) });
+  const app = testApp();
+  try {
+    for (let i = 0; i < 6; i++) {
+      const res = await app.request("/api/versions/77/file", { method: "HEAD" });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get("Content-Disposition") ?? "", /^attachment/);
+    }
+    assert.equal(
+      mock.calls.filter((c) => c.url.includes("/k/v1/file.json?fileKey=")).length,
+      0,
+    );
+    const res = await app.request("/api/versions/77/file");
+    assert.equal(res.status, 200);
+    await res.arrayBuffer();
+  } finally {
+    mock.restore();
+  }
+});
+
+test("取得中・送信前にクライアントが切断したら同時実行枠を返す", async () => {
+  const mock = installKintoneMock({ fileBytes: new Uint8Array([1, 2, 3]) });
+  const app = testApp();
+  try {
+    for (let i = 0; i < 6; i++) {
+      const controller = new AbortController();
+      const res = await app.request("/api/versions/77/file", {
+        signal: controller.signal,
+      });
+      controller.abort();
+      // 中断済みでも 200 の応答オブジェクト自体は返るが、本文は読まない。
+      assert.ok(res.status === 200 || res.status >= 500);
+    }
+    const res = await app.request("/api/versions/77/file");
+    assert.equal(res.status, 200);
+    await res.arrayBuffer();
+  } finally {
+    mock.restore();
+  }
+});
+
+test("実サーバーで受信を止めたクライアントは送信完了まで枠を保持し、切断で解放する", async () => {
+  // 最後のチャンクが Node の送信バッファに滞留している間も枠を握り続けることを、
+  // fetch を使わない生のソケットで確かめる（fetch はモック済みのため）。
+  const mock = installKintoneMock({ fileBytes: new Uint8Array(8 * 1024 * 1024) });
+  let port = 0;
+  const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
+    const s = serve({ fetch: testApp().fetch, port: 0 }, (info) => {
+      port = info.port;
+      resolve(s);
+    });
+  });
+  const open = (): Socket => {
+    const sock = connect(port, "127.0.0.1");
+    sock.write("GET /api/versions/77/file HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    return sock;
+  };
+  /** ステータス行だけ読み、以降は受信を止める（遅いクライアントの再現）。 */
+  const statusOf = (sock: Socket) =>
+    new Promise<number>((resolve) => {
+      sock.once("data", (d) => {
+        sock.pause();
+        resolve(Number(String(d).split(" ")[1]));
+      });
+    });
+  const sockets: Socket[] = [];
+  try {
+    for (let i = 0; i < 4; i++) {
+      const sock = open();
+      sockets.push(sock);
+      assert.equal(await statusOf(sock), 200);
+    }
+    // 送信が詰まっている 4 件が枠を握っているので 5 件目は 503。
+    const fifth = open();
+    sockets.push(fifth);
+    assert.equal(await statusOf(fifth), 503);
+
+    for (const sock of sockets) sock.destroy();
+    await new Promise((r) => setTimeout(r, 200));
+    const after = open();
+    sockets.push(after);
+    assert.equal(await statusOf(after), 200);
+  } finally {
+    for (const sock of sockets) sock.destroy();
+    await new Promise((r) => server.close(() => r(undefined)));
     mock.restore();
   }
 });

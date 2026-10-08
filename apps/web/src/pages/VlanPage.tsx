@@ -24,6 +24,7 @@ export function VlanPage() {
   const [ids, setIds] = useState<DeviceIdentifiers | null>(null);
   const [vlans, setVlans] = useState<VlanDefinition[]>([]);
   const [ports, setPorts] = useState<VlanPort[]>([]);
+  const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("vlans");
@@ -37,7 +38,11 @@ export function VlanPage() {
           apiFetch<{ version: ConfigVersion; identifiers: DeviceIdentifiers }>(
             `/api/versions/${id}`,
           ),
-          apiFetch<{ vlans: VlanDefinition[]; ports: VlanPort[] }>(
+          apiFetch<{
+            vlans: VlanDefinition[];
+            ports: VlanPort[];
+            truncated?: boolean;
+          }>(
             `/api/versions/${id}/vlan`,
           ),
         ]);
@@ -45,6 +50,7 @@ export function VlanPage() {
         setIds(verRes.identifiers);
         setVlans(vlanRes.vlans);
         setPorts(vlanRes.ports);
+        setTruncated(vlanRes.truncated === true);
       } catch (e) {
         setError(e instanceof ApiError ? e.message : String(e));
       } finally {
@@ -140,6 +146,13 @@ export function VlanPage() {
 
       {loading && <p className="text-slate-500">読み込み中…</p>}
       {error && <p className="text-red-600">エラー: {error}</p>}
+
+      {!loading && !error && truncated && (
+        <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span className="font-semibold">注意:</span>{" "}
+          VLAN の範囲指定が多すぎるため、展開数の上限で打ち切りました。一部のポート所属が表示されていない可能性があります。
+        </div>
+      )}
 
       {!loading && !error && vlans.length === 0 && ports.length === 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800">

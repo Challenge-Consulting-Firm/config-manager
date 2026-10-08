@@ -134,6 +134,14 @@ export function DiffPage() {
         </div>
       )}
 
+      {!loading && !error && tab === "config" && configDiff?.approximate && (
+        <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <span className="font-semibold">注意:</span>{" "}
+          コンフィグの行数が多いため、変更箇所を「削除 → 追加」としてまとめた簡易差分で表示しています。
+          行単位の正確な対応付けは行っていません。
+        </div>
+      )}
+
       {!loading && !error && tab === "config" && configDiff && (
         <DiffViewer lines={configDiff.lines} stats={configDiff.stats} />
       )}

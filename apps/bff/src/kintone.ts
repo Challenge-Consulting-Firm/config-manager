@@ -240,11 +240,52 @@ export async function kintoneUploadFile(
   return json.fileKey;
 }
 
-/** Kintone のファイルダウンロード API から添付バイナリを取得する。 */
+/** 添付ファイルが取得上限を超えたことを示す（呼び出し側で 413 に変換する）。 */
+export class KintoneFileTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`Kintone attachment exceeds ${maxBytes} bytes`);
+    this.name = "KintoneFileTooLargeError";
+  }
+}
+
+/** 添付ファイル取得のタイムアウト。応答が遅い間もメモリを握り続けないため。 */
+const FILE_DOWNLOAD_TIMEOUT_MS = 30_000;
+
+/** エラー応答の本文はログ用に先頭だけ読めば足りる。 */
+const ERROR_BODY_PEEK_BYTES = 1024;
+
+/** 本文を最大 maxBytes まで読んで文字列化し、残りは読まずに破棄する。 */
+async function peekText(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks).subarray(0, maxBytes).toString("utf8");
+}
+
+/**
+ * Kintone のファイルダウンロード API から添付バイナリを取得する。
+ *
+ * Kintone 上で直接大容量のファイルが添付されることもあるため、arrayBuffer() で
+ * 無条件に読み切らず、受信バイト数を数えながら maxBytes を超えた時点で中断する
+ * （Content-Length は信用せず、あれば早期拒否にだけ使う）。受信したチャンクは
+ * 結合せずに返す（結合用のバッファで一時的にメモリが倍になるのを避けるため）。
+ */
 export async function kintoneDownloadFile(
   cfg: AppConfig,
   fileKey: string,
-): Promise<{ data: ArrayBuffer; contentType: string }> {
+  opts: { maxBytes: number; signal?: AbortSignal },
+): Promise<{ chunks: Uint8Array[]; size: number; contentType: string }> {
   const headers: Record<string, string> = {
     "X-Cybozu-API-Token": cfg.kintone.configAppToken,
   };
@@ -253,21 +294,54 @@ export async function kintoneDownloadFile(
       `${cfg.kintone.username}:${cfg.kintone.password}`,
     ).toString("base64");
   }
-  const res = await fetch(
-    `${cfg.kintone.baseUrl}/k/v1/file.json?fileKey=${encodeURIComponent(fileKey)}`,
-    { headers },
-  );
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `Kintone file download failed (${res.status}): ${text.slice(0, 300)}`,
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FILE_DOWNLOAD_TIMEOUT_MS);
+  try {
+    const res = await fetch(
+      `${cfg.kintone.baseUrl}/k/v1/file.json?fileKey=${encodeURIComponent(fileKey)}`,
+      {
+        headers,
+        signal: opts.signal
+          ? AbortSignal.any([controller.signal, opts.signal])
+          : controller.signal,
+      },
     );
+    if (!res.ok) {
+      const text = await peekText(res, ERROR_BODY_PEEK_BYTES).catch(() => "");
+      throw new Error(
+        `Kintone file download failed (${res.status}): ${text.slice(0, 300)}`,
+      );
+    }
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > opts.maxBytes) {
+      controller.abort();
+      throw new KintoneFileTooLargeError(opts.maxBytes);
+    }
+
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    if (res.body) {
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > opts.maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new KintoneFileTooLargeError(opts.maxBytes);
+        }
+        chunks.push(value);
+      }
+    }
+    return {
+      chunks,
+      size: total,
+      contentType:
+        res.headers.get("content-type") ?? "application/octet-stream",
+    };
+  } finally {
+    clearTimeout(timer);
   }
-  return {
-    data: await res.arrayBuffer(),
-    contentType:
-      res.headers.get("content-type") ?? "application/octet-stream",
-  };
 }
 
 export function detectedFromRecord(rec: KintoneRecord): DeviceDetection | undefined {
