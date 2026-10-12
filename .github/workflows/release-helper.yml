@@ -81,6 +81,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
+          # ツールキャッシュの古いパッチ版ではなく、標準ライブラリの脆弱性修正を含む最新パッチ版を使う。
+          check-latest: true
           cache-dependency-path: apps/helper/go.sum
 
       - name: Build
@@ -149,6 +151,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
+          # ツールキャッシュの古いパッチ版ではなく、標準ライブラリの脆弱性修正を含む最新パッチ版を使う。
+          check-latest: true
           cache-dependency-path: apps/helper/go.sum
 
       - name: Build universal binary
