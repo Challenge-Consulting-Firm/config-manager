@@ -81,7 +81,10 @@ const app = new Hono<AppEnv>();
 // 検索語・顧客名が fly のログに残るため（Issue #78）。
 app.use(accessLogger());
 // fly.dev 直アクセスを拒否し、公開経路を Cloudflare（WAF・Bot 対策）に限定する。
-app.use("*", createCloudflareOnlyGuard({ enabled: cfg.requireCloudflare }));
+app.use("*", createCloudflareOnlyGuard({
+    enabled: cfg.requireCloudflare,
+    originSecret: cfg.cloudflareOriginSecret,
+  }));
 // Cap request bodies at 6 MB so a 5 MB config upload (plus JSON/headers)
 // is accepted but runaway payloads are rejected early with HTTP 413.
 app.use("*", bodyLimit({ maxSize: 6 * 1024 * 1024 }));

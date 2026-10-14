@@ -219,7 +219,7 @@ cp .env.example .env
 | --- | --- |
 | `AUTH_MODE` | `disabled` で Entra ID をバイパス（**ローカル検証専用**）。`NODE_ENV=production` では起動失敗する。本番は必ず `oidc` |
 | `LOCAL_DEV_USER_NAME` / `LOCAL_DEV_USER_EMAIL` | `AUTH_MODE=disabled` 時に記録されるダミー作業者 |
-| `REQUIRE_CLOUDFLARE` | `true` で Cloudflare プロキシ非経由（fly.dev 直など）のリクエストを 403 にする（`/healthz` は除く）。本番のみ有効化。既定 `false` |
+| `REQUIRE_CLOUDFLARE` | `true` で Cloudflare プロキシ非経由（fly.dev 直など）のリクエストを 403 にする（`/healthz` は除く）。本番のみ有効化。既定 `false`。有効時は `CLOUDFLARE_ORIGIN_SECRET`（32 文字以上・Cloudflare の Transform Rule で `x-origin-verify` に付与する値）が必須 |
 | `KINTONE_DOMAIN` | `xxx.cybozu.com` |
 | `KINTONE_CONFIG_APP_ID` / `KINTONE_CONFIG_APP_TOKEN` | コンフィグ管理アプリ |
 | `KINTONE_AUDIT_APP_ID` / `KINTONE_AUDIT_APP_TOKEN` | 作業履歴アプリ |

@@ -39,6 +39,8 @@ export interface AppConfig {
   publicBaseUrl: string;
   /** true のとき Cloudflare プロキシを経由しないリクエスト（fly.dev 直など）を拒否する。 */
   requireCloudflare: boolean;
+  /** Cloudflare の Transform Rule が x-origin-verify に付与する秘密値。requireCloudflare 時は必須。 */
+  cloudflareOriginSecret: string;
   /** "oidc" uses Entra ID (production). "disabled" skips auth and injects a
    *  fixed local user — for local validation only. */
   authMode: AuthMode;
@@ -122,13 +124,23 @@ export function loadConfig(): AppConfig {
         "Set AUTH_MODE=oidc (and configure ENTRA_* / SESSION_SECRET) for production.",
     );
   }
+  const requireCloudflare = optional("REQUIRE_CLOUDFLARE", "false") === "true";
+  const cloudflareOriginSecret = optional("CLOUDFLARE_ORIGIN_SECRET");
+  // 秘密値なしで有効化すると誰も通れない（または弱い値で突破される）ため起動を止める。
+  if (requireCloudflare && cloudflareOriginSecret.length < 32) {
+    throw new Error(
+      "REQUIRE_CLOUDFLARE=true requires CLOUDFLARE_ORIGIN_SECRET (32+ chars) " +
+        "matching the Cloudflare Transform Rule header.",
+    );
+  }
   // Entra ID + session secret are only required for the OIDC flow.
   const entraRequired = authMode !== "disabled";
   const cfg: AppConfig = {
     port: int("PORT", 3000),
     nodeEnv,
     publicBaseUrl,
-    requireCloudflare: optional("REQUIRE_CLOUDFLARE", "false") === "true",
+    requireCloudflare,
+    cloudflareOriginSecret,
     authMode,
     localDevUser: {
       name: optional("LOCAL_DEV_USER_NAME", "Local Developer"),

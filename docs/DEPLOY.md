@@ -455,13 +455,24 @@ Entra ID のアプリ登録に `https://config.ccf.work/auth/callback` を追加
 
 ### 6. fly.dev 直アクセスの拒否
 
-動作確認後、Cloudflare を経由しないアクセス（`https://config-manager.fly.dev/` 直など）を拒否します。
+Cloudflare を経由しないアクセス（`https://config-manager.fly.dev/` 直など）を拒否します。接続元が Cloudflare の IP かどうかだけでは、第三者が自分の Cloudflare ゾーンや Workers から fly.dev へ中継した場合に区別できないため、**自ゾーンだけが付与する秘密ヘッダ** も照合します。
 
-```bash
-fly secrets set --app config-manager REQUIRE_CLOUDFLARE=true
-```
+1. 秘密値を生成し、fly.io に設定する（この時点ではまだ有効化しない）
+   ```bash
+   SECRET="$(openssl rand -hex 32)"
+   fly secrets set --app config-manager --stage CLOUDFLARE_ORIGIN_SECRET="$SECRET"
+   echo "$SECRET"   # Cloudflare に貼り付けたら端末履歴から消す
+   ```
+2. Cloudflare の「ルール」→「Transform Rules」→「リクエストヘッダーの変更」でルールを作成
+   - 条件: `(http.host eq "config.ccf.work")`
+   - 操作: 静的に **設定** — ヘッダ名 `x-origin-verify`、値は手順 1 の秘密値
+3. 有効化する（シークレットの反映と同時に再起動される）
+   ```bash
+   fly secrets set --app config-manager REQUIRE_CLOUDFLARE=true
+   ```
+4. 確認: `curl https://config-manager.fly.dev/` が 403、`/healthz` は `ok`、ブラウザで `https://config.ccf.work/` が使えること
 
-BFF は `Fly-Client-IP`（fly.io のプロキシが付与し偽装不可）が Cloudflare の IP レンジ外のリクエストを 403 にします（`apps/bff/src/security.ts` の `createCloudflareOnlyGuard`）。`/healthz` はデプロイ後の確認・fly のヘルスチェック用に対象外です。切り戻す場合は `REQUIRE_CLOUDFLARE=false` を設定します。
+BFF は「`Fly-Client-IP`（fly.io のプロキシが付与し偽装不可）が Cloudflare レンジ内」かつ「`x-origin-verify` が秘密値と一致」の両方を満たさないリクエストを 403 にします（`apps/bff/src/security.ts` の `createCloudflareOnlyGuard`）。`/healthz` は対象外です。`REQUIRE_CLOUDFLARE=true` で秘密値が未設定・32 文字未満なら起動に失敗します。切り戻す場合は `REQUIRE_CLOUDFLARE=false` を設定します。秘密値をローテーションする場合は、Transform Rule と `CLOUDFLARE_ORIGIN_SECRET` を続けて更新します（更新の間は 403 になるため、利用の少ない時間帯に行う）。
 
 ### 7. クライアント IP の扱い
 
