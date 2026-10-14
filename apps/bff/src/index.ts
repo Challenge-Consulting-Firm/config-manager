@@ -33,6 +33,7 @@ import { createAuthLogoutApp } from "./authLogout.js";
 import { api, type AppEnv } from "./api.js";
 import { createHelperCredentialsApp } from "./helperCredentials.js";
 import {
+  createCloudflareOnlyGuard,
   createCsrfOriginGuard,
   securityHeaders,
 } from "./security.js";
@@ -79,6 +80,11 @@ const app = new Hono<AppEnv>();
 // query string を値ごと出す標準 logger は使わない。OIDC の code / state や
 // 検索語・顧客名が fly のログに残るため（Issue #78）。
 app.use(accessLogger());
+// fly.dev 直アクセスを拒否し、公開経路を Cloudflare（WAF・Bot 対策）に限定する。
+app.use("*", createCloudflareOnlyGuard({
+    enabled: cfg.requireCloudflare,
+    originSecret: cfg.cloudflareOriginSecret,
+  }));
 // Cap request bodies at 6 MB so a 5 MB config upload (plus JSON/headers)
 // is accepted but runaway payloads are rejected early with HTTP 413.
 app.use("*", bodyLimit({ maxSize: 6 * 1024 * 1024 }));

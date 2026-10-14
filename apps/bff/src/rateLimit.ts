@@ -6,6 +6,7 @@
  * best-effort guard against accidental or abusive bursts on expensive routes.
  */
 
+import { BlockList, isIP } from "node:net";
 import type { Context, MiddlewareHandler } from "hono";
 import type { AppEnv } from "./api.js";
 
@@ -32,16 +33,79 @@ export interface RateLimitOptions {
 }
 
 /**
+ * Cloudflare の公開エッジ IP レンジ（https://www.cloudflare.com/ips/）。
+ * Cloudflare プロキシ経由（config.ccf.work）では fly.io から見た接続元が
+ * Cloudflare エッジになるため、そのままでは全利用者が同じバケットに入る。
+ * 接続元がこのレンジのときだけ CF-Connecting-IP を信用し、fly.dev へ直接
+ * 来たリクエストがヘッダを偽装してバケットを散らすことを防ぐ。
+ * レンジが更新された場合は上記 URL に合わせて追随すること。
+ */
+const CLOUDFLARE_IPV4 = [
+  "173.245.48.0/20",
+  "103.21.244.0/22",
+  "103.22.200.0/22",
+  "103.31.4.0/22",
+  "141.101.64.0/18",
+  "108.162.192.0/18",
+  "190.93.240.0/20",
+  "188.114.96.0/20",
+  "197.234.240.0/22",
+  "198.41.128.0/17",
+  "162.158.0.0/15",
+  "104.16.0.0/13",
+  "104.24.0.0/14",
+  "172.64.0.0/13",
+  "131.0.72.0/22",
+];
+const CLOUDFLARE_IPV6 = [
+  "2400:cb00::/32",
+  "2606:4700::/32",
+  "2803:f800::/32",
+  "2405:b500::/32",
+  "2405:8100::/32",
+  "2a06:98c0::/29",
+  "2c0f:f248::/32",
+];
+
+const cloudflareRanges = (() => {
+  const list = new BlockList();
+  for (const cidr of CLOUDFLARE_IPV4) {
+    const [net, prefix] = cidr.split("/");
+    list.addSubnet(net!, Number(prefix), "ipv4");
+  }
+  for (const cidr of CLOUDFLARE_IPV6) {
+    const [net, prefix] = cidr.split("/");
+    list.addSubnet(net!, Number(prefix), "ipv6");
+  }
+  return list;
+})();
+
+export function isCloudflareIp(ip: string): boolean {
+  const family = isIP(ip);
+  if (family === 4) return cloudflareRanges.check(ip, "ipv4");
+  if (family === 6) return cloudflareRanges.check(ip, "ipv6");
+  return false;
+}
+
+/**
  * Best-effort client IP.
  *
  * `Fly-Client-IP` is written by the fly.io proxy and cannot be forged by the
- * client, so it wins. The `X-Forwarded-For` fallback takes the RIGHTMOST entry:
- * a client can prepend arbitrary values, but the closest trusted proxy appends
- * the real address last.
+ * client, so it wins — unless it is a Cloudflare edge, in which case the real
+ * client is in `CF-Connecting-IP` (set by Cloudflare, trusted only then).
+ * The `X-Forwarded-For` fallback takes the RIGHTMOST entry: a client can
+ * prepend arbitrary values, but the closest trusted proxy appends the real
+ * address last.
  */
 export function clientIp(c: Context): string {
   const fly = c.req.header("fly-client-ip")?.trim();
-  if (fly) return fly;
+  if (fly) {
+    if (isCloudflareIp(fly)) {
+      const cf = c.req.header("cf-connecting-ip")?.trim();
+      if (cf && isIP(cf)) return cf;
+    }
+    return fly;
+  }
   const xff = c.req.header("x-forwarded-for");
   if (xff) {
     const parts = xff.split(",").map((p) => p.trim()).filter(Boolean);

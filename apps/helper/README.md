@@ -69,7 +69,7 @@ CGO_ENABLED=0 go build -o config-manager-helper ./cmd/helper
 # HELPER_VERSION と HELPER_ALLOWED_ORIGIN を ldflags で注入
 CGO_ENABLED=0 go build -ldflags "-s -w \
   -X github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server.Version=1.2.3 \
-  -X github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server.BuildTimeAllowedOrigin=https://config-manager.fly.dev" \
+  -X github.com/Challenge-Consulting-Firm/config-manager/apps/helper/internal/server.BuildTimeAllowedOrigin=https://config.ccf.work" \
   -o config-manager-helper ./cmd/helper
 ```
 
@@ -78,14 +78,14 @@ CGO_ENABLED=0 go build -ldflags "-s -w \
 | 変数 | 役割 | 未注入時 |
 | --- | --- | --- |
 | `server.Version` | 表示バージョン | `0.0.0-dev` |
-| `server.BuildTimeAllowedOrigin` | 本番 SPA の origin | 空（開発用 localhost のみ許可） |
+| `server.BuildTimeAllowedOrigin` | 本番 SPA の origin（カンマ区切りで複数可） | 空（開発用 localhost のみ許可） |
 
 `scripts/build-helper.sh` を使う場合は、環境変数で制御できます:
 
 ```bash
 # build-helper.sh は VERSION を引数または git tag から取得し、
 # HELPER_ALLOWED_ORIGIN 環境変数があれば BuildTimeAllowedOrigin へ注入します。
-HELPER_ALLOWED_ORIGIN=https://config-manager.fly.dev ./scripts/build-helper.sh 1.2.3
+HELPER_ALLOWED_ORIGIN=https://config.ccf.work,https://config-manager.fly.dev ./scripts/build-helper.sh 1.2.3
 ```
 
 > **注意**: `scripts/build-helper.sh` は `apps/helper/` 配下ではなく `scripts/` 配下にあるため、
@@ -171,6 +171,7 @@ Windows はダブルクリック、macOS / Linux は端末から起動します�
     - http://127.0.0.1:3000
     - http://localhost:5173
     - http://127.0.0.1:5173
+    - https://config.ccf.work
     - https://config-manager.fly.dev
 --------------------------------------------------------
   【セキュリティ注意】

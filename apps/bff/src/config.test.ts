@@ -74,3 +74,22 @@ test("グループ ID はカンマ区切りで前後空白を落として読み�
     },
   );
 });
+
+test("REQUIRE_CLOUDFLARE=true で秘密値が未設定・短ければ起動に失敗する", () => {
+  withEnv({ REQUIRE_CLOUDFLARE: "true" }, () => {
+    assert.throws(() => loadConfig(), /CLOUDFLARE_ORIGIN_SECRET/);
+  });
+  withEnv({ REQUIRE_CLOUDFLARE: "true", CLOUDFLARE_ORIGIN_SECRET: "short" }, () => {
+    assert.throws(() => loadConfig(), /CLOUDFLARE_ORIGIN_SECRET/);
+  });
+});
+
+test("REQUIRE_CLOUDFLARE=true で十分な長さの秘密値があれば起動できる", () => {
+  withEnv(
+    { REQUIRE_CLOUDFLARE: "true", CLOUDFLARE_ORIGIN_SECRET: "x".repeat(32) },
+    () => {
+      const cfg = loadConfig();
+      assert.equal(cfg.requireCloudflare, true);
+    },
+  );
+});

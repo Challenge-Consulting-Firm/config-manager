@@ -7,8 +7,10 @@
  * keep the entrypoint focused on routing.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Context, Next } from "hono";
 import { HELPER_PORT_CANDIDATES } from "@config-manager/shared";
+import { isCloudflareIp } from "./rateLimit.js";
 
 /** Methods that mutate server state and therefore require CSRF defenses. */
 const STATE_CHANGING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -201,4 +203,45 @@ export async function securityHeaders(c: Context, next: Next) {
   if (proto === "https") {
     h.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
+}
+
+/** Cloudflare の Transform Rule で付与させる、origin 検証用ヘッダ名。 */
+export const ORIGIN_VERIFY_HEADER = "x-origin-verify";
+
+function digest(value: string): Buffer {
+  return createHash("sha256").update(value).digest();
+}
+
+/**
+ * Cloudflare プロキシ（config.ccf.work）を経由しないリクエストを拒否する。
+ *
+ * fly.dev のホスト名は fly.io 側で無効化できないため、アプリで弾く。
+ * 接続元が Cloudflare エッジかどうか（`Fly-Client-IP` は fly.io のプロキシが
+ * 書き込むためクライアントが偽装できない）だけでは不十分で、第三者が自分の
+ * Cloudflare ゾーンや Workers から fly.dev へ中継すると同じ条件を満たし、
+ * こちらのゾーンの WAF / Bot 対策を迂回できてしまう。そこで自ゾーンの
+ * Transform Rule でのみ付与する秘密ヘッダも必須にする。
+ * `/healthz` はデプロイ後の疎通確認と fly のヘルスチェックが fly.dev / 内部から
+ * 叩くため対象外にする。
+ */
+export function createCloudflareOnlyGuard(opts: {
+  enabled: boolean;
+  originSecret: string;
+}) {
+  // 長さの違いで比較時間が変わらないよう、ハッシュ同士を定数時間比較する。
+  const expected = digest(opts.originSecret);
+  return async (c: Context, next: Next) => {
+    if (!opts.enabled || c.req.path === "/healthz") return next();
+    const fly = c.req.header("fly-client-ip")?.trim();
+    const supplied = c.req.header(ORIGIN_VERIFY_HEADER) ?? "";
+    if (
+      fly &&
+      isCloudflareIp(fly) &&
+      supplied !== "" &&
+      timingSafeEqual(digest(supplied), expected)
+    ) {
+      return next();
+    }
+    return c.text("Forbidden", 403);
+  };
 }

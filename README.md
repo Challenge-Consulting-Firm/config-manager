@@ -13,6 +13,9 @@ NW 機器のコンフィグを世代管理するシステム。
 Browser ──(OIDC)──> Entra ID
    │  (sealed cookie session)
    ▼
+Cloudflare (proxy, https://config.ccf.work)
+   │
+   ▼
 BFF on fly.io (Hono)  ──(API token)──>  Kintone
    │
    └── serves React SPA build assets
@@ -216,6 +219,7 @@ cp .env.example .env
 | --- | --- |
 | `AUTH_MODE` | `disabled` で Entra ID をバイパス（**ローカル検証専用**）。`NODE_ENV=production` では起動失敗する。本番は必ず `oidc` |
 | `LOCAL_DEV_USER_NAME` / `LOCAL_DEV_USER_EMAIL` | `AUTH_MODE=disabled` 時に記録されるダミー作業者 |
+| `REQUIRE_CLOUDFLARE` | `true` で Cloudflare プロキシ非経由（fly.dev 直など）のリクエストを 403 にする（`/healthz` は除く）。本番のみ有効化。既定 `false`。有効時は `CLOUDFLARE_ORIGIN_SECRET`（32 文字以上・Cloudflare の Transform Rule で `x-origin-verify` に付与する値）が必須 |
 | `KINTONE_DOMAIN` | `xxx.cybozu.com` |
 | `KINTONE_CONFIG_APP_ID` / `KINTONE_CONFIG_APP_TOKEN` | コンフィグ管理アプリ |
 | `KINTONE_AUDIT_APP_ID` / `KINTONE_AUDIT_APP_TOKEN` | 作業履歴アプリ |
@@ -252,7 +256,7 @@ pnpm dev   # BFF(3000) + Vite(5173) が並列起動
 ### D. Entra ID 側のアプリ登録（本番認証時に実施）
 
 1. Entra ID > App registrations > New registration。
-2. リダイレクト URI: Web プラットフォームで `http://localhost:3000/auth/callback`（開発）と `https://<your-fly-app>.fly.dev/auth/callback`（本番）を追加。
+2. リダイレクト URI: Web プラットフォームで `http://localhost:3000/auth/callback`（開発）と `https://config.ccf.work/auth/callback`（本番・Cloudflare 経由）を追加。
 3. Client credentials からクライアントシークレットを生成 → `ENTRA_CLIENT_SECRET`。
 4. API のアクセス許可: `Microsoft Graph` の `GroupMember.Read.All`（グループ制限をする場合）、`openid`/`profile`/`email`/`offline_access`。
 5. （任意）特定グループに制限する場合、グループの Object ID を `ENTRA_REQUIRED_GROUP_IDS` に。
@@ -269,13 +273,13 @@ fly launch --no-deploy --name config-manager
 # 2. シークレットを個別設定 (詳細は docs/DEPLOY.md)
 fly secrets set --app config-manager AUTH_MODE=oidc
 fly secrets set --app config-manager NODE_ENV=production
-fly secrets set --app config-manager PUBLIC_BASE_URL=https://config-manager.fly.dev
+fly secrets set --app config-manager PUBLIC_BASE_URL=https://config.ccf.work
 fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
 fly secrets set --app config-manager CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)  # Meraki 接続情報利用時
 fly secrets set --app config-manager ENTRA_TENANT_ID=...
 fly secrets set --app config-manager ENTRA_CLIENT_ID=...
 fly secrets set --app config-manager ENTRA_CLIENT_SECRET=...
-fly secrets set --app config-manager ENTRA_REDIRECT_URI=https://config-manager.fly.dev/auth/callback
+fly secrets set --app config-manager ENTRA_REDIRECT_URI=https://config.ccf.work/auth/callback
 fly secrets set --app config-manager KINTONE_DOMAIN=...
 fly secrets set --app config-manager KINTONE_CONFIG_APP_ID=...
 fly secrets set --app config-manager KINTONE_CONFIG_APP_TOKEN=...
@@ -296,7 +300,7 @@ bash scripts/fly-deploy.sh
 
 > ⚠️ **`.env` からの全体一括同期 (旧 `--sync-secrets`) は廃止しました。** ローカル開発用の `.env` (`AUTH_MODE=disabled` 等) で本番シークレットを上書きしてしまう事故を防ぐため、シークレットは必ず個別に設定してください。
 
-> `PUBLIC_BASE_URL` と `ENTRA_REDIRECT_URI` は fly.io の HTTPS URL に合わせてください。これらは Entra ID アプリ登録のリダイレクト URI とも一致する必要があります。ロールバック時の注意・トラブルシューティング・CI/CD 連携は `docs/DEPLOY.md` を参照してください。
+> `PUBLIC_BASE_URL` と `ENTRA_REDIRECT_URI` は公開 URL（Cloudflare 経由の `https://config.ccf.work`）に合わせてください。Cloudflare 側の設定は `docs/DEPLOY.md` の「Cloudflare 経由の公開」を参照してください。これらは Entra ID アプリ登録のリダイレクト URI とも一致する必要があります。ロールバック時の注意・トラブルシューティング・CI/CD 連携は `docs/DEPLOY.md` を参照してください。
 
 ### F. Meraki 連携（省略可）
 
