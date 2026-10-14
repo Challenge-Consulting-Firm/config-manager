@@ -439,6 +439,12 @@ Cloudflare プロキシ有効時は fly.io の HTTP/TLS-ALPN 検証が通らな�
   - 式: `(http.host eq "config.ccf.work" and http.request.uri.path eq "/helper/credentials/redeem" and http.request.method eq "POST")`
   - アクション: スキップ → Super Bot Fight Mode ルールのみ（WAF 管理ルールは適用したまま）
   - このエンドポイントは 1 回限り・60 秒失効のトークンを要求し、BFF 側でも IP 単位のレート制限をかけている
+- 「セキュリティ」→「セキュリティ ルール」で、config 向けに以下も設定している。いずれも plan / recruit / marumie と同じ ccf.work ゾーンの設定で、**レート制限ルールは Pro プランの上限（2 件）を使い切っているため既存ルールに相乗りしている**。式を編集するときは他サービスの条件を消さないこと
+  - カスタムルール `config 国外ブロック`: `(http.host eq "config.ccf.work" and ip.src.country ne "JP")` → ブロック。**海外からはブラウザ・ヘルパーとも使えない**（redeem のスキップルールは Bot 判定だけを外すため、これも適用される）
+  - カスタムルール `使わないメソッドの拒否`: 対象ホストに `config.ccf.work` を含め、GET / HEAD / POST / PUT / PATCH / DELETE / OPTIONS 以外をブロック
+  - レート制限ルール「同じ IP から 10 秒に 20 回を超えたら、10 秒間ブロック」: config は `/auth/` と `/helper/` で始まるパスが対象
+  - レート制限ルール「同じ IP から 1 分に 300 回を超えたら、1 分間ブロック」: config は `/api/` で始まるパスが対象。社内 NAT など同一 IP の利用者が増えて誤ブロックが出たら、このルールの回数を見直す
+  - これらに該当すると Cloudflare が 403 / 429 を返し、BFF のログには残らない。BFF 側のレート制限（`429` + `Retry-After`）と切り分けるには「セキュリティ」→「Analytics」のイベントを確認する
 
 ### 4. シークレットと Entra ID
 
