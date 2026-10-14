@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 30
     environment:
       name: production
-      url: https://config-manager.fly.dev
+      url: https://config.ccf.work
     steps:
       - name: Validate the verified commit
         id: commit

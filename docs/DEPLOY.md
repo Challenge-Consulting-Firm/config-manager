@@ -14,6 +14,7 @@
 - [Kintone API トークンの権限設計](#kintone-api-トークンの権限設計)
 - [Kintone API トークンのローテーション](#kintone-api-トークンのローテーション)
 - [ロールバック](#ロールバック)
+- [Cloudflare 経由の公開 (config.ccf.work)](#cloudflare-経由の公開-configccfwork)
 - [確認・監視](#確認監視)
 - [トラブルシューティング](#トラブルシューティング)
 - [CI/CD 連携のヒント](#cicd-連携のヒント)
@@ -77,6 +78,9 @@ cp .env.example .env
 Browser ──(OIDC)──> Entra ID
    │  (sealed cookie session)
    ▼
+Cloudflare (proxy, https://config.ccf.work)
+   │
+   ▼
 BFF on fly.io (Hono, single machine)  ──(API token)──>  Kintone
    │                                                        ▲
    ├── serves React SPA build assets                        │
@@ -86,6 +90,7 @@ BFF on fly.io (Hono, single machine)  ──(API token)──>  Kintone
 - **単一マシン** で BFF + SPA 配信を兼ねます (`fly.toml` の `min_machines_running = 0` により、アイドル時は自動停止します)。
 - **シークレット** は fly.io の Secrets 機能で保持し、コンテナ起動時に環境変数として注入されます。`.env` ファイルはデプロイされません。
 - **永続ストレージ** は持ちません。すべての状態は Kintone に保存されます。
+- **公開 URL** は Cloudflare プロキシ経由の `https://config.ccf.work` です。fly.io は origin として動き、`config-manager.fly.dev` はヘルスチェック等の運用用途に残ります（設定は [Cloudflare 経由の公開](#cloudflare-経由の公開-configccfwork) を参照）。
 
 ---
 
@@ -112,7 +117,7 @@ fly launch --no-deploy --name config-manager
 本番 URL を Entra ID のアプリ登録に追加します。
 
 ```
-https://<app-name>.fly.dev/auth/callback
+https://config.ccf.work/auth/callback
 ```
 
 - Azure Portal > App registrations > 認証 > プラットフォーム > Web
@@ -124,13 +129,13 @@ https://<app-name>.fly.dev/auth/callback
 
 `.env` はローカル検証用 (`AUTH_MODE=disabled` 等) であり、本番シークレットとは値が異なるフィールドがあるため、一括同期すると本番認証が壊れる事故に繋がります。
 
-以下は個別設定の例 (`https://config-manager.fly.dev` の部分は実際のアプリ URL に置き換えてください):
+以下は個別設定の例 (`https://config.ccf.work` は Cloudflare 経由の公開 URL。別ドメインで運用する場合は置き換えてください):
 
 ```bash
 # 本番固有の設定 (ローカル .env とは異なる必須の 3 つ)
 fly secrets set --app config-manager AUTH_MODE=oidc
 fly secrets set --app config-manager NODE_ENV=production
-fly secrets set --app config-manager PUBLIC_BASE_URL=https://config-manager.fly.dev
+fly secrets set --app config-manager PUBLIC_BASE_URL=https://config.ccf.work
 fly secrets set --app config-manager SESSION_SECRET=$(openssl rand -base64 32)
 # Meraki 接続情報アプリを使う場合は API キー暗号化鍵も設定（推奨）
 fly secrets set --app config-manager CREDENTIALS_ENCRYPTION_KEY=$(openssl rand -base64 32)
@@ -144,7 +149,7 @@ fly secrets set --app config-manager ENTRA_GROUP_VIEWER_IDS=00000000-0000-0000-0
 fly secrets set --app config-manager ENTRA_TENANT_ID=00000000-0000-0000-0000-000000000000
 fly secrets set --app config-manager ENTRA_CLIENT_ID=00000000-0000-0000-0000-000000000000
 fly secrets set --app config-manager ENTRA_CLIENT_SECRET=replace-with-your-secret-value
-fly secrets set --app config-manager ENTRA_REDIRECT_URI=https://config-manager.fly.dev/auth/callback
+fly secrets set --app config-manager ENTRA_REDIRECT_URI=https://config.ccf.work/auth/callback
 
 # Kintone
 fly secrets set --app config-manager KINTONE_DOMAIN=example.cybozu.com
@@ -177,7 +182,7 @@ curl https://config-manager.fly.dev/healthz
 # -> ok
 ```
 
-ブラウザで `https://config-manager.fly.dev/` を開き、Entra ID ログイン → 機器一覧画面が表示されれば成功です。
+ブラウザで `https://config.ccf.work/` を開き（Cloudflare 設定は [Cloudflare 経由の公開](#cloudflare-経由の公開-configccfwork) を先に済ませること）、Entra ID ログイン → 機器一覧画面が表示されれば成功です。
 
 ---
 
@@ -402,6 +407,68 @@ fly releases --app config-manager --image
 
 ---
 
+## Cloudflare 経由の公開 (config.ccf.work)
+
+本番は Cloudflare のプロキシ（オレンジ雲）を前段に置き、`https://config.ccf.work` で公開します。fly.io は origin のまま変わりません。
+
+### 1. fly.io にカスタムドメインの証明書を追加
+
+```bash
+fly certs add config.ccf.work --app config-manager
+fly certs show config.ccf.work --app config-manager
+```
+
+Cloudflare プロキシ有効時は fly.io の HTTP/TLS-ALPN 検証が通らないため、`fly certs setup config.ccf.work --app config-manager` に表示される **`_acme-challenge.config.ccf.work` の CNAME** を Cloudflare DNS に追加して DNS-01 で発行させます（このレコードは **DNS only / グレー雲**）。
+
+### 2. Cloudflare DNS
+
+| Type | Name | Target | Proxy |
+| --- | --- | --- | --- |
+| CNAME | `config` | `fly certs setup` の CNAME 値（例: `0pz82rr.config-manager.fly.dev`） | Proxied（オレンジ雲） |
+| CNAME | `_acme-challenge.config` | `fly certs setup` の ACME 値（例: `config.ccf.work.0pz82rr.flydns.net`） | DNS only |
+| TXT | `_fly-ownership.config` | `fly certs setup` の Ownership 値（例: `app-0pz82rr`） | DNS only |
+
+### 3. Cloudflare の SSL/TLS 設定
+
+- SSL/TLS 暗号化モード: **Full** 以上（ゾーン設定。Flexible は fly.io の `force_https` とリダイレクトループになるため不可）
+- Always Use HTTPS: 有効
+- `/auth/*` と `/api/*` はキャッシュさせないこと。既定のキャッシュ設定（HTML/JSON は対象外）なら追加設定は不要。Cache Everything 系のルールを作る場合は除外する
+- ccf.work ゾーンは Super Bot Fight Mode で「確実に自動化」された通信をブロックしている。curl 等のスクリプトや外形監視は 403 になるため、監視は `config-manager.fly.dev/healthz` に向けること（`deploy.yml` も fly.dev を使用）
+- ヘルパー（Go）が BFF へ送る `POST /helper/credentials/redeem` も Bot 判定でブロックされるため、カスタムルールでスキップしている:
+  - ルール名: `config helper redeem bot skip`
+  - 式: `(http.host eq "config.ccf.work" and http.request.uri.path eq "/helper/credentials/redeem" and http.request.method eq "POST")`
+  - アクション: スキップ → Super Bot Fight Mode ルールのみ（WAF 管理ルールは適用したまま）
+  - このエンドポイントは 1 回限り・60 秒失効のトークンを要求し、BFF 側でも IP 単位のレート制限をかけている
+
+### 4. シークレットと Entra ID
+
+```bash
+fly secrets set --app config-manager PUBLIC_BASE_URL=https://config.ccf.work
+fly secrets set --app config-manager ENTRA_REDIRECT_URI=https://config.ccf.work/auth/callback
+```
+
+Entra ID のアプリ登録に `https://config.ccf.work/auth/callback` を追加します。旧 `https://config-manager.fly.dev/auth/callback` は移行確認後に削除して構いません。`PUBLIC_BASE_URL` を切り替えると CSRF の Origin 検証も新 URL 基準になるため、**fly.dev 直アクセスでのログイン・更新操作はできなくなります**（ヘルスチェックは引き続き可能）。
+
+### 5. ヘルパー
+
+ヘルパーの許可 Origin はビルド時に埋め込まれます。`release-helper.yml` は `https://config.ccf.work,https://config-manager.fly.dev` を埋め込むため、**新しいヘルパーをリリースし利用者に更新してもらう** 必要があります。旧バイナリのまま使う場合は `--allow-origin https://config.ccf.work` を付けて起動してください。
+
+### 6. fly.dev 直アクセスの拒否
+
+動作確認後、Cloudflare を経由しないアクセス（`https://config-manager.fly.dev/` 直など）を拒否します。
+
+```bash
+fly secrets set --app config-manager REQUIRE_CLOUDFLARE=true
+```
+
+BFF は `Fly-Client-IP`（fly.io のプロキシが付与し偽装不可）が Cloudflare の IP レンジ外のリクエストを 403 にします（`apps/bff/src/security.ts` の `createCloudflareOnlyGuard`）。`/healthz` はデプロイ後の確認・fly のヘルスチェック用に対象外です。切り戻す場合は `REQUIRE_CLOUDFLARE=false` を設定します。
+
+### 7. クライアント IP の扱い
+
+Cloudflare 経由では fly.io から見た接続元（`Fly-Client-IP`）が Cloudflare エッジになります。BFF のレート制限は、`Fly-Client-IP` が [Cloudflare の公開 IP レンジ](https://www.cloudflare.com/ips/) に含まれる場合に限り `CF-Connecting-IP` を利用者 IP として使います（`apps/bff/src/rateLimit.ts`）。Cloudflare がレンジを変更した場合は同ファイルの一覧を更新してください。
+
+---
+
 ## 確認・監視
 
 ### マシン状態
@@ -462,7 +529,7 @@ fly machine status <machine-id>
 
 - **原因**: `ENTRA_REDIRECT_URI` と Entra ID アプリ登録の URI が不一致、または `SESSION_SECRET` 未設定
 - **対処**:
-  - `ENTRA_REDIRECT_URI` が `https://<app>.fly.dev/auth/callback` と完全一致しているか確認
+  - `ENTRA_REDIRECT_URI` が `https://config.ccf.work/auth/callback` と完全一致しているか確認
   - Entra ID 側のリダイレクト URI に fly.io の URL が追加されているか確認 (README D)
   - `SESSION_SECRET` が 32 文字以上のランダム値か確認
   - ログに `[session] rejected cookie with schema version ...` が出ている場合は、旧

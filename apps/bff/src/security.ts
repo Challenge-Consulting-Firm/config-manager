@@ -9,6 +9,7 @@
 
 import type { Context, Next } from "hono";
 import { HELPER_PORT_CANDIDATES } from "@config-manager/shared";
+import { isCloudflareIp } from "./rateLimit.js";
 
 /** Methods that mutate server state and therefore require CSRF defenses. */
 const STATE_CHANGING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -201,4 +202,22 @@ export async function securityHeaders(c: Context, next: Next) {
   if (proto === "https") {
     h.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
+}
+
+/**
+ * Cloudflare プロキシ（config.ccf.work）を経由しないリクエストを拒否する。
+ *
+ * fly.dev のホスト名は fly.io 側で無効化できないため、アプリで弾く。判定は
+ * fly.io のプロキシが書き込む `Fly-Client-IP`（クライアントが偽装できない）が
+ * Cloudflare エッジのレンジかどうかで行う。Host ヘッダは偽装できるので使わない。
+ * `/healthz` はデプロイ後の疎通確認と fly のヘルスチェックが fly.dev / 内部から
+ * 叩くため対象外にする。
+ */
+export function createCloudflareOnlyGuard(opts: { enabled: boolean }) {
+  return async (c: Context, next: Next) => {
+    if (!opts.enabled || c.req.path === "/healthz") return next();
+    const fly = c.req.header("fly-client-ip")?.trim();
+    if (fly && isCloudflareIp(fly)) return next();
+    return c.text("Forbidden", 403);
+  };
 }

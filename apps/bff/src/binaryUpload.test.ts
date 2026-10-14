@@ -23,6 +23,7 @@ const cfg = {
   port: 3000,
   nodeEnv: "test",
   publicBaseUrl: "http://localhost:3000",
+  requireCloudflare: false,
   authMode: "oidc",
   localDevUser: { name: "Test", email: "test@example.com" },
   entra: {

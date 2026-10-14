@@ -35,7 +35,7 @@ import (
 // 未注入時は "0.0.0-dev"。build-helper.sh で -X server.Version=$VERSION で上書きする。
 var Version = "0.0.0-dev"
 
-// BuildTimeAllowedOrigin はビルド時に ldflags で注入する本番 SPA の origin。
+// BuildTimeAllowedOrigin はビルド時に ldflags で注入する本番 SPA の origin（カンマ区切りで複数可）。
 // 配布バイナリ起動時にユーザー PC で環境変数が設定されている保証がないため、
 // 本番 origin はバイナリへ埋め込む。未注入時は空（開発用 localhost のみ許可）。
 var BuildTimeAllowedOrigin = ""
@@ -668,9 +668,12 @@ func DefaultAllowedOrigins() []string {
 		"http://localhost:5173",
 		"http://127.0.0.1:5173",
 	}
-	// ビルド時注入された本番 origin。
-	if bt := strings.TrimSpace(BuildTimeAllowedOrigin); bt != "" {
-		origins = append(origins, originOf(bt))
+	// ビルド時注入された本番 origin。ドメイン移行期間に旧 URL と新 URL の
+	// 両方から呼べるよう、カンマ区切りで複数指定できる。
+	for _, bt := range strings.Split(BuildTimeAllowedOrigin, ",") {
+		if bt = strings.TrimSpace(bt); bt != "" {
+			origins = append(origins, originOf(bt))
+		}
 	}
 	// 起動時の環境変数（上書き・追加用）。
 	if pub := strings.TrimSpace(os.Getenv("PUBLIC_BASE_URL")); pub != "" {

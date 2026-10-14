@@ -43,7 +43,8 @@ concurrency:
 
 env:
   # 配布バイナリに埋め込む本番 SPA の origin（ヘルパーの Origin allowlist）。
-  HELPER_ALLOWED_ORIGIN: https://config-manager.fly.dev
+  # 本番は Cloudflare 経由の config.ccf.work。移行期間中は fly.dev も許可する。
+  HELPER_ALLOWED_ORIGIN: https://config.ccf.work,https://config-manager.fly.dev
 
 jobs:
   version:

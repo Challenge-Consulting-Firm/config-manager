@@ -37,6 +37,8 @@ export interface AppConfig {
   port: number;
   nodeEnv: string;
   publicBaseUrl: string;
+  /** true のとき Cloudflare プロキシを経由しないリクエスト（fly.dev 直など）を拒否する。 */
+  requireCloudflare: boolean;
   /** "oidc" uses Entra ID (production). "disabled" skips auth and injects a
    *  fixed local user — for local validation only. */
   authMode: AuthMode;
@@ -126,6 +128,7 @@ export function loadConfig(): AppConfig {
     port: int("PORT", 3000),
     nodeEnv,
     publicBaseUrl,
+    requireCloudflare: optional("REQUIRE_CLOUDFLARE", "false") === "true",
     authMode,
     localDevUser: {
       name: optional("LOCAL_DEV_USER_NAME", "Local Developer"),
