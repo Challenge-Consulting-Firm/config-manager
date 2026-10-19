@@ -11,8 +11,8 @@
   },
   "dependencies": {
     "@config-manager/shared": "workspace:*",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "react-dropzone": "^20.1.3",
     "react-router-dom": "^7.18.4",
     "xlsx": "^0.18.5"
