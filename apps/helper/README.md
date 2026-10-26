@@ -38,7 +38,7 @@ NW 機器から Telnet または SSH でコンフィグを自動取得する **G
 
 ### 前提
 
-- Go 1.25 以上（`golang.org/x/crypto` の要求バージョン。CI も 1.25 を使用）
+- Go 1.26 以上（`golang.org/x/crypto` の要求バージョン）。標準ライブラリの脆弱性修正を取り込むため、1.26 系の最新パッチ版を使うこと（CI も `check-latest` で最新パッチ版を使用）
 - 外部依存は `golang.org/x/text`（SJIS 変換用）と `golang.org/x/crypto`（SSH 用）
 
 ### 初回セットアップ

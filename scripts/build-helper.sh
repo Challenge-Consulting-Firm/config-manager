@@ -18,7 +18,8 @@
 #   HELPER_OUT_DIR=/tmp/helper ./scripts/build-helper.sh   # 出力先変更
 #
 # 前提:
-#   - Go 1.21+ がインストールされていること
+#   - Go 1.26+ がインストールされていること（apps/helper/go.mod の go ディレクティブ。
+#     標準ライブラリの脆弱性修正を含めるため最新パッチ版を推奨）
 #   - macOS universal 生成には lipo（macOS 標準）が必要。Linux 環境で lipo が
 #     無い場合は darwin-arm64 / darwin-amd64 を個別に出力して終了する。
 #

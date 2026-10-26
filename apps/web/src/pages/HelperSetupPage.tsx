@@ -389,10 +389,27 @@ export function HelperSetupPage() {
             )}
           </div>
         ) : (
-          <p className="text-sm text-slate-500">
-            配布物がまだ配置されていません（latest.json が未配信、または OS を判定できませんでした）。
-            管理者に配布状況をご確認ください。
-          </p>
+          <div className="flex flex-col gap-3">
+            <p className="text-sm text-slate-500">
+              {manifest?.note ??
+                "配布物がまだ配置されていません（latest.json が未配信、または OS を判定できませんでした）。"}
+              管理者に配布状況をご確認ください。
+            </p>
+            {/* 公開 URL の移行（Issue #127/#128）前に配った旧版は許可 Origin に
+                現在の URL を含まず、そのままでは検出できない。新版の配布までの
+                つなぎとして、起動時に Origin を追加する方法を案内する。 */}
+            <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+              <p className="font-semibold">配布済みのヘルパー（v0.4.0 以前）をお持ちの場合:</p>
+              <p className="mt-1">
+                この URL からの接続を許可するオプションを付けて起動してください。
+              </p>
+              <pre className="mt-1 overflow-x-auto rounded bg-slate-800 px-2 py-1 text-slate-100">
+                {isMac
+                  ? `./config-manager-helper --allow-origin ${window.location.origin}`
+                  : `.\\config-manager-helper.exe --allow-origin ${window.location.origin}`}
+              </pre>
+            </div>
+          </div>
         )}
       </section>
 

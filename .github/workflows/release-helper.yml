@@ -14,7 +14,7 @@ name: Release Helper
 #   git tag helper-v0.5.0 && git push origin helper-v0.5.0
 #   （検証だけしたい場合は workflow_dispatch の dryRun を使う。公開はしない）
 #
-# 必要な secrets（未設定ならジョブは fail closed で停止する）:
+# 必要な secrets（helper-release 環境に登録。未設定ならジョブは fail closed で停止する）:
 #   HELPER_WINDOWS_PFX_BASE64 / HELPER_WINDOWS_PFX_PASSWORD
 #   HELPER_MACOS_CERT_P12_BASE64 / HELPER_MACOS_CERT_PASSWORD
 #   HELPER_MACOS_SIGN_IDENTITY
@@ -72,6 +72,10 @@ jobs:
 
   build-windows:
     needs: version
+    # 署名鍵は専用環境 helper-release の secrets に置く。production 環境は
+    # main ブランチ限定のため helper-v* タグから参照できず、リポジトリ secrets だと
+    # どのブランチのワークフローからも読めてしまうため、タグ／main に限定した環境で守る。
+    environment: helper-release
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -142,6 +146,10 @@ jobs:
 
   build-macos:
     needs: version
+    # 署名鍵は専用環境 helper-release の secrets に置く。production 環境は
+    # main ブランチ限定のため helper-v* タグから参照できず、リポジトリ secrets だと
+    # どのブランチのワークフローからも読めてしまうため、タグ／main に限定した環境で守る。
+    environment: helper-release
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -279,6 +287,7 @@ jobs:
             --dir dist \
             --version "$VERSION" \
             --base-url "https://github.com/$REPO/releases/download/helper-v$VERSION" \
+            --flat-names \
             --windows-signature authenticode \
             --macos-signature developer-id-notarized
           cat dist/latest.json
@@ -299,6 +308,8 @@ jobs:
           set -euo pipefail
           tag="helper-v$VERSION"
           # ファイル名が衝突しないよう、アップロード時に OS を含む名前へ変える。
+          # latest.json / checksums.sha256 は --flat-names で同じ名前を指しているため、
+          # ここを変えるときは scripts/helper-release-manifest.sh の published_name も揃える。
           cp dist/windows-x64/config-manager-helper.exe "dist/config-manager-helper-windows-x64.exe"
           cp dist/darwin-universal/config-manager-helper "dist/config-manager-helper-darwin-universal"
           gh release create "$tag" --title "$tag" --notes "署名済みローカル取得ヘルパー $VERSION。検証手順は docs/HELPER-RELEASE.md を参照。" || true

@@ -13,7 +13,14 @@
 #   scripts/helper-release-manifest.sh --dir OUT_DIR --version 0.4.0 \
 #     [--base-url https://github.com/.../download/helper-v0.4.0] \
 #     [--windows-signature authenticode] \
-#     [--macos-signature developer-id-notarized]
+#     [--macos-signature developer-id-notarized] \
+#     [--flat-names]
+#
+# --flat-names は GitHub Releases 向け。Release のアセットはディレクトリを持てない
+# ため、release-helper.yml は config-manager-helper-<key>[.exe] という平坦な名前で
+# アップロードする。latest.json の URL と checksums.sha256 のファイル名もその名前に
+# 揃えないと、URL が 404 になり、ダウンロード後の shasum -c も照合できない（Issue #128）。
+# ハッシュは --dir 配下の実ファイル（windows-x64/ 等）から計算する。
 #
 # 署名種別（--*-signature）は latest.json に載せ、SPA が利用者へ検証手順を
 # 提示するために使う。省略時は "none"（未署名）。
@@ -24,6 +31,7 @@ VERSION=""
 BASE_URL=""
 WINDOWS_SIGNATURE="none"
 MACOS_SIGNATURE="none"
+FLAT_NAMES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --base-url) BASE_URL="$2"; shift 2 ;;
     --windows-signature) WINDOWS_SIGNATURE="$2"; shift 2 ;;
     --macos-signature) MACOS_SIGNATURE="$2"; shift 2 ;;
+    --flat-names) FLAT_NAMES=1; shift ;;
     *) echo "[helper-manifest] エラー: 不明な引数: $1" >&2; exit 2 ;;
   esac
 done
@@ -81,13 +90,28 @@ if [[ ${#PRESENT[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# 利用者がダウンロードするときのファイル名（--dir からの相対パス、または平坦名）。
+published_name() {
+  local key="$1" rel="$2"
+  if [[ $FLAT_NAMES -eq 1 ]]; then
+    if [[ "$rel" == *.exe ]]; then
+      echo "config-manager-helper-$key.exe"
+    else
+      echo "config-manager-helper-$key"
+    fi
+  else
+    echo "$rel"
+  fi
+}
+
 # checksums.sha256（sha256sum -c / shasum -c で照合できる形式）。
 CHECKSUMS="$OUT_DIR/checksums.sha256"
 : > "$CHECKSUMS"
 for def in "${PRESENT[@]}"; do
+  key="${def%%|*}"
   rel="${def#*|}"
   rel="${rel%%|*}"
-  printf '%s  %s\n' "$(sha256_of "$OUT_DIR/$rel")" "$rel" >> "$CHECKSUMS"
+  printf '%s  %s\n' "$(sha256_of "$OUT_DIR/$rel")" "$(published_name "$key" "$rel")" >> "$CHECKSUMS"
 done
 echo "[helper-manifest] wrote $CHECKSUMS"
 
@@ -114,7 +138,7 @@ NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     signature="${rest#*|}"
     if [[ $first -eq 0 ]]; then echo ","; fi
     printf '    "%s": {\n      "url": "%s",\n      "sha256": "%s",\n      "signature": "%s"\n    }' \
-      "$key" "$(url_for "$rel")" "$(sha256_of "$OUT_DIR/$rel")" "$signature"
+      "$key" "$(url_for "$(published_name "$key" "$rel")")" "$(sha256_of "$OUT_DIR/$rel")" "$signature"
     first=0
   done
   echo
