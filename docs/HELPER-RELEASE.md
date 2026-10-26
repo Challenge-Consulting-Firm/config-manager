@@ -35,7 +35,16 @@
    | `build-macos` | macOS ランナーで universal ビルド → Developer ID 署名（hardened runtime）→ notarization（`notarytool --wait`） |
    | `publish` | 署名済み artifact をダウンロード → `checksums.sha256` / `latest.json` 生成 → provenance 添付 → GitHub Release へ公開 |
 
-4. `latest.json` を BFF の配信先（`apps/bff/public/downloads/helper/`）へ反映する。GitHub Releases から直接ダウンロードさせる場合は、Release の `latest.json`（絶対 URL 入り）をそのまま配置する。
+4. Release の `latest.json`（GitHub Releases の絶対 URL 入り）を BFF の配信先へ反映し、`main` へマージして本番へデプロイする。SPA は同一オリジンの `/downloads/helper/latest.json` しか読まないため、この手順を飛ばすと新版は画面に出ない。
+
+   ```bash
+   gh release download helper-v0.5.0 --pattern latest.json \
+     --dir apps/bff/public/downloads/helper --clobber
+   ```
+
+   Release のアセットはディレクトリを持てないため、`config-manager-helper-windows-x64.exe` / `config-manager-helper-darwin-universal` という名前で公開される（`latest.json` と `checksums.sha256` も `--flat-names` で同じ名前を指す）。バイナリ本体はイメージに含めない（`deploy.yml` は clean checkout からビルドするため、`.gitignore` 対象のバイナリは入らない）。
+
+> **初回リリース前の状態**: コミット済みの `latest.json` は `assets` が空のプレースホルダで、セットアップ画面は「準備中」と、配布済みの旧版（v0.4.0 以前）を `--allow-origin <現在の URL>` 付きで起動する方法を表示する（Issue #128）。旧版は許可 Origin に `https://config.ccf.work` を含まないため。
 
 **公開されない条件（fail closed）**
 
@@ -96,9 +105,15 @@ spctl -a -t exec -vv config-manager-helper   # source=Notarized Developer ID
 
 | 用途 | secret 名 | 保管 | 備考 |
 | ---- | --------- | ---- | ---- |
-| Windows Authenticode | `HELPER_WINDOWS_PFX_BASE64` / `HELPER_WINDOWS_PFX_PASSWORD` | GitHub Actions secrets（production 環境） | OV / EV コード署名証明書の `.pfx` を base64 化 |
+| Windows Authenticode | `HELPER_WINDOWS_PFX_BASE64` / `HELPER_WINDOWS_PFX_PASSWORD` | GitHub Actions secrets（`helper-release` 環境） | OV / EV コード署名証明書の `.pfx` を base64 化 |
 | macOS Developer ID | `HELPER_MACOS_CERT_P12_BASE64` / `HELPER_MACOS_CERT_PASSWORD` / `HELPER_MACOS_SIGN_IDENTITY` | 同上 | `Developer ID Application` 証明書 |
 | Apple 公証 | `HELPER_MACOS_NOTARY_ISSUER_ID` / `HELPER_MACOS_NOTARY_KEY_ID` / `HELPER_MACOS_NOTARY_KEY_BASE64` | 同上 | App Store Connect API キー（`.p8`） |
+
+`helper-release` 環境の設定（Settings → Environments）:
+
+- **Deployment branches and tags**: 「Selected branches and tags」にし、タグ `helper-v*` と ブランチ `main`（`workflow_dispatch` の dryRun 用）だけを許可する。
+- **Required reviewers**（推奨）: 管理者を指定し、署名ジョブの実行前に承認を必須にする。
+- `production` 環境は Fly.io デプロイ用で `main` ブランチ限定のため、タグから実行する `Release Helper` では使えない。署名鍵をリポジトリ secrets に置くと任意のブランチのワークフローから読めるため、専用環境に置く。
 
 運用ルール:
 

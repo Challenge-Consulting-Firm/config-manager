@@ -98,6 +98,38 @@ test("base-url を渡すと絶対 URL になる", async () => {
   );
 });
 
+test("--flat-names で URL と checksums が GitHub Release のアセット名になる", async () => {
+  const dir = await fixture();
+  const result = run(dir, [
+    "--base-url",
+    "https://github.com/o/r/releases/download/helper-v1.2.3",
+    "--flat-names",
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const manifest = JSON.parse(await readFile(join(dir, "latest.json"), "utf8"));
+  assert.equal(
+    manifest.assets["windows-x64"].url,
+    "https://github.com/o/r/releases/download/helper-v1.2.3/config-manager-helper-windows-x64.exe",
+  );
+  assert.equal(
+    manifest.assets["darwin-universal"].url,
+    "https://github.com/o/r/releases/download/helper-v1.2.3/config-manager-helper-darwin-universal",
+  );
+  // ハッシュは元のディレクトリ配置の実ファイルから計算する。
+  assert.equal(manifest.assets["windows-x64"].sha256, sha256("windows-binary"));
+
+  const checksums = await readFile(join(dir, "checksums.sha256"), "utf8");
+  assert.match(
+    checksums,
+    new RegExp(`^${sha256("windows-binary")}  config-manager-helper-windows-x64\\.exe$`, "m"),
+  );
+  assert.match(
+    checksums,
+    new RegExp(`^${sha256("mac-universal-binary")}  config-manager-helper-darwin-universal$`, "m"),
+  );
+});
+
 test("base-url 未指定なら BFF 同梱の相対 URL になる", async () => {
   const dir = await fixture();
   assert.equal(run(dir).status, 0);
