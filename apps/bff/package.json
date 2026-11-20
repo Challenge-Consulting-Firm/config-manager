@@ -14,7 +14,7 @@
   "dependencies": {
     "@config-manager/shared": "workspace:*",
     "@hono/node-server": "^2.1.8",
-    "hono": "^4.13.18",
+    "hono": "^4.13.19",
     "iron-session": "^9.1.0"
   },
   "devDependencies": {
