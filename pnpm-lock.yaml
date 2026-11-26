@@ -19,10 +19,10 @@ importers:
         version: link:../../packages/shared
       '@hono/node-server':
         specifier: ^2.1.11
-        version: 2.1.11(hono@4.13.19)
+        version: 2.1.11(hono@4.13.20)
       hono:
-        specifier: ^4.13.19
-        version: 4.13.19
+        specifier: ^4.13.20
+        version: 4.13.20
       iron-session:
         specifier: ^9.1.0
         version: 9.1.0
@@ -703,8 +703,8 @@ packages:
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
 
-  hono@4.13.19:
-    resolution: {integrity: sha512-KmXvQAXwcAHV+muzbIwoJ23niEB5nMoDVr9WcRkU8mvjUECm/1+7v4Jgp7P7a+H6MLFrh+vXrGonGrGS+RQfkA==}
+  hono@4.13.20:
+    resolution: {integrity: sha512-xo6gecEJQ+CjTtOUUbcLHE8CdRKMeF4qITe+DT+OhFnSUmZR/ZBa9XavAfiGh4HlukmlaHFdaK4dz5tkTYFNmA==}
     engines: {node: '>=16.9.0'}
 
   iron-session@9.1.0:
@@ -1047,9 +1047,9 @@ snapshots:
   '@esbuild/win32-x64@0.28.2':
     optional: true
 
-  '@hono/node-server@2.1.11(hono@4.13.19)':
+  '@hono/node-server@2.1.11(hono@4.13.20)':
     dependencies:
-      hono: 4.13.19
+      hono: 4.13.20
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
@@ -1354,7 +1354,7 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
-  hono@4.13.19: {}
+  hono@4.13.20: {}
 
   iron-session@9.1.0:
     dependencies:
